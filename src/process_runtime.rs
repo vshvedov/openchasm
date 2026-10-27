@@ -398,6 +398,7 @@ struct RuntimeProcess {
     wind_active: bool,
     source_active: bool,
     supported: bool,
+    proposal_forbidden: bool,
     required_keys: [bool; 3],
     mission_effect: bool,
     ignored_call: bool,
@@ -1042,6 +1043,10 @@ impl RuntimeProcess {
             wind_active: false,
             source_active: false,
             supported,
+            proposal_forbidden: process
+                .properties
+                .iter()
+                .any(|cmd| matches!(cmd.name.as_str(), "mortal" | "checkgo" | "checkback")),
             required_keys,
             mission_effect: has_end_delay || has_message,
             ignored_call,
@@ -1169,7 +1174,13 @@ impl RuntimeProcess {
             Phase::Closed | Phase::Closing => {}
         }
     }
-    fn tick(&mut self, process_id: u16, dt: f32, frame: &mut ProcessFrame<'_>) {
+    fn tick(
+        &mut self,
+        process_id: u16,
+        dt: f32,
+        frame: &mut ProcessFrame<'_>,
+        bypass_obstruction: bool,
+    ) {
         let world = &mut *frame.world;
         let elevations = &mut *frame.elevations;
         let objects = &mut *frame.objects;
@@ -1231,8 +1242,9 @@ impl RuntimeProcess {
         if change != 0.0 {
             let elapsed = change.abs() * self.duration;
             let direction = change.signum();
-            if obstructed(&self.motions, world, elapsed, direction)
-                || objects_obstructed(&self.object_motions, world, objects, elapsed, direction)
+            if !bypass_obstruction
+                && (obstructed(&self.motions, world, elapsed, direction)
+                    || objects_obstructed(&self.object_motions, world, objects, elapsed, direction))
             {
                 self.progress = previous;
                 self.phase = if change > 0.0 {
@@ -1417,6 +1429,59 @@ pub struct ProcessRuntime {
     source_enabled: bool,
 }
 
+/// One straight interval of an individual process's motion, in tiles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedMotionInterval {
+    pub walls: Vec<(usize, [f32; 2])>,
+    pub objects: Vec<([u8; 2], [f32; 2])>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrepareMotionError {
+    Missing,
+    InvalidTime,
+    Unsupported,
+    Conflict,
+    StaleGeometry,
+}
+
+/// An exclusive transaction: dropping it leaves runtime and world untouched.
+pub struct PreparedMotionStep<'a> {
+    runtime: &'a mut ProcessRuntime,
+    world: &'a mut World,
+    next_runtime: ProcessRuntime,
+    next_world: World,
+    intervals: Vec<PreparedMotionInterval>,
+}
+impl PreparedMotionStep<'_> {
+    pub fn intervals(&self) -> &[PreparedMotionInterval] {
+        &self.intervals
+    }
+    pub fn proposed_world(&self) -> &World {
+        &self.next_world
+    }
+    /// Newly emitted effects, in commit order; existing queued effects are excluded.
+    pub fn new_effects(&self) -> &[ProcessEffect] {
+        &self.next_runtime.effects[self.runtime.effects.len()..]
+    }
+    pub fn proposed_object(&self, cell: [u8; 2]) -> Option<&ProcessObject> {
+        self.next_runtime.objects.get(&cell)
+    }
+    /// The host must validate every interval and entity displacement before commit.
+    pub fn commit(mut self, player_position: [f32; 2]) -> Result<(), PrepareMotionError> {
+        if !player_position
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= 4096.0)
+        {
+            return Err(PrepareMotionError::StaleGeometry);
+        }
+        self.next_world.player.position = player_position;
+        *self.runtime = self.next_runtime;
+        *self.world = self.next_world;
+        Ok(())
+    }
+}
+
 /// Durable process phase; delay is measured in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1474,6 +1539,146 @@ pub enum ProcessGeometryError {
 }
 
 impl ProcessRuntime {
+    /// Stage one process tick without applying player obstruction checks. This
+    /// opt-in foundation requires the host to collision-check every interval.
+    /// Unsupported flags and geometry fail closed; legacy ticking is unchanged.
+    pub fn prepare_motion_step<'a>(
+        &'a mut self,
+        world: &'a mut World,
+        id: u16,
+        dt: f32,
+    ) -> Result<PreparedMotionStep<'a>, PrepareMotionError> {
+        use PrepareMotionError as E;
+        if !dt.is_finite() || dt <= 0.0 || dt > 60.0 {
+            return Err(E::InvalidTime);
+        }
+        let process = self.processes.get(&id).ok_or(E::Missing)?;
+        if !process.supported
+            || process.proposal_forbidden
+            || process
+                .motions
+                .iter()
+                .any(|m| matches!(m.kind, MotionKind::Rotate { .. } | MotionKind::Vertical(_)))
+            || process
+                .object_motions
+                .iter()
+                .any(|m| matches!(m.kind, MotionKind::Rotate { .. } | MotionKind::Vertical(_)))
+        {
+            return Err(E::Unsupported);
+        }
+        if world.walls.len() != self.wall_cells.len()
+            || world
+                .walls
+                .iter()
+                .zip(&self.wall_cells)
+                .any(|(wall, cell)| {
+                    wall.cell != *cell || !wall.a.iter().chain(wall.b.iter()).all(|v| v.is_finite())
+                })
+            || process.object_motions.iter().any(|m| {
+                !self.objects.contains_key(&m.cell)
+                    || self.cell_types.as_ref().is_some_and(|types| {
+                        types[usize::from(m.cell[0]) * 64 + usize::from(m.cell[1])] != m.raw_type
+                    })
+            })
+        {
+            return Err(E::StaleGeometry);
+        }
+        for (&other_id, other) in &self.processes {
+            if other_id == id || other.phase == Phase::Closed {
+                continue;
+            }
+            if process
+                .motions
+                .iter()
+                .any(|m| other.motions.iter().any(|o| m.wall == o.wall))
+                || process
+                    .object_motions
+                    .iter()
+                    .any(|m| other.object_motions.iter().any(|o| m.cell == o.cell))
+            {
+                return Err(E::Conflict);
+            }
+        }
+        let before = process.clone();
+        let mut next_runtime = self.clone();
+        let mut next_world = world.clone();
+        {
+            let mut frame = ProcessFrame {
+                world: &mut next_world,
+                elevations: &mut next_runtime.elevations,
+                objects: &mut next_runtime.objects,
+                cell_types: &mut next_runtime.cell_types,
+                effects: &mut next_runtime.effects,
+            };
+            next_runtime
+                .processes
+                .get_mut(&id)
+                .expect("checked process")
+                .tick(id, dt, &mut frame, true);
+        }
+        let after = &next_runtime.processes[&id];
+        let elapsed = (after.progress - before.progress).abs() * before.duration;
+        let direction = (after.progress - before.progress).signum();
+        let mut breaks = vec![0.0, elapsed];
+        let all = before
+            .motions
+            .iter()
+            .map(|m| {
+                (
+                    m.progress,
+                    m.duration,
+                    matches!(m.kind, MotionKind::AxisTranslate { .. }),
+                )
+            })
+            .chain(before.object_motions.iter().map(|m| {
+                (
+                    m.progress,
+                    m.duration,
+                    matches!(m.kind, MotionKind::AxisTranslate { .. }),
+                )
+            }));
+        if elapsed > 0.0 {
+            for (progress, duration, axis) in all {
+                for boundary in [if direction > 0.0 { 1.0 } else { 0.0 }, 0.5] {
+                    if boundary == 0.5 && !axis {
+                        continue;
+                    }
+                    let time = (boundary - progress) * duration * direction;
+                    if time > 0.0 && time < elapsed {
+                        breaks.push(time);
+                    }
+                }
+            }
+        }
+        breaks.sort_by(f32::total_cmp);
+        breaks.dedup();
+        let mut intervals = Vec::new();
+        for pair in breaks.windows(2) {
+            if pair[0] == pair[1] {
+                continue;
+            }
+            let delta = |m: &Motion| {
+                let from = (m.progress + direction * pair[0] / m.duration).clamp(0.0, 1.0);
+                let to = (m.progress + direction * pair[1] / m.duration).clamp(0.0, 1.0);
+                m.transform([0.0, 0.0], from, to)
+            };
+            intervals.push(PreparedMotionInterval {
+                walls: before.motions.iter().map(|m| (m.wall, delta(m))).collect(),
+                objects: before
+                    .object_motions
+                    .iter()
+                    .map(|m| (m.cell, delta(&m.proxy())))
+                    .collect(),
+            });
+        }
+        Ok(PreparedMotionStep {
+            runtime: self,
+            world,
+            next_runtime,
+            next_world,
+            intervals,
+        })
+    }
     /// Verify restored process motion against a fresh runtime/world baseline.
     /// Translations commute; a rotation sharing its target with any other
     /// horizontal motion has history-dependent order and is rejected.
@@ -2829,7 +3034,7 @@ impl ProcessRuntime {
             effects: &mut self.effects,
         };
         for (&id, process) in &mut self.processes {
-            process.tick(id, dt, &mut frame);
+            process.tick(id, dt, &mut frame, false);
         }
     }
     /// Call after movement once per simulation step. `interact_pressed` must be
@@ -2857,6 +3062,133 @@ impl ProcessRuntime {
 mod tests {
     use super::*;
     use crate::world::{Player, Wall};
+
+    #[test]
+    fn motion_proposal_splits_axis_and_rolls_back_on_drop() {
+        let script = Script::parse(
+            "#proc1\nSpeed 8\n#action\nxmove 1 1 256 256\n#end\n#links\nlink 0 0 1\n#end\n",
+        );
+        let mut world = World {
+            walls: vec![Wall {
+                a: [1.0, 1.0],
+                b: [1.0, 2.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([1, 1]),
+            }],
+            player: Player {
+                position: [8.0, 8.0],
+                angle: 0.0,
+            },
+        };
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let snapshot = runtime.snapshot(&world).unwrap();
+        let original = world.walls[0];
+        {
+            let prepared = runtime.prepare_motion_step(&mut world, 1, 2.0).unwrap();
+            assert_eq!(prepared.intervals().len(), 2);
+            assert_eq!(prepared.intervals()[0].walls[0].1, [1.0, 0.0]);
+            assert_eq!(prepared.intervals()[1].walls[0].1, [0.0, 1.0]);
+        }
+        assert_eq!(runtime.snapshot(&world).unwrap(), snapshot);
+        assert_eq!(world.walls[0].a, original.a);
+        runtime
+            .prepare_motion_step(&mut world, 1, 2.0)
+            .unwrap()
+            .commit([8.0, 8.0])
+            .unwrap();
+        assert_eq!(world.walls[0].a, [2.0, 2.0]);
+        let after = runtime.snapshot(&world).unwrap();
+        assert_eq!(after.processes[0].wall_progress, vec![1.0]);
+    }
+
+    #[test]
+    fn motion_proposal_splits_independent_completion_and_reverse_turn() {
+        let script = Script::parse("#proc1\nSpeed 8\n#action\nxmove 1 1 256 256\nmove 2 1 256 0 s:16\n#end\n#links\nlink 0 0 1\nreturn 0 0 1\n#end\n");
+        let mut world = World {
+            walls: vec![
+                Wall {
+                    a: [1.0, 1.0],
+                    b: [1.0, 2.0],
+                    texture: 1,
+                    blocks_movement: true,
+                    cell: Some([1, 1]),
+                },
+                Wall {
+                    a: [2.0, 1.0],
+                    b: [2.0, 2.0],
+                    texture: 1,
+                    blocks_movement: true,
+                    cell: Some([2, 1]),
+                },
+            ],
+            player: Player {
+                position: [8.0, 8.0],
+                angle: 0.0,
+            },
+        };
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        runtime.activate_at("link", [0, 0]);
+        let prepared = runtime.prepare_motion_step(&mut world, 1, 2.0).unwrap();
+        assert_eq!(prepared.intervals().len(), 2);
+        assert_eq!(prepared.intervals()[0].walls[1].1, [1.0, 0.0]);
+        assert_eq!(prepared.intervals()[1].walls[1].1, [0.0, 0.0]);
+        prepared.commit([8.0, 8.0]).unwrap();
+        runtime.activate_at("return", [0, 0]);
+        let prepared = runtime.prepare_motion_step(&mut world, 1, 2.0).unwrap();
+        assert_eq!(prepared.intervals().len(), 2);
+        assert_eq!(prepared.intervals()[0].walls[0].1, [0.0, -1.0]);
+        assert_eq!(prepared.intervals()[1].walls[0].1, [-1.0, 0.0]);
+        prepared.commit([8.0, 8.0]).unwrap();
+        assert_eq!(world.walls[0].a, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn motion_proposal_rejects_unsupported_and_conflicting_movers() {
+        let world = World {
+            walls: vec![Wall {
+                a: [1.0, 1.0],
+                b: [1.0, 2.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([1, 1]),
+            }],
+            player: Player {
+                position: [8.0, 8.0],
+                angle: 0.0,
+            },
+        };
+        for command in ["rotate 1 1 0 0 90", "up 1 1 80"] {
+            let script = Script::parse(&format!(
+                "#proc1\n#action\n{command}\n#end\n#links\nlink 0 0 1\n#end\n"
+            ));
+            let mut runtime = ProcessRuntime::with_capabilities(
+                &script,
+                &world,
+                ProcessCapabilities {
+                    wall_elevation: true,
+                    initial_cell_types: None,
+                },
+            );
+            let mut w = world.clone();
+            assert!(matches!(
+                runtime.prepare_motion_step(&mut w, 1, 0.1),
+                Err(PrepareMotionError::Unsupported)
+            ));
+        }
+        let script = Script::parse("#proc1\n#action\nmove 1 1 256 0\n#end\n#proc2\n#action\nmove 1 1 256 0\n#end\n#links\nlink 0 0 1\nlink 0 0 2\n#end\n");
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        let mut w = world.clone();
+        runtime.activate_at("link", [0, 0]);
+        assert!(matches!(
+            runtime.prepare_motion_step(&mut w, 1, 0.1),
+            Err(PrepareMotionError::Conflict)
+        ));
+    }
 
     #[test]
     fn validates_reversed_object_motion_and_rejects_forgery() {

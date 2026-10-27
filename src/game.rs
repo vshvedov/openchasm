@@ -6,7 +6,7 @@ use crate::pickups::{Difficulty, PickupEvent, Pickups};
 pub struct GameInventory {
     pub inventory: Inventory,
     pub pickups: Pickups,
-    weapons: WeaponDefinitions,
+    pub weapons: WeaponDefinitions,
 }
 impl GameInventory {
     pub fn new(
@@ -21,6 +21,10 @@ impl GameInventory {
             weapons,
         }
     }
+    pub fn weapons(&self) -> &WeaponDefinitions {
+        &self.weapons
+    }
+
     /// Update inventory on overlap and return presentation/script events.
     pub fn collect_near(&mut self, position: [f32; 2]) -> Vec<PickupEvent> {
         self.pickups

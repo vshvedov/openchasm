@@ -7,7 +7,8 @@ use crate::object_combat::ObjectCombat;
 use crate::object_states::{ObjectStateError, ObjectStates, ObjectTransition};
 use crate::objects::ObjectDefinitions;
 use crate::process_runtime::{
-    ImmediateAction, PreparedProcess, ProcessEvent, RuntimeObjectSyncError, RuntimeObjectTransition,
+    ImmediateAction, PreparedProcess, ProcessEvent, RuntimeObjectSyncError,
+    RuntimeObjectTransition, RuntimeWallSyncError, RuntimeWallTransition,
 };
 use crate::quake::{QuakeError, QuakeField};
 use std::collections::BTreeSet;
@@ -36,6 +37,7 @@ pub enum TransactionError {
     Quake(QuakeError),
     AmbientUnavailable,
     WallChangesUnavailable,
+    RuntimeWall(RuntimeWallSyncError),
     Ambient(InvalidAmbientRegion),
     CollisionNotClear { cell: [usize; 2] },
     PoseMismatch { cell: [usize; 2] },
@@ -83,6 +85,31 @@ impl<'a> ProcessTransaction<'a> {
     /// capability rejects any process that contains an ambient action.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_with_ambient(
+        process: PreparedProcess<'a>,
+        states: &'a mut ObjectStates,
+        combat: &'a mut ObjectCombat,
+        quake: &'a mut QuakeField,
+        definitions: &ObjectDefinitions,
+        manifest: &PresentationManifest,
+        is_clear: impl FnMut([usize; 2], [f32; 2], f32) -> bool,
+        ambient: Option<&'a mut AmbientGrid>,
+    ) -> Result<Self, TransactionError> {
+        Self::prepare_with_wall_transitions(
+            process,
+            states,
+            combat,
+            quake,
+            definitions,
+            manifest,
+            is_clear,
+            ambient,
+            None,
+        )
+    }
+
+    /// The host has separately preflighted wall geometry and presentation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_wall_transitions(
         mut process: PreparedProcess<'a>,
         states: &'a mut ObjectStates,
         combat: &'a mut ObjectCombat,
@@ -91,7 +118,13 @@ impl<'a> ProcessTransaction<'a> {
         manifest: &PresentationManifest,
         mut is_clear: impl FnMut([usize; 2], [f32; 2], f32) -> bool,
         ambient: Option<&'a mut AmbientGrid>,
+        walls: Option<&[RuntimeWallTransition]>,
     ) -> Result<Self, TransactionError> {
+        if let Some(walls) = walls {
+            process
+                .stage_wall_transitions(walls)
+                .map_err(TransactionError::RuntimeWall)?;
+        }
         let mut staged_states = states.clone();
         let mut staged_combat = combat.clone();
         let mut staged_quake = quake.clone();
@@ -149,9 +182,10 @@ impl<'a> ProcessTransaction<'a> {
                     });
                     transitions.extend(changes);
                 }
-                ImmediateAction::WallChange { .. } => {
+                ImmediateAction::WallChange { .. } if walls.is_none() => {
                     return Err(TransactionError::WallChangesUnavailable)
                 }
+                ImmediateAction::WallChange { .. } => {}
                 ImmediateAction::Quake(zone) => staged_quake
                     .apply_batch(&[zone])
                     .map_err(TransactionError::Quake)?,

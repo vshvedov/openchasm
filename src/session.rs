@@ -28,6 +28,7 @@ use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
 use crate::quake::{QuakeField, QuakeZone};
 use crate::teleport::{RearmPolicy, Teleport, TeleportEvent, TeleportFailure, TeleportState};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
+use crate::wall_transitions::{prepare_wall_transitions, WallMaterialCatalog};
 use crate::wind::{WindError, WindField};
 use crate::world::{CollisionCircle, Input, WallCollisionMode, World};
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,6 +162,8 @@ pub struct SessionEvents {
     pub object_destructions: Vec<ObjectDestructionEvent>,
     /// Ordered committed model replacements; the host must apply before next tick.
     pub object_transitions: Vec<ObjectTransition>,
+    /// Ordered committed wall material replacements.
+    pub wall_transitions: Vec<crate::process_runtime::RuntimeWallTransition>,
     /// Authored quake commands for an explicitly opted-in consumer.
     pub quake_changes: Vec<QuakeZone>,
     /// Mission presentation/completion events produced during this step.
@@ -358,6 +361,7 @@ pub struct Session {
     /// Absolute offsets in original script units, indexed by wall index.
     pub wall_elevations: Vec<f32>,
     base_wall_blocking: Vec<bool>,
+    wall_materials: Option<WallMaterialCatalog>,
     elevation_by_cell: Vec<f32>,
     combat: Combat,
     rockets: RocketDefinitions,
@@ -398,6 +402,7 @@ pub struct SessionSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionSnapshotCapabilities {
     pub wall_collision_mode: WallCollisionMode,
+    pub wall_materials: bool,
     pub teleports: bool,
     pub object_heights: bool,
     pub explosions: bool,
@@ -424,6 +429,7 @@ impl Session {
     fn snapshot_capabilities(&self) -> SessionSnapshotCapabilities {
         SessionSnapshotCapabilities {
             wall_collision_mode: self.wall_collision_mode,
+            wall_materials: self.wall_materials.is_some(),
             teleports: self.teleports.is_some(),
             object_heights: self.object_heights.is_some(),
             explosions: self.explosions_enabled,
@@ -626,6 +632,23 @@ impl Session {
                 }
                 _ => SessionSnapshotError::Inconsistent("process geometry"),
             })?;
+        if self.wall_materials.is_some() {
+            if let Some(types) = &snapshot.processes.cell_types {
+                for wall in &snapshot.world.walls {
+                    if let Some([x, y]) = wall.cell {
+                        if x >= 64
+                            || y >= 64
+                            || types.get(usize::from(x) * 64 + usize::from(y))
+                                != Some(&wall.texture)
+                        {
+                            return Err(SessionSnapshotError::Inconsistent("wall cell type"));
+                        }
+                    }
+                }
+            } else {
+                return Err(SessionSnapshotError::Unverifiable("wall cell types"));
+            }
+        }
         candidate
             .wall_elevations
             .clone_from(&snapshot.wall_elevations);
@@ -887,6 +910,7 @@ impl Session {
         Self {
             wall_elevations,
             base_wall_blocking,
+            wall_materials: None,
             elevation_by_cell: vec![0.0; 64 * 64],
             world: setup.world,
             wall_collision_mode: WallCollisionMode::TwoSided,
@@ -970,6 +994,19 @@ impl Session {
         self.addon_boss_rule = mapping == ActorMapping::AddonToRemaster;
     }
 
+    /// Enable staged wall replacements using the host's complete GFX flags and
+    /// presentation availability. Existing shot flags must match the catalog.
+    pub fn set_wall_material_catalog(&mut self, catalog: WallMaterialCatalog) -> bool {
+        if (1..=127u8).any(|raw| {
+            catalog
+                .get(raw)
+                .is_some_and(|m| m.blocks_shots != self.shot_blocking[usize::from(raw)])
+        }) {
+            return false;
+        }
+        self.wall_materials = Some(catalog);
+        true
+    }
     /// Choose the wall policy for player and wind-driven movement. Defaults to
     /// two-sided. Authored sides apply only to walls the process runtime proves
     /// static; moving-wall obstruction remains conservative. Snapshot clones
@@ -1238,7 +1275,73 @@ impl Session {
                 Some((actor.position, radius))
             })
             .collect();
-        let transaction = ProcessTransaction::prepare_with_ambient(
+        let mut wall_transitions = Vec::new();
+        let mut wall_types = BTreeMap::new();
+        for action in prepared.actions() {
+            if let ImmediateAction::WallChange { cell, raw_type } = *action {
+                let mut matches = self
+                    .world
+                    .walls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, wall)| wall.cell == Some(cell));
+                let (wall_index, wall) =
+                    matches.next().ok_or((ProcessOutcome::Unsupported, true))?;
+                if matches.next().is_some() {
+                    return Err((ProcessOutcome::Unsupported, true));
+                }
+                let previous_type = wall_types.get(&wall_index).copied().unwrap_or(wall.texture);
+                wall_types.insert(wall_index, raw_type);
+                wall_transitions.push(crate::process_runtime::RuntimeWallTransition {
+                    cell,
+                    wall_index,
+                    previous_type,
+                    new_type: raw_type,
+                });
+            }
+        }
+        let staged_walls = if wall_transitions.is_empty() {
+            None
+        } else {
+            let catalog = self
+                .wall_materials
+                .as_ref()
+                .ok_or((ProcessOutcome::Unsupported, true))?;
+            let needed = (self.vertical.head() * 64.0).max(80.0);
+            let clear = |wall: &crate::world::Wall, position: [f32; 2], radius: f32| {
+                if !position.iter().all(|v| v.is_finite()) || !radius.is_finite() {
+                    return false;
+                }
+                let d = [wall.b[0] - wall.a[0], wall.b[1] - wall.a[1]];
+                let length = d[0] * d[0] + d[1] * d[1];
+                if !length.is_finite() || length <= 1e-12 {
+                    return false;
+                }
+                let t = (((position[0] - wall.a[0]) * d[0] + (position[1] - wall.a[1]) * d[1])
+                    / length)
+                    .clamp(0.0, 1.0);
+                let dx = position[0] - wall.a[0] - d[0] * t;
+                let dy = position[1] - wall.a[1] - d[1] * t;
+                dx * dx + dy * dy >= radius * radius
+            };
+            Some(
+                prepare_wall_transitions(
+                    &self.world,
+                    &self.base_wall_blocking,
+                    catalog,
+                    &wall_transitions,
+                    |index, blocks| {
+                        blocks && self.wall_elevations.get(index).is_some_and(|e| *e < needed)
+                    },
+                    |_, wall| {
+                        clear(wall, player, 0.18)
+                            && actor_circles.iter().all(|(p, r)| clear(wall, *p, *r))
+                    },
+                )
+                .map_err(|_| (ProcessOutcome::Unsupported, true))?,
+            )
+        };
+        let transaction = ProcessTransaction::prepare_with_wall_transitions(
             prepared,
             &mut scripted.states,
             combat,
@@ -1254,6 +1357,9 @@ impl Session {
                         .all(|(p, r)| p.iter().all(|v| v.is_finite()) && distance(*p) >= radius + r)
             },
             self.ambient.as_mut(),
+            staged_walls
+                .as_ref()
+                .map(|staged| staged.transitions.as_slice()),
         )
         .map_err(|_| (ProcessOutcome::Unsupported, true))?;
         if delayed {
@@ -1280,6 +1386,11 @@ impl Session {
             }
         }
         events.object_transitions.extend(transitions);
+        if let Some(staged) = staged_walls {
+            self.world = staged.world;
+            self.base_wall_blocking = staged.base_blocking;
+            events.wall_transitions.extend(staged.transitions);
+        }
         events.quake_changes.extend(quakes);
         if grid_immediate {
             self.journal_push(GridJournalEntry::Immediate { process_id: id });
@@ -1305,6 +1416,11 @@ impl Session {
         let saved_scripted = self.scripted_objects.clone();
         let saved_objects = self.objects.clone();
         let saved_ambient = self.ambient.clone();
+        let saved_walls = self
+            .wall_materials
+            .as_ref()
+            .map(|_| (self.world.clone(), self.base_wall_blocking.clone()));
+        let wall_start = events.wall_transitions.len();
         let saved_journal = self.journal_checkpoint();
         let replacement_start = events.object_transitions.len();
         let destruction_start = events.object_destructions.len();
@@ -1326,6 +1442,11 @@ impl Session {
                     self.scripted_objects = saved_scripted;
                     self.objects = saved_objects;
                     self.ambient = saved_ambient;
+                    if let Some((world, blocking)) = saved_walls {
+                        self.world = world;
+                        self.base_wall_blocking = blocking;
+                    }
+                    events.wall_transitions.truncate(wall_start);
                     self.journal_rollback(saved_journal);
                     events.object_transitions.truncate(replacement_start);
                     events.object_destructions.truncate(destruction_start);
@@ -1410,6 +1531,7 @@ impl Session {
         let attempt_count = attempts.len();
         let hit_count = events.object_hits.len();
         let transition_count = events.object_transitions.len();
+        let wall_count = events.wall_transitions.len();
         let destruction_count = events.object_destructions.len();
         let quake_count = events.quake_changes.len();
         let mut accepted = true;
@@ -1500,6 +1622,7 @@ impl Session {
             attempts.truncate(attempt_count);
             events.object_hits.truncate(hit_count);
             events.object_transitions.truncate(transition_count);
+            events.wall_transitions.truncate(wall_count);
             events.object_destructions.truncate(destruction_count);
             events.quake_changes.truncate(quake_count);
             return;
@@ -1580,6 +1703,7 @@ impl Session {
         let attempt_count = attempts.len();
         let hit_count = events.object_hits.len();
         let transition_count = events.object_transitions.len();
+        let wall_count = events.wall_transitions.len();
         let destruction_count = events.object_destructions.len();
         let quake_count = events.quake_changes.len();
         let previous_damage = events.damage;
@@ -1597,6 +1721,7 @@ impl Session {
                 attempts.truncate(attempt_count);
                 events.object_hits.truncate(hit_count);
                 events.object_transitions.truncate(transition_count);
+                events.wall_transitions.truncate(wall_count);
                 events.object_destructions.truncate(destruction_count);
                 events.quake_changes.truncate(quake_count);
                 events.damage = previous_damage;
@@ -1665,6 +1790,7 @@ impl Session {
                             attempts.truncate(attempt_count);
                             events.object_hits.truncate(hit_count);
                             events.object_transitions.truncate(transition_count);
+                            events.wall_transitions.truncate(wall_count);
                             events.object_destructions.truncate(destruction_count);
                             events.quake_changes.truncate(quake_count);
                             events.damage = previous_damage;
@@ -1728,6 +1854,7 @@ impl Session {
             let attempt_count = attempts.len();
             let hit_count = events.object_hits.len();
             let transition_count = events.object_transitions.len();
+            let wall_count = events.wall_transitions.len();
             let destruction_count = events.object_destructions.len();
             let quake_count = events.quake_changes.len();
             let explosions_count = events.explosions.len();
@@ -1746,6 +1873,7 @@ impl Session {
                         attempts.truncate(attempt_count);
                         events.object_hits.truncate(hit_count);
                         events.object_transitions.truncate(transition_count);
+                        events.wall_transitions.truncate(wall_count);
                         events.object_destructions.truncate(destruction_count);
                         events.quake_changes.truncate(quake_count);
                         events.explosions.truncate(explosions_count);
@@ -2167,6 +2295,9 @@ impl Session {
                     self.scripted_objects.clone(),
                     self.ambient.clone(),
                     self.journal_checkpoint(),
+                    self.wall_materials
+                        .as_ref()
+                        .map(|_| (self.world.clone(), self.base_wall_blocking.clone())),
                 ))
             }
         } else {
@@ -2213,16 +2344,23 @@ impl Session {
             }
         }
         if pickup_failed {
-            if let Some((game, processes, objects, scripted, ambient, journal)) = pickup_backup {
+            if let Some((game, processes, objects, scripted, ambient, journal, walls)) =
+                pickup_backup
+            {
                 self.game = game;
                 self.processes = processes;
                 self.objects = objects;
                 self.scripted_objects = scripted;
                 self.ambient = ambient;
                 self.journal_rollback(journal);
+                if let Some((world, blocking)) = walls {
+                    self.world = world;
+                    self.base_wall_blocking = blocking;
+                }
             }
             events.pickups.clear();
             events.object_transitions.clear();
+            events.wall_transitions.clear();
             events.object_destructions.clear();
             events.quake_changes.clear();
             attempts.clear();
@@ -2272,6 +2410,11 @@ impl Session {
             let scripted_before_hit = self.scripted_objects.clone();
             let ambient_before_hit = self.ambient.clone();
             let journal_before_hit = self.journal_checkpoint();
+            let walls_before_hit = self
+                .wall_materials
+                .as_ref()
+                .map(|_| (self.world.clone(), self.base_wall_blocking.clone()));
+            let wall_events_before_hit = events.wall_transitions.len();
             let processes_before_hit = self
                 .scripted_objects
                 .as_ref()
@@ -2371,6 +2514,11 @@ impl Session {
                                 self.scripted_objects = scripted_before_hit;
                                 self.ambient = ambient_before_hit;
                                 self.journal_rollback(journal_before_hit);
+                                if let Some((world, blocking)) = walls_before_hit {
+                                    self.world = world;
+                                    self.base_wall_blocking = blocking;
+                                }
+                                events.wall_transitions.truncate(wall_events_before_hit);
                                 if let Some(processes) = processes_before_hit {
                                     self.processes = processes;
                                 }
@@ -2695,6 +2843,11 @@ impl Session {
                     let scripted_before_hit = self.scripted_objects.clone();
                     let ambient_before_hit = self.ambient.clone();
                     let journal_before_hit = self.journal_checkpoint();
+                    let walls_before_hit = self
+                        .wall_materials
+                        .as_ref()
+                        .map(|_| (self.world.clone(), self.base_wall_blocking.clone()));
+                    let wall_events_before_hit = events.wall_transitions.len();
                     let processes_before_hit = self
                         .scripted_objects
                         .as_ref()
@@ -2741,6 +2894,11 @@ impl Session {
                                         self.scripted_objects = scripted_before_hit;
                                         self.ambient = ambient_before_hit;
                                         self.journal_rollback(journal_before_hit);
+                                        if let Some((world, blocking)) = walls_before_hit {
+                                            self.world = world;
+                                            self.base_wall_blocking = blocking;
+                                        }
+                                        events.wall_transitions.truncate(wall_events_before_hit);
                                         if let Some(processes) = processes_before_hit {
                                             self.processes = processes;
                                         }
@@ -3124,6 +3282,207 @@ mod tests {
             baseline.restore_from_baseline(&forged, digest).err(),
             Some(SessionSnapshotError::Inconsistent("process geometry"))
         );
+    }
+
+    fn wall_change_session(text: &str) -> Session {
+        use crate::process_runtime::ProcessCapabilities;
+        use crate::wall_transitions::WallMaterial;
+        let mut session = ambient_session(text);
+        session.world.walls.push(crate::world::Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 87,
+            blocks_movement: false,
+            cell: Some([1, 0]),
+        });
+        session.base_wall_blocking.push(false);
+        session.wall_elevations.push(0.0);
+        let mut cells = [0; 4096];
+        cells[64] = 87;
+        session.processes = ProcessRuntime::with_wall_changes(
+            &Script::parse(text),
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        session.light_sources = Some(LightSources::default());
+        session.shot_blocking[2] = false;
+        let mut catalog = WallMaterialCatalog::default();
+        assert!(catalog.set(
+            87,
+            WallMaterial {
+                blocks_movement: false,
+                blocks_shots: true,
+                presentation_available: true
+            }
+        ));
+        assert!(catalog.set(
+            2,
+            WallMaterial {
+                blocks_movement: true,
+                blocks_shots: false,
+                presentation_available: true
+            }
+        ));
+        assert!(session.set_wall_material_catalog(catalog));
+        session
+    }
+
+    #[test]
+    fn wall_change_commits_material_and_blocks_player_overlap_atomically() {
+        let text =
+            "#proc1\n#action\nchange 1 0 2\nambient 0 0 0 0 5\n#end\n#links\nlink 0 0 1\n#end\n";
+        let baseline = wall_change_session(text);
+        let mut source = baseline.clone();
+        source.world.player.position = [1.0, 0.5];
+        let mut events = SessionEvents::default();
+        assert!(source
+            .try_staged_process("link", [0, 0], 1, &mut events)
+            .is_err());
+        assert!(events.wall_transitions.is_empty());
+        assert_eq!(source.world.walls[0].texture, 87);
+        assert_eq!(source.processes.cell_type([1, 0]), Some(87));
+        assert_eq!(source.ambient_grid().unwrap().cell([0, 0]), Some(0));
+        source.world.player.position = [0.5, 0.5];
+        source
+            .try_staged_process("link", [0, 0], 1, &mut events)
+            .unwrap();
+        assert_eq!(events.wall_transitions.len(), 1);
+        assert_eq!(source.world.walls[0].texture, 2);
+        assert!(source.world.walls[0].blocks_movement);
+        assert!(source.base_wall_blocking[0]);
+        assert_eq!(source.processes.cell_type([1, 0]), Some(2));
+        assert_eq!(source.ambient_grid().unwrap().cell([0, 0]), Some(5));
+        assert!(!Session::blocks_shot(
+            &source.world.walls[0],
+            &source.shot_blocking,
+            &source.elevation_by_cell,
+            1.0
+        ));
+        source.apply_process_effects();
+        let digest = crate::save_format::ContentDigest([12; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        assert!(baseline.restore_from_baseline(&snapshot, digest).is_err());
+    }
+
+    #[test]
+    fn wall_change_checks_living_actor_and_presentation() {
+        use crate::wall_transitions::WallMaterial;
+        let text = "#proc1\n#action\nchange 1 0 2\n#end\n#links\nlink 0 0 1\n#end\n";
+        let mut session = wall_change_session(text);
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 64,
+            actor_radius: 64,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement: Monster {
+                position: [256, 128],
+                id: 101,
+                angle: 0,
+                flags: 2,
+            },
+            position: [1.0, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        assert!(session
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .is_err());
+        session.actors.actors[0].health = 0;
+        let mut unavailable = WallMaterialCatalog::default();
+        unavailable.set(
+            87,
+            WallMaterial {
+                blocks_movement: false,
+                blocks_shots: true,
+                presentation_available: true,
+            },
+        );
+        unavailable.set(
+            2,
+            WallMaterial {
+                blocks_movement: true,
+                blocks_shots: false,
+                presentation_available: false,
+            },
+        );
+        assert!(session.set_wall_material_catalog(unavailable));
+        assert!(session
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .is_err());
+        assert_eq!(session.world.walls[0].texture, 87);
+        let mut available = WallMaterialCatalog::default();
+        available.set(
+            87,
+            WallMaterial {
+                blocks_movement: false,
+                blocks_shots: true,
+                presentation_available: true,
+            },
+        );
+        available.set(
+            2,
+            WallMaterial {
+                blocks_movement: true,
+                blocks_shots: false,
+                presentation_available: true,
+            },
+        );
+        assert!(session.set_wall_material_catalog(available));
+        session
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .unwrap();
+        assert_eq!(session.world.walls[0].texture, 2);
+    }
+
+    #[test]
+    fn delayed_wall_change_revalidates_and_retries_clearance() {
+        let text =
+            "#proc1\nstartdelay 0.05\n#action\nchange 1 0 2\n#end\n#links\nlink 0 0 1\n#end\n";
+        let mut session = wall_change_session(text);
+        let mut events = SessionEvents::default();
+        session
+            .try_staged_process("link", [0, 0], 1, &mut events)
+            .unwrap();
+        assert!(events.wall_transitions.is_empty());
+        session.world.player.position = [1.0, 0.5];
+        for _ in 0..5 {
+            session.step(SessionInput::default());
+        }
+        assert_eq!(session.processes.ready_delayed(), vec![1]);
+        assert_eq!(session.world.walls[0].texture, 87);
+        session.world.player.position = [0.5, 0.5];
+        let result = session.step(SessionInput::default());
+        assert_eq!(result.wall_transitions.len(), 1);
+        assert_eq!(session.world.walls[0].texture, 2);
+        assert!(session.processes.ready_delayed().is_empty());
+    }
+
+    #[test]
+    fn failed_destroy_group_rolls_back_wall_and_events() {
+        let text = "#proc1\n#action\nchange 1 0 2\n#end\n#proc2\n#action\nchange 3 0 163\n#end\n#links\ndestroy 4 0 1\ndestroy 4 0 2\n#end\n";
+        let mut session = wall_change_session(text);
+        let mut events = SessionEvents::default();
+        let (_, accepted) = session.activate_destroy([4, 0], &mut events);
+        assert!(!accepted);
+        assert!(events.wall_transitions.is_empty());
+        assert_eq!(session.world.walls[0].texture, 87);
+        assert!(!session.base_wall_blocking[0]);
+        assert_eq!(session.processes.cell_type([1, 0]), Some(87));
     }
 
     fn ambient_session(text: &str) -> Session {

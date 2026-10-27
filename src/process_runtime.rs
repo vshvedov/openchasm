@@ -39,6 +39,20 @@ enum MotionKind {
     /// Raw process height units; projection and collision are handled by host.
     Vertical(i32),
 }
+
+fn rotations_share_pivot<'a>(kinds: impl IntoIterator<Item = &'a MotionKind>) -> bool {
+    let mut pivot = None;
+    for kind in kinds {
+        let MotionKind::Rotate { pivot: current, .. } = kind else {
+            return false;
+        };
+        if pivot.is_some_and(|previous| previous != *current) {
+            return false;
+        }
+        pivot = Some(*current);
+    }
+    pivot.is_some()
+}
 impl Motion {
     fn transform(&self, point: [f32; 2], from: f32, to: f32) -> [f32; 2] {
         let progress_delta = to - from;
@@ -1684,8 +1698,8 @@ impl ProcessRuntime {
         })
     }
     /// Verify restored process motion against a fresh runtime/world baseline.
-    /// Translations commute; a rotation sharing its target with any other
-    /// horizontal motion has history-dependent order and is rejected.
+    /// Translations and rotations sharing one pivot commute. Other rotation
+    /// combinations have history-dependent order and are rejected.
     pub fn validate_snapshot_geometry(
         &self,
         baseline: &ProcessRuntime,
@@ -1736,6 +1750,7 @@ impl ProcessRuntime {
                 && horizontal
                     .iter()
                     .any(|m| matches!(m.kind, MotionKind::Rotate { .. }))
+                && !rotations_share_pivot(horizontal.iter().map(|m| &m.kind))
                 && (horizontal.iter().any(|m| m.progress != 0.0)
                     || !near(base.a[0], saved.a[0])
                     || !near(base.a[1], saved.a[1])
@@ -1788,6 +1803,7 @@ impl ProcessRuntime {
                 && horizontal
                     .iter()
                     .any(|m| matches!(m.kind, MotionKind::Rotate { .. }))
+                && !rotations_share_pivot(horizontal.iter().map(|m| &m.kind))
                 && (horizontal.iter().any(|m| m.progress != 0.0)
                     || !near(base.position[0], object.position[0])
                     || !near(base.position[1], object.position[1])
@@ -3254,6 +3270,54 @@ mod tests {
         assert_eq!(
             runtime.validate_snapshot_geometry(&baseline, &world, &moved),
             Err(ProcessGeometryError::AmbiguousRotation)
+        );
+        let script = Script::parse("#proc1\n#action\nrotate 1 0 256 0 90\n#end\n#proc2\n#action\nrotate 1 0 512 0 90\n#end\n#links\nlink 0 0 2\n#end\n");
+        let baseline = ProcessRuntime::new(&script, &world);
+        let mut runtime = baseline.clone();
+        let mut moved = world.clone();
+        runtime.activate_at("link", [0, 0]);
+        runtime.tick(&mut moved, 1.0 / 60.0, false);
+        assert_eq!(
+            runtime.validate_snapshot_geometry(&baseline, &world, &moved),
+            Err(ProcessGeometryError::AmbiguousRotation)
+        );
+    }
+
+    #[test]
+    fn object_rotations_with_same_pivot_restore_and_reject_forgery() {
+        let script = Script::parse("#proc1\n#action\nrotate 2 0 512 0 30\n#end\n#proc2\n#action\nrotate 2 0 512 0 45\n#end\n#links\nlink 0 0 1\n#end\n");
+        let base_world = world();
+        let mut cells = [0; 4096];
+        cells[128] = 163;
+        let baseline = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &base_world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[object_fixture([2, 0])],
+        )
+        .unwrap();
+        let mut runtime = baseline.clone();
+        let mut moved = base_world.clone();
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        runtime.advance_motions(&mut moved, 0.1);
+        runtime.take_effects();
+        let snapshot = runtime.snapshot(&moved).unwrap();
+        let mut restored = baseline.clone();
+        restored.restore(&snapshot, &moved).unwrap();
+        assert_eq!(
+            restored.validate_snapshot_geometry(&baseline, &base_world, &moved),
+            Ok(())
+        );
+        let mut forged = snapshot;
+        forged.objects[0].position[0] += 0.1;
+        restored.restore(&forged, &moved).unwrap();
+        assert_eq!(
+            restored.validate_snapshot_geometry(&baseline, &base_world, &moved),
+            Err(ProcessGeometryError::PoseMismatch)
         );
     }
 

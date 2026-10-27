@@ -633,10 +633,25 @@ struct QuickSave {
     shot_feedback: Option<(&'static str, f32)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckpointCommand {
     Save,
     Load,
+}
+fn checkpoint_command_for_key(key: Scancode) -> Option<CheckpointCommand> {
+    match key {
+        Scancode::F5 => Some(CheckpointCommand::Save),
+        Scancode::F9 => Some(CheckpointCommand::Load),
+        _ => None,
+    }
+}
+fn apply_checkpoint_commands(
+    commands: Vec<CheckpointCommand>,
+    mut apply: impl FnMut(CheckpointCommand),
+) {
+    for command in commands {
+        apply(command);
+    }
 }
 
 fn sync_actor_scene(
@@ -787,7 +802,7 @@ pub fn run(
         let frame_start = Instant::now();
         let mut restart_requested = false;
         let mut advance_requested = false;
-        let mut checkpoint_command = None;
+        let mut checkpoint_commands = Vec::new();
         let mut suppress_gameplay = false;
         for event in event_pump.poll_iter() {
             if matches!(
@@ -862,11 +877,11 @@ pub fn run(
                             suppress_gameplay = true;
                         }
                         PauseAction::Save => {
-                            checkpoint_command = Some(CheckpointCommand::Save);
+                            checkpoint_commands.push(CheckpointCommand::Save);
                             suppress_gameplay = true;
                         }
                         PauseAction::Load => {
-                            checkpoint_command = Some(CheckpointCommand::Load);
+                            checkpoint_commands.push(CheckpointCommand::Load);
                             suppress_gameplay = true;
                         }
                         PauseAction::Restart => {
@@ -907,10 +922,8 @@ pub fn run(
                             suppress_gameplay = true;
                         } else if code == Scancode::Return {
                             advance_requested = true;
-                        } else if code == Scancode::F5 {
-                            checkpoint_command = Some(CheckpointCommand::Save);
-                        } else if code == Scancode::F9 {
-                            checkpoint_command = Some(CheckpointCommand::Load);
+                        } else if let Some(command) = checkpoint_command_for_key(code) {
+                            checkpoint_commands.push(command);
                         } else if code == Scancode::Tab {
                             minimap.open = !minimap.open;
                         } else if code == Scancode::E {
@@ -1008,7 +1021,7 @@ pub fn run(
             completed = false;
             look.pending_dx = 0;
         }
-        if let Some(command) = checkpoint_command {
+        apply_checkpoint_commands(checkpoint_commands, |command| {
             match command {
                 CheckpointCommand::Save => {
                     quicksave = Some(QuickSave {
@@ -1069,7 +1082,7 @@ pub fn run(
                     }
                 }
             }
-        }
+        });
         if completed && advance_requested && !pause.open {
             sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
@@ -1419,6 +1432,22 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn same_batch_checkpoint_keys_preserve_save_then_load_order() {
+        let commands: Vec<_> = [Scancode::F5, Scancode::F9]
+            .into_iter()
+            .filter_map(checkpoint_command_for_key)
+            .collect();
+        assert_eq!(commands, [CheckpointCommand::Save, CheckpointCommand::Load]);
+        let mut live_state = 42;
+        let mut saved = Some(7);
+        apply_checkpoint_commands(commands, |command| match command {
+            CheckpointCommand::Save => saved = Some(live_state),
+            CheckpointCommand::Load => live_state = saved.unwrap(),
+        });
+        assert_eq!(live_state, 42);
+        assert_eq!(saved, Some(42));
+    }
     #[test]
     fn committed_break_sounds_use_event_order_and_pretransition_metadata() {
         use openchasm::session::{ObjectDestructionCause, ObjectDestructionEvent};

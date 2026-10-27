@@ -78,6 +78,11 @@ impl Menu {
     fn custom_selected(&self) -> bool {
         self.source == self.sources.len()
     }
+    fn erase_path_character(&mut self) {
+        self.custom.pop();
+        self.levels.clear();
+        self.error = Some("Press Enter to load this path".into());
+    }
     fn path(&self) -> PathBuf {
         if self.custom_selected() {
             PathBuf::from(&self.custom)
@@ -126,14 +131,19 @@ impl Menu {
         // Revalidate custom paths and content at start, including external changes.
         let selected = self.levels.get(self.level).map(|level| level.0.clone());
         self.refresh();
-        let id = selected
-            .and_then(|id| {
-                self.levels
-                    .iter()
-                    .find(|entry| entry.0 == id)
-                    .map(|entry| entry.0.clone())
-            })
-            .or_else(|| self.levels.first().map(|entry| entry.0.clone()))?;
+        let id = if let Some(id) = selected {
+            if !self.levels.iter().any(|entry| entry.0 == id) {
+                if !self.levels.is_empty() {
+                    self.error = Some(format!(
+                        "Selected level {id} is no longer available; choose a level"
+                    ));
+                }
+                return None;
+            }
+            id
+        } else {
+            self.levels.first()?.0.clone()
+        };
         Some(Choice {
             path: self.path(),
             level: id,
@@ -245,6 +255,12 @@ pub fn run(
                     }
                 }
                 Event::KeyDown {
+                    keycode: Some(Keycode::Backspace),
+                    ..
+                } if menu.row == 1 && menu.custom_selected() => {
+                    menu.erase_path_character();
+                }
+                Event::KeyDown {
                     keycode: Some(key),
                     keymod,
                     repeat: false,
@@ -254,11 +270,6 @@ pub fn run(
                     Keycode::Down | Keycode::Tab => menu.row = (menu.row + 1) % 5,
                     Keycode::Left if menu.row != 1 => menu.change(-1),
                     Keycode::Right if menu.row != 1 => menu.change(1),
-                    Keycode::Backspace if menu.row == 1 && menu.custom_selected() => {
-                        menu.custom.pop();
-                        menu.levels.clear();
-                        menu.error = Some("Press Enter to load this path".into());
-                    }
                     Keycode::V
                         if menu.row == 1
                             && menu.custom_selected()
@@ -466,7 +477,23 @@ mod tests {
         menu.change(1);
         assert!(menu.custom_selected());
         assert_eq!(menu.levels.len(), 2);
+        menu.level = 1;
+        std::fs::remove_file(map.join("map.02")).unwrap();
+        assert!(menu.choice().is_none());
+        assert!(menu.error.as_deref().unwrap().contains("level 02"));
+        assert_eq!(menu.levels.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
         assert!(menu.choice().is_none());
+    }
+    #[test]
+    fn path_backspace_handles_unicode_and_invalidates_selection() {
+        let mut menu = Menu::new(vec![], None, None);
+        menu.custom = "abcé".into();
+        menu.levels.push(("01".into(), "A".into()));
+        menu.erase_path_character();
+        assert_eq!(menu.custom, "abc");
+        assert!(menu.levels.is_empty());
+        menu.erase_path_character();
+        assert_eq!(menu.custom, "ab");
     }
 }

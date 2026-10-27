@@ -236,6 +236,7 @@ pub struct ObjectScene {
     palette: [u32; 256],
     object_cache: HashMap<(String, Option<String>), Option<usize>>,
     level_meshes: Vec<Option<(usize, bool, bool)>>,
+    mine_mesh: Option<usize>,
 }
 
 fn texture_uv(polygon: &crate::model::Polygon, corner: usize, car_uv: bool) -> [f32; 2] {
@@ -811,6 +812,7 @@ impl ObjectScene {
             palette,
             object_cache: cache,
             level_meshes,
+            mine_mesh: None,
         }
     }
 
@@ -1069,6 +1071,32 @@ impl ObjectScene {
         }
     }
 
+    /// Preload the item table's planted-mine model (index 30). Missing or
+    /// unsupported resources leave mine snapshots invisible and return false.
+    #[allow(dead_code)] // Viewer opts in when mine simulation is integrated.
+    pub fn preload_mine(
+        &mut self,
+        resources: &mut ResourceSet,
+        definitions: &ObjectDefinitions,
+    ) -> bool {
+        let Some(definition) = definitions.items.get(30) else {
+            return false;
+        };
+        let mut warnings = BTreeSet::new();
+        let mesh = load_object_mesh(
+            resources,
+            definition,
+            &mut self.meshes,
+            &mut self.object_cache,
+            &mut warnings,
+        );
+        for warning in warnings {
+            eprintln!("mine preview: {warning}");
+        }
+        self.mine_mesh = mesh;
+        mesh.is_some()
+    }
+
     /// Update one render-side actor pose by its stable source placement index.
     #[allow(dead_code)] // Used once simulation state drives actor transforms.
     pub fn set_actor_pose(
@@ -1197,8 +1225,27 @@ impl ObjectScene {
         height: usize,
         camera: CameraView,
     ) {
+        self.render_with_mines(frame, depth, width, height, camera, &[]);
+    }
+
+    /// Render a snapshot of active mines in the same pass as static objects,
+    /// preserving shared wall/object depth and per-pixel translucent ordering.
+    /// Mines use their base pose at their XYZ position; armed flashing and
+    /// model-group toggling remain unverified and are not represented.
+    #[allow(dead_code)] // Viewer opts in when mine simulation is integrated.
+    pub fn render_with_mines(
+        &self,
+        frame: &mut [u32],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        mines: &[openchasm::explosives::Mine],
+    ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
+            || !player.position.iter().all(|x| x.is_finite())
+            || !player.angle.is_finite()
             || width.checked_mul(height) != Some(frame.len())
             || frame.len() != depth.len()
         {
@@ -1213,7 +1260,37 @@ impl ObjectScene {
             palette: &self.palette,
             translucent: None,
         };
-        for instance in &self.instances {
+        let mine_instances: Vec<_> = self
+            .mine_mesh
+            .into_iter()
+            .flat_map(|mesh| {
+                mines
+                    .iter()
+                    .take(openchasm::explosives::MAX_MINES)
+                    .filter_map(move |mine| {
+                        if !mine.position.iter().all(|value| value.is_finite()) {
+                            return None;
+                        }
+                        Some(Instance {
+                            mesh,
+                            position: [mine.position[0], mine.position[1]],
+                            angle: 0.0,
+                            elevation: mine.position[2],
+                            cell: None,
+                            actor_source_index: None,
+                            object_definition_index: None,
+                            original_definition_index: None,
+                            object_animation_playing: false,
+                            object_animation_initially_playing: false,
+                            object_animation_seconds: 0.0,
+                            animation_mode: ActorAnimationMode::Idle,
+                            animation_seconds: 0.0,
+                            visible: true,
+                        })
+                    })
+            })
+            .collect();
+        for instance in self.instances.iter().chain(&mine_instances) {
             if !instance.visible {
                 continue;
             }
@@ -1348,6 +1425,7 @@ mod tests {
             palette: [0; 256],
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
+            mine_mesh: None,
         }
     }
     #[test]
@@ -1396,6 +1474,7 @@ mod tests {
             palette: [0; 256],
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
+            mine_mesh: None,
         };
         scene.add_actors(&mut resources, &actors, &defs);
         assert_eq!(scene.meshes.len(), 1); // shared mesh
@@ -1549,6 +1628,113 @@ mod tests {
             );
             assert_eq!(instance.object_animation_seconds, 0.0);
         }
+    }
+
+    #[test]
+    fn mine_snapshots_share_depth_and_reject_non_finite_positions() {
+        use openchasm::explosives::Mine;
+        use openchasm::projectiles::Owner;
+        let mut scene = gltf_scene(255);
+        scene.instances.clear();
+        scene.mine_mesh = Some(0);
+        let mine = Mine {
+            id: 1,
+            owner: Owner::Player,
+            position: [2.0, 0.0, 0.0],
+            age_ticks: 0,
+            armed: false,
+        };
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+        };
+        let mut frame = vec![0; 64 * 64];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        scene.render_with_mines(&mut frame, &mut depth, 64, 64, camera, &[mine]);
+        assert!(frame.iter().any(|&pixel| pixel != 0));
+        frame.fill(0);
+        depth.fill(1.0);
+        scene.render_with_mines(&mut frame, &mut depth, 64, 64, camera, &[mine]);
+        assert!(frame.iter().all(|&pixel| pixel == 0));
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        let invalid = Mine {
+            position: [2.0, 0.0, f32::INFINITY],
+            ..mine
+        };
+        scene.render_with_mines(&mut frame, &mut depth, 64, 64, camera, &[invalid]);
+        assert!(frame.iter().all(|&pixel| pixel == 0));
+        assert!(depth.iter().all(|&pixel| pixel == f32::INFINITY));
+    }
+
+    #[test]
+    fn installed_mine_snapshot_renders_and_obeys_depth_when_available() {
+        use openchasm::explosives::Mine;
+        use openchasm::projectiles::Owner;
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let map = crate::map::Map::parse(&resources.read("map/map.01").unwrap()).unwrap();
+        let definitions = ObjectDefinitions::parse(
+            &resources.read("chasm.inf").unwrap(),
+            &resources.read("map/resource.01").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            definitions.items[30].model_name.to_ascii_lowercase(),
+            "mine.3o"
+        );
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+        scene.instances.clear();
+        assert!(scene.preload_mine(&mut resources, &definitions));
+        let mesh = scene.mine_mesh.unwrap();
+        assert_eq!(scene.meshes[mesh].model.vertices.len(), 17);
+        let mesh_count = scene.meshes.len();
+        assert!(scene.preload_mine(&mut resources, &definitions));
+        assert_eq!(scene.meshes.len(), mesh_count);
+        let mine = Mine {
+            id: 1,
+            owner: Owner::Player,
+            position: [2.0, 0.0, 0.0],
+            age_ticks: 0,
+            armed: false,
+        };
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 0.75,
+        };
+        let mut frame = vec![0; 160 * 100];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        scene.render_with_mines(&mut frame, &mut depth, 160, 100, camera, &[mine]);
+        assert!(frame.iter().any(|&pixel| pixel != 0));
+        assert!(depth.iter().any(|&pixel| pixel.is_finite()));
+        frame.fill(0);
+        depth.fill(1.0);
+        scene.render_with_mines(&mut frame, &mut depth, 160, 100, camera, &[mine]);
+        assert!(frame.iter().all(|&pixel| pixel == 0));
+        assert!(depth.iter().all(|&value| value == 1.0));
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        let invalid = Mine {
+            position: [f32::NAN, 0.0, 0.0],
+            ..mine
+        };
+        scene.render_with_mines(&mut frame, &mut depth, 160, 100, camera, &[invalid]);
+        assert!(frame.iter().all(|&pixel| pixel == 0));
+        assert!(depth.iter().all(|&value| value == f32::INFINITY));
     }
 
     #[test]
@@ -1784,6 +1970,7 @@ mod tests {
             palette: [0; 256],
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
+            mine_mesh: None,
         };
         assert!(scene.set_actor_animation(7, ActorAnimationMode::Idle, 0.25));
         assert_eq!(scene.instances[0].animation_seconds, 0.25);
@@ -1838,6 +2025,7 @@ mod tests {
             palette: [0; 256],
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
+            mine_mesh: None,
         };
         assert!(scene.set_visible([1, 2], false));
         assert!(!scene.instances[0].visible);
@@ -1909,6 +2097,7 @@ mod tests {
             palette: [0; 256],
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
+            mine_mesh: None,
         };
         scene.add_actors(&mut resources, &actors, &definitions);
         assert_eq!(scene.meshes.len(), 1);

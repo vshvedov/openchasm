@@ -2,6 +2,7 @@
 //!
 //! Geometry here is renderer-only: the camera height and lighting are chosen to
 //! match the current wall preview, not yet validated against the original game.
+use crate::color_pipeline::RenderPixel;
 use crate::map::{Floors, Map, FLOOR_TEXTURE_COUNT, FLOOR_TEXTURE_SIDE, MAP_SIDE};
 use crate::object_render::CameraView;
 use crate::sky::Sky;
@@ -80,6 +81,7 @@ impl PlaneRenderer {
     }
 
     /// Paint planes and write perpendicular depths for actual geometry only.
+    #[cfg(test)]
     pub fn render_with_depth(
         &self,
         frame: &mut [u32],
@@ -92,9 +94,22 @@ impl PlaneRenderer {
         self.render_inner(frame, Some(depth), width, height, camera, lights);
     }
 
-    fn render_inner(
+    /// Render plane colors into either the legacy or linear-HDR target.
+    pub fn render_to<C: RenderPixel>(
         &self,
-        frame: &mut [u32],
+        frame: &mut [C],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+    ) {
+        self.render_inner(frame, Some(depth), width, height, camera, lights);
+    }
+
+    fn render_inner<C: RenderPixel>(
+        &self,
+        frame: &mut [C],
         mut depth: Option<&mut [f32]>,
         width: usize,
         height: usize,
@@ -125,15 +140,15 @@ impl PlaneRenderer {
             } else {
                 FLOOR_BACKGROUND
             };
-            row.fill(background);
-            let paint_sky = |x: usize, pixel: &mut u32| {
+            row.fill(C::from_srgb8(background));
+            let paint_sky = |x: usize, pixel: &mut C| {
                 if let Some(sky) = &self.sky {
                     let camera_x = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
-                    *pixel = sky.sample([
+                    *pixel = C::from_srgb8(sky.sample([
                         cos + camera_plane[0] * camera_x,
                         sin + camera_plane[1] * camera_x,
                         (horizon - (y as f32 + 0.5)) / projection,
-                    ]);
+                    ]));
                 }
             };
             // Half the current preview wall's projected height at unit distance.
@@ -193,14 +208,10 @@ impl PlaneRenderer {
                         + tx];
                 let light = lights.map_or(0.0, |lights| lights.sample([world_x, world_y]));
                 let static_light = self.static_light.sample([world_x, world_y]).unwrap_or(1.0);
-                let shade =
-                    |channel| ((channel as f32 * static_light * (1.0 + light)) as u32).min(255);
                 if let Some(buffer) = depth.as_deref_mut() {
                     buffer[y * width + x] = distance;
                 }
-                *pixel = (shade((texel >> 16) & 255) << 16)
-                    | (shade((texel >> 8) & 255) << 8)
-                    | shade(texel & 255);
+                *pixel = C::shade_srgb8(texel, static_light * (1.0 + light));
             }
         }
     }
@@ -254,6 +265,36 @@ mod tests {
         assert!(minimum >= 0.0 && maximum <= 1.3 && maximum - minimum > 0.5);
         assert!(light.sample([-1.0, 0.0]).is_none());
         assert!(light.wall_sample([64, 0], 0.5).is_none());
+    }
+
+    #[test]
+    fn generic_plane_target_preserves_hdr_and_matches_legacy_output() {
+        use crate::color_pipeline::LinearRgb;
+        let (map, floors, palette) = fixtures(0, SKY_TILE);
+        let mut renderer = PlaneRenderer::new(&map, &floors, &palette);
+        let raw = vec![0; 0x27001 + 4];
+        renderer.static_light = Map::parse(&raw).unwrap().static_light().clone();
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [16.5, 16.5],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut legacy = vec![0; 64];
+        let mut generic = legacy.clone();
+        let mut depth_a = vec![f32::INFINITY; 64];
+        let mut depth_b = depth_a.clone();
+        renderer.render_with_depth(&mut legacy, &mut depth_a, 8, 8, camera, None);
+        renderer.render_to(&mut generic, &mut depth_b, 8, 8, camera, None);
+        assert_eq!(legacy, generic);
+        assert_eq!(depth_a, depth_b);
+        let mut hdr = vec![LinearRgb::default(); 64];
+        let mut depth_hdr = vec![f32::INFINITY; 64];
+        renderer.render_to(&mut hdr, &mut depth_hdr, 8, 8, camera, None);
+        assert!(hdr[7 * 8 + 4].0[0] > 1.0);
+        assert_eq!(depth_a, depth_hdr);
     }
 
     #[test]

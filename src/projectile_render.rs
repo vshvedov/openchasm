@@ -167,9 +167,33 @@ impl ProjectileRenderer {
 
     /// Sample authored light per projectile; fullbright definitions bypass it.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn render_with_static_light(
         &self,
         frame: &mut [u32],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        projectiles: &[ProjectileVisual],
+        static_light: Option<&crate::map::StaticLightMap>,
+    ) {
+        self.render_to(
+            frame,
+            depth,
+            width,
+            height,
+            camera,
+            projectiles,
+            static_light,
+        );
+    }
+
+    /// Render directly to an encoded or linear-HDR scene buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to<C: crate::color_pipeline::RenderPixel>(
+        &self,
+        frame: &mut [C],
         depth: &mut [f32],
         width: usize,
         height: usize,
@@ -326,15 +350,15 @@ fn project(vertex: Vertex, width: usize, height: usize, horizon: f32) -> Project
 fn edge(a: Projected, b: Projected, x: f32, y: f32) -> f32 {
     (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x)
 }
-struct Raster<'a> {
-    frame: &'a mut [u32],
+struct Raster<'a, C: crate::color_pipeline::RenderPixel> {
+    frame: &'a mut [C],
     depth: &'a mut [f32],
     width: usize,
     height: usize,
     palette: &'a [u32; 256],
     static_light: Option<f32>,
 }
-impl Raster<'_> {
+impl<C: crate::color_pipeline::RenderPixel> Raster<'_, C> {
     fn triangle(&mut self, triangle: [Projected; 3], model: &Model, flags: u8, fullbright: bool) {
         let [a, b, c] = triangle;
         let area = edge(a, b, c.x, c.y);
@@ -378,10 +402,7 @@ impl Raster<'_> {
                     self.static_light
                         .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0))
                 };
-                let channel = |c: u32| (c as f32 * attenuation) as u32;
-                self.frame[pixel] = (channel((rgb >> 16) & 255) << 16)
-                    | (channel((rgb >> 8) & 255) << 8)
-                    | channel(rgb & 255);
+                self.frame[pixel] = C::shade_srgb8(rgb, attenuation);
                 self.depth[pixel] = distance;
             }
         }
@@ -637,6 +658,69 @@ mod tests {
             .collect();
         assert!(!columns.is_empty());
         assert!(columns.iter().all(|&x| x > 320));
+    }
+
+    #[test]
+    fn linear_projectile_retains_hdr_light_respects_depth_and_fullbright() {
+        use crate::color_pipeline::LinearRgb;
+        let mut renderer = renderer();
+        renderer.fullbright[0] = false;
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [3.0, 0.0, 1.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        let map = crate::map::Map::parse(&vec![0; 0x27001 + 4]).unwrap();
+        let mut frame = vec![LinearRgb::default(); 64 * 64];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        renderer.render_to(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            Some(map.static_light()),
+        );
+        let index = frame
+            .iter()
+            .position(|p| p.0[0] > 1.0)
+            .expect("retain light above one");
+        frame.fill(LinearRgb::default());
+        depth.fill(0.1);
+        renderer.render_to(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            Some(map.static_light()),
+        );
+        assert_eq!(frame[index], LinearRgb::default());
+        frame.fill(LinearRgb::default());
+        depth.fill(f32::INFINITY);
+        renderer.fullbright[0] = true;
+        renderer.render_to(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            Some(map.static_light()),
+        );
+        assert!((frame[index].0[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

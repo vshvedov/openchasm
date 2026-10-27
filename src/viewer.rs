@@ -7,6 +7,8 @@
 #[path = "minimap.rs"]
 mod minimap;
 use crate::audio::{Audio, PlayerSound};
+use crate::color_pipeline::{ColorPipeline, LinearRgb, RenderPixel};
+use crate::graphics_settings::{GraphicsMenu, GraphicsSettings, MenuAction, SettingsStore};
 use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot};
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
@@ -32,7 +34,16 @@ const WIDTH: usize = 640;
 const HEIGHT: usize = 400;
 const STEP: f32 = 1.0 / 60.0;
 const MOUSE_SENSITIVITY: f32 = 0.002;
-const FRAME_DURATION: Duration = Duration::from_micros(16_667);
+fn fps_limit(value: u32) -> Option<Duration> {
+    (value != 0).then(|| Duration::from_secs_f64(1.0 / f64::from(value)))
+}
+fn effective_fps_limit(stored: u32, uncapped_override: bool) -> Option<Duration> {
+    if uncapped_override {
+        None
+    } else {
+        fps_limit(stored)
+    }
+}
 
 #[derive(Default)]
 struct RelativeLook {
@@ -172,6 +183,7 @@ enum PauseAction {
     Resume,
     Save,
     Load,
+    Options,
     Restart,
     Exit,
 }
@@ -202,15 +214,16 @@ impl PauseMenu {
         }
         match code {
             Scancode::Escape => return Some(PauseAction::Resume),
-            Scancode::Up => self.selected = (self.selected + 4) % 5,
-            Scancode::Down => self.selected = (self.selected + 1) % 5,
+            Scancode::Up => self.selected = (self.selected + 5) % 6,
+            Scancode::Down => self.selected = (self.selected + 1) % 6,
             Scancode::F5 => return Some(PauseAction::Save),
             Scancode::F9 => return Some(PauseAction::Load),
             Scancode::Return => match self.selected {
                 0 => return Some(PauseAction::Resume),
                 1 => return Some(PauseAction::Save),
                 2 => return Some(PauseAction::Load),
-                3 => self.confirm = Some(PauseAction::Restart),
+                3 => return Some(PauseAction::Options),
+                4 => self.confirm = Some(PauseAction::Restart),
                 _ => self.confirm = Some(PauseAction::Exit),
             },
             _ => {}
@@ -255,6 +268,7 @@ fn draw_pause_menu(frame: &mut [u32], menu: &PauseMenu) {
             "RESUME",
             "MEMORY QUICK SAVE",
             "MEMORY QUICK LOAD",
+            "GRAPHICS OPTIONS",
             "RESTART LEVEL",
             "EXIT LEVEL",
         ]
@@ -460,6 +474,7 @@ fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
     }
 }
 
+#[derive(Clone, Copy)]
 struct RenderWorld<'a> {
     world: &'a World,
     elevations: &'a [f32],
@@ -502,6 +517,7 @@ struct RenderTimings {
     model: Duration,
     effects: Duration,
     weapon: Duration,
+    post: Duration,
 }
 impl RenderTimings {
     fn accumulate(&mut self, other: Self) {
@@ -510,6 +526,7 @@ impl RenderTimings {
         self.model += other.model;
         self.effects += other.effects;
         self.weapon += other.weapon;
+        self.post += other.post;
     }
     fn ms_per_frame(value: Duration, frames: u32) -> f64 {
         if frames == 0 {
@@ -535,11 +552,11 @@ fn render(
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
 ) {
-    let _ = render_profiled::<true>(frame, depth, scene, textures, planes, objects, false);
+    let _ = render_profiled::<true, u32>(frame, depth, scene, textures, planes, objects, false);
 }
 
-fn render_profiled<const NEAR_FIRST: bool>(
-    frame: &mut [u32],
+fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
+    frame: &mut [C],
     depth: &mut [f32],
     scene: RenderWorld<'_>,
     textures: &[Option<ViewerTexture>],
@@ -559,14 +576,16 @@ fn render_profiled<const NEAR_FIRST: bool>(
     };
     depth.fill(f32::INFINITY);
     if let Some(planes) = planes {
-        planes.render_with_depth(frame, depth, WIDTH, HEIGHT, camera, scene.lights);
+        planes.render_to(frame, depth, WIDTH, HEIGHT, camera, scene.lights);
     } else {
         for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
-            row.fill(if (y as f32 + 0.5) < camera.horizon(HEIGHT) {
-                0x303847
-            } else {
-                0x38312b
-            });
+            row.fill(C::from_srgb8(
+                if (y as f32 + 0.5) < camera.horizon(HEIGHT) {
+                    0x303847
+                } else {
+                    0x38312b
+                },
+            ));
         }
     }
     timings.plane = profile_elapsed(started);
@@ -618,10 +637,13 @@ fn render_profiled<const NEAR_FIRST: bool>(
                 })
                 .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
             let light = scene.lights.map_or(0.0, |lights| lights.sample(point));
-            let channel = |base: u32| ((base as f32 * attenuation * (1.0 + light)) as u32).min(255);
-            let color = (channel(75 + texture * 37 % 110) << 16)
-                | (channel(70 + texture * 23 % 100) << 8)
-                | channel(65 + texture * 13 % 90);
+            let lighting = attenuation * (1.0 + light);
+            let color = C::shade_srgb8(
+                ((75 + texture * 37 % 110) << 16)
+                    | ((70 + texture * 23 % 100) << 8)
+                    | (65 + texture * 13 % 90),
+                lighting,
+            );
             let image = textures.get(texture as usize).and_then(Option::as_ref);
             for y in top..bottom {
                 if distance >= depth[y * WIDTH + x] {
@@ -636,9 +658,7 @@ fn render_profiled<const NEAR_FIRST: bool>(
                     if (87..=119).contains(&texture) && rgb >> 24 == 0 {
                         continue;
                     }
-                    (channel((rgb >> 16) & 255) << 16)
-                        | (channel((rgb >> 8) & 255) << 8)
-                        | channel(rgb & 255)
+                    C::shade_srgb8(rgb, lighting)
                 } else {
                     color
                 };
@@ -650,7 +670,7 @@ fn render_profiled<const NEAR_FIRST: bool>(
     timings.wall = profile_elapsed(started);
     let started = profile_start(profile);
     if let Some(objects) = objects {
-        objects.render_with_static_light(
+        objects.render_to(
             frame,
             depth,
             WIDTH,
@@ -663,6 +683,76 @@ fn render_profiled<const NEAR_FIRST: bool>(
     }
     timings.model = profile_elapsed(started);
     timings
+}
+
+struct FrameScene<'a> {
+    world: RenderWorld<'a>,
+    textures: &'a [Option<ViewerTexture>],
+    planes: &'a PlaneRenderer,
+    objects: &'a ObjectScene,
+    camera: CameraView,
+    projectiles: &'a ProjectileRenderer,
+    projectile_visuals: &'a [ProjectileVisual],
+    explosions: Option<&'a crate::explosion_render::ExplosionRenderer>,
+    impacts: Option<&'a crate::impact_render::ImpactRenderer>,
+    trails: Option<&'a crate::projectile_trails::ProjectileTrails>,
+    weapon: &'a WeaponRenderer,
+    weapon_id: usize,
+    weapon_pose: WeaponPose,
+    weapon_frame: usize,
+}
+impl FrameScene<'_> {
+    fn draw<C: RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &mut [f32],
+        profile: bool,
+    ) -> RenderTimings {
+        let mut timings = render_profiled::<true, C>(
+            frame,
+            depth,
+            self.world,
+            self.textures,
+            Some(self.planes),
+            Some(self.objects),
+            profile,
+        );
+        let started = profile_start(profile);
+        self.projectiles.render_to(
+            frame,
+            depth,
+            WIDTH,
+            HEIGHT,
+            self.camera,
+            self.projectile_visuals,
+            Some(self.planes.static_light()),
+        );
+        if let Some(renderer) = self.explosions {
+            renderer.render_to(frame, depth, WIDTH, HEIGHT, self.camera);
+        }
+        if let Some(renderer) = self.impacts {
+            renderer.render_to(frame, depth, WIDTH, HEIGHT, self.camera);
+        }
+        if let Some(renderer) = self.trails {
+            renderer.render_to(frame, depth, WIDTH, HEIGHT, self.camera);
+        }
+        timings.effects = profile_elapsed(started);
+        let started = profile_start(profile);
+        self.weapon.render_to(
+            frame,
+            WIDTH,
+            HEIGHT,
+            self.weapon_id,
+            self.weapon_pose,
+            self.weapon_frame,
+            self.planes
+                .static_light()
+                .sample(self.camera.player.position)
+                .unwrap_or(1.0),
+        );
+        timings.weapon = profile_elapsed(started);
+        timings
+    }
 }
 
 fn draw_header(frame: &mut [u32], label: &str) {
@@ -888,6 +978,26 @@ pub fn run(
     let mut held = HashSet::new();
     let mut mouse_fire = false;
     let mut frame = vec![0; WIDTH * HEIGHT];
+    let mut hdr_frame = vec![LinearRgb::default(); WIDTH * HEIGHT];
+    let mut bloom = crate::bloom::Bloom::new(WIDTH, HEIGHT)?;
+    let settings_store = match SettingsStore::for_sdl() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("graphics preference directory unavailable: {error}");
+            None
+        }
+    };
+    let mut graphics = match settings_store.as_ref().map(SettingsStore::load) {
+        Some(Ok(settings)) => settings,
+        Some(Err(error)) => {
+            eprintln!("graphics preferences unavailable: {error}");
+            GraphicsSettings::default()
+        }
+        None => GraphicsSettings::default(),
+    };
+    let mut uncapped_override = std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1");
+    let mut color_pipeline = ColorPipeline::new(graphics.color_settings())?;
+    let mut graphics_menu = GraphicsMenu::default();
     let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
     let mut frame_clock = FrameClock {
         last: Instant::now(),
@@ -910,13 +1020,9 @@ pub fn run(
     let mut completed = false;
     let mut pause = PauseMenu::default();
     let mut console = crate::developer_console::Console::default();
-    let mut show_fps = true;
-    let mut mouse_sensitivity = MOUSE_SENSITIVITY;
-    let frame_limit = if std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1") {
-        None
-    } else {
-        Some(FRAME_DURATION)
-    };
+    let mut show_fps = graphics.show_fps;
+    let mut mouse_sensitivity = graphics.sensitivity;
+    let frame_limit = effective_fps_limit(graphics.max_fps, uncapped_override);
     let mut frame_pacer = crate::frame_stats::FramePacer::new(frame_limit, Instant::now());
     let mut pending_simulation_time = Duration::ZERO;
     let mut frame_stats = crate::frame_stats::FrameStats::new(Instant::now());
@@ -938,6 +1044,9 @@ pub fn run(
     ];
     let mut running = true;
     while running {
+        let graphics_before = graphics.clone();
+        let override_before = uncapped_override;
+        let mut graphics_changed = false;
         let mut restart_requested = false;
         let mut advance_requested = false;
         let mut checkpoint_commands = Vec::new();
@@ -952,6 +1061,7 @@ pub fn run(
                     }
             ) {
                 console.close();
+                graphics_menu.close();
                 video.text_input().stop();
                 pause.show(Some(PauseAction::Exit));
                 sdl.mouse().set_relative_mouse_mode(false);
@@ -975,7 +1085,7 @@ pub fn run(
                 }
             ) {
                 look.set_focus(false);
-                if !pause.open && !console.is_open() {
+                if !pause.open && !console.is_open() && !graphics_menu.is_open() {
                     pause.show(None);
                 }
                 sdl.mouse().set_relative_mouse_mode(false);
@@ -998,7 +1108,11 @@ pub fn run(
                 }
             ) {
                 look.set_focus(true);
-                if !pause.open && !console.is_open() && !capture_mouse(&mut look, &sdl.mouse()) {
+                if !pause.open
+                    && !console.is_open()
+                    && !graphics_menu.is_open()
+                    && !capture_mouse(&mut look, &sdl.mouse())
+                {
                     eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
                 }
                 continue;
@@ -1037,7 +1151,7 @@ pub fn run(
                 if console.is_open() {
                     console.close();
                     video.text_input().stop();
-                    if !pause.open {
+                    if !pause.open && !graphics_menu.is_open() {
                         capture_mouse(&mut look, &sdl.mouse());
                     }
                 } else {
@@ -1075,18 +1189,23 @@ pub fn run(
                         Command::Fps(value) => {
                             if let Some(value) = value {
                                 show_fps = value;
+                                graphics.show_fps = value;
+                                graphics_changed = true;
                             }
                             console.push(&format!("fps {}", if show_fps { "on" } else { "off" }));
                         }
                         Command::MaxFps(value) => {
                             if let Some(value) = value {
-                                frame_pacer.set_limit(
-                                    (value != 0)
-                                        .then(|| Duration::from_secs_f64(1.0 / f64::from(value))),
-                                    Instant::now(),
-                                );
+                                graphics.max_fps = value;
+                                uncapped_override = false;
+                                graphics_changed = true;
                             }
-                            console.push(&match frame_pacer.limit() {
+                            let active_limit = if value.is_some() {
+                                effective_fps_limit(graphics.max_fps, uncapped_override)
+                            } else {
+                                frame_pacer.limit()
+                            };
+                            console.push(&match active_limit {
                                 Some(limit) => format!("maxfps {:.0}", 1.0 / limit.as_secs_f64()),
                                 None => "maxfps 0 (uncapped)".to_owned(),
                             });
@@ -1094,9 +1213,68 @@ pub fn run(
                         Command::Sensitivity(value) => {
                             if let Some(value) = value {
                                 mouse_sensitivity = value;
+                                graphics.sensitivity = value;
+                                graphics_changed = true;
                             }
                             console
                                 .push(&format!("sensitivity {mouse_sensitivity:.5} radians/pixel"));
+                        }
+                        Command::Options => {
+                            graphics_menu.open();
+                            console.close();
+                            video.text_input().stop();
+                            sdl.mouse().set_relative_mouse_mode(false);
+                            look.release();
+                            clear_held_controls(
+                                &mut held,
+                                &mut mouse_fire,
+                                &mut look,
+                                &mut accumulator,
+                            );
+                            pending_interact = false;
+                            pending_jump = false;
+                            pending_weapon = None;
+                            advance_requested = false;
+                            checkpoint_commands.clear();
+                            suppress_gameplay = true;
+                            frame_clock.rebase(Instant::now());
+                        }
+                        Command::Graphics(value) => {
+                            if let Some(value) = value {
+                                graphics.set_preset(value);
+                                graphics_changed = true;
+                            }
+                            console.push(&format!("graphics {:?}", graphics.preset));
+                        }
+                        Command::ToneMap(value) => {
+                            if let Some(value) = value {
+                                graphics.tone_mapping = value;
+                                graphics_changed = true;
+                            }
+                            console.push(&format!(
+                                "tonemap {}",
+                                if graphics.tone_mapping { "on" } else { "off" }
+                            ));
+                        }
+                        Command::Gamma(value)
+                        | Command::Brightness(value)
+                        | Command::Saturation(value)
+                        | Command::Bloom(value) => {
+                            let (name, field) = match command {
+                                Command::Gamma(_) => ("gamma", &mut graphics.gamma),
+                                Command::Brightness(_) => ("brightness", &mut graphics.brightness),
+                                Command::Saturation(_) => ("saturation", &mut graphics.saturation),
+                                Command::Bloom(_) => ("bloom", &mut graphics.bloom),
+                                _ => unreachable!(),
+                            };
+                            if let Some(value) = value {
+                                *field = value;
+                                graphics_changed = true;
+                            }
+                            console.push(&format!("{name} {field:.3}"));
+                            if !graphics.uses_hdr() {
+                                console.push("Colour controls apply in remaster/enhanced modes");
+                            }
                         }
                         Command::Status => {
                             let p = session.world.player;
@@ -1123,13 +1301,35 @@ pub fn run(
                             console.push("Restarting level");
                             console.close();
                             video.text_input().stop();
-                            if !pause.open {
+                            if !pause.open && !graphics_menu.is_open() {
                                 capture_mouse(&mut look, &sdl.mouse());
                             }
                             suppress_gameplay = true;
                         }
                         Command::Quit => {
                             running = false;
+                        }
+                    }
+                }
+                continue;
+            }
+            if graphics_menu.is_open() {
+                if look.focused && !suppress_gameplay {
+                    match graphics_menu.event(&event, &mut graphics) {
+                        MenuAction::None => {}
+                        MenuAction::Changed => graphics_changed = true,
+                        MenuAction::Closed => {
+                            clear_held_controls(
+                                &mut held,
+                                &mut mouse_fire,
+                                &mut look,
+                                &mut accumulator,
+                            );
+                            frame_clock.rebase(Instant::now());
+                            suppress_gameplay = true;
+                            if !pause.open {
+                                capture_mouse(&mut look, &sdl.mouse());
+                            }
                         }
                     }
                 }
@@ -1164,6 +1364,22 @@ pub fn run(
                         }
                         PauseAction::Load => {
                             checkpoint_commands.push(CheckpointCommand::Load);
+                            suppress_gameplay = true;
+                        }
+                        PauseAction::Options => {
+                            graphics_menu.open();
+                            clear_held_controls(
+                                &mut held,
+                                &mut mouse_fire,
+                                &mut look,
+                                &mut accumulator,
+                            );
+                            pending_interact = false;
+                            pending_jump = false;
+                            pending_weapon = None;
+                            checkpoint_commands.clear();
+                            advance_requested = false;
+                            frame_clock.rebase(Instant::now());
                             suppress_gameplay = true;
                         }
                         PauseAction::Restart => {
@@ -1267,12 +1483,44 @@ pub fn run(
                 _ => {}
             }
         }
+        if graphics_changed {
+            match graphics
+                .validate()
+                .and_then(|_| ColorPipeline::new(graphics.color_settings()))
+            {
+                Ok(pipeline) => {
+                    if graphics.max_fps != graphics_before.max_fps {
+                        uncapped_override = false;
+                    }
+                    color_pipeline = pipeline;
+                    if let Some(store) = &settings_store {
+                        if let Err(error) = store.save(&graphics) {
+                            console.push(&format!("Could not save graphics settings: {error}"));
+                            checkpoint_notice = Some(("GRAPHICS SETTINGS NOT SAVED", 3.0));
+                        }
+                    } else {
+                        console.push("Graphics settings apply for this session only");
+                    }
+                }
+                Err(error) => {
+                    graphics = graphics_before;
+                    uncapped_override = override_before;
+                    console.push(&format!("Graphics change rejected: {error}"));
+                }
+            }
+            show_fps = graphics.show_fps;
+            mouse_sensitivity = graphics.sensitivity;
+            frame_pacer.set_limit(
+                effective_fps_limit(graphics.max_fps, uncapped_override),
+                Instant::now(),
+            );
+        }
         if !running {
             break;
         }
         let active = simulation_active(
             look.focused,
-            pause.open || console.is_open(),
+            pause.open || console.is_open() || graphics_menu.is_open(),
             suppress_gameplay,
         );
         let elapsed = frame_clock.sample(Instant::now(), active);
@@ -1624,24 +1872,6 @@ pub fn run(
         let dynamic_lights = session.light_sources.as_ref().map(|sources| {
             openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&sources.snapshot())
         });
-        let mut stage_timings = render_profiled::<true>(
-            &mut frame,
-            &mut depth,
-            RenderWorld {
-                world: &session.world,
-                elevations: &session.wall_elevations,
-                eye_height: camera.eye_height,
-                yaw_offset,
-                pitch: camera.pitch,
-                mines: session.mines(),
-                lights: dynamic_lights.as_ref(),
-            },
-            &textures,
-            Some(&planes),
-            Some(&objects),
-            profile,
-        );
-        let stage_started = profile_start(profile);
         let projectile_visuals: Vec<_> = session
             .projectiles
             .active()
@@ -1658,41 +1888,45 @@ pub fn run(
                 pitch: session.projectile_pitch(projectile.id).unwrap_or(0.0),
             })
             .collect();
-        projectile_renderer.render_with_static_light(
-            &mut frame,
-            &mut depth,
-            WIDTH,
-            HEIGHT,
-            camera,
-            &projectile_visuals,
-            Some(planes.static_light()),
-        );
-        if let Some(renderer) = &explosion_renderer {
-            renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
-        }
-        if let Some(renderer) = &impact_renderer {
-            renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
-        }
-        if let Some(renderer) = &projectile_trails {
-            renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
-        }
-        stage_timings.effects = profile_elapsed(stage_started);
-        let stage_started = profile_start(profile);
         let (pose, frame_index) = weapon_clock
             .pose(weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Idle));
-        weapon_overlay.render_with_light(
-            &mut frame,
-            WIDTH,
-            HEIGHT,
-            session.selected_weapon,
-            pose,
-            frame_index,
-            planes
-                .static_light()
-                .sample(camera.player.position)
-                .unwrap_or(1.0),
-        );
-        stage_timings.weapon = profile_elapsed(stage_started);
+        let scene = FrameScene {
+            world: RenderWorld {
+                world: &session.world,
+                elevations: &session.wall_elevations,
+                eye_height: camera.eye_height,
+                yaw_offset,
+                pitch: camera.pitch,
+                mines: session.mines(),
+                lights: dynamic_lights.as_ref(),
+            },
+            textures: &textures,
+            planes: &planes,
+            objects: &objects,
+            camera,
+            projectiles: &projectile_renderer,
+            projectile_visuals: &projectile_visuals,
+            explosions: explosion_renderer.as_ref(),
+            impacts: impact_renderer.as_ref(),
+            trails: projectile_trails.as_ref(),
+            weapon: &weapon_overlay,
+            weapon_id: session.selected_weapon,
+            weapon_pose: pose,
+            weapon_frame: frame_index,
+        };
+        let mut stage_timings = if graphics.uses_hdr() {
+            scene.draw(&mut hdr_frame, &mut depth, profile)
+        } else {
+            scene.draw(&mut frame, &mut depth, profile)
+        };
+        if graphics.uses_hdr() {
+            let started = profile_start(profile);
+            if graphics.bloom > 0.0 {
+                bloom.apply(&mut hdr_frame, graphics.bloom, color_pipeline.exposure())?;
+            }
+            color_pipeline.encode_frame(&hdr_frame, &mut frame)?;
+            stage_timings.post = profile_elapsed(started);
+        }
         if profile {
             stage_totals.accumulate(stage_timings);
             stage_frames = stage_frames.saturating_add(1);
@@ -1768,7 +2002,7 @@ pub fn run(
             draw_pause_menu(&mut frame, &pause);
         } else if !look.focused {
             text(&mut frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
-        } else if !look.captured && !console.is_open() {
+        } else if !look.captured && !console.is_open() && !graphics_menu.is_open() {
             text(&mut frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
         }
         if show_fps {
@@ -1782,6 +2016,7 @@ pub fn run(
                 ),
             );
         }
+        graphics_menu.render(&mut frame, WIDTH, HEIGHT, &graphics);
         console.render(&mut frame, WIDTH, HEIGHT);
         let render_time = render_started.elapsed();
         let present_started = Instant::now();
@@ -1804,7 +2039,7 @@ pub fn run(
             profile_samples = profile_samples.wrapping_add(1);
             if profile && profile_samples.is_multiple_of(4) {
                 let ms = |value| RenderTimings::ms_per_frame(value, stage_frames);
-                eprintln!("frame profile: {:.1} fps, {:.2} ms/frame; sim {:.2}, render {:.2}, present {:.2}, max {:.2} ms; plane {:.2}, wall {:.2}, model {:.2}, effects {:.2}, weapon {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms, ms(stage_totals.plane), ms(stage_totals.wall), ms(stage_totals.model), ms(stage_totals.effects), ms(stage_totals.weapon));
+                eprintln!("frame profile: {:.1} fps, {:.2} ms/frame; sim {:.2}, render {:.2}, present {:.2}, max {:.2} ms; plane {:.2}, wall {:.2}, model {:.2}, effects {:.2}, weapon {:.2}, post {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms, ms(stage_totals.plane), ms(stage_totals.wall), ms(stage_totals.model), ms(stage_totals.effects), ms(stage_totals.weapon), ms(stage_totals.post));
             }
             stage_totals = RenderTimings::default();
             stage_frames = 0;
@@ -1823,6 +2058,31 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn environment_uncapped_override_leaves_saved_cap_unchanged() {
+        let mut settings = GraphicsSettings::default();
+        let mut uncapped_override = true;
+        assert_eq!(
+            effective_fps_limit(settings.max_fps, uncapped_override),
+            None
+        );
+        settings.gamma = 1.3;
+        assert_eq!(settings.max_fps, 60);
+        assert_eq!(
+            effective_fps_limit(settings.max_fps, uncapped_override),
+            None
+        );
+        // An explicit user cap (including the same saved value) cancels override.
+        settings.max_fps = 60;
+        uncapped_override = false;
+        assert_eq!(
+            effective_fps_limit(settings.max_fps, uncapped_override),
+            fps_limit(60)
+        );
+        settings.max_fps = 0;
+        assert_eq!(effective_fps_limit(settings.max_fps, false), None);
+    }
+
     #[test]
     fn render_timing_averages_and_disabled_clock() {
         let mut total = RenderTimings::default();
@@ -1892,13 +2152,15 @@ mod tests {
         assert_eq!(menu.key(Scancode::F9), Some(PauseAction::Load));
         assert_eq!(menu.key(Scancode::W), None);
         menu.key(Scancode::Up);
-        assert_eq!(menu.selected, 4);
+        assert_eq!(menu.selected, 5);
         assert_eq!(menu.key(Scancode::Return), None);
         assert_eq!(menu.confirm, Some(PauseAction::Exit));
         assert_eq!(menu.key(Scancode::F5), None);
         assert_eq!(menu.key(Scancode::Escape), None);
         assert_eq!(menu.confirm, None);
         menu.selected = 3;
+        assert_eq!(menu.key(Scancode::Return), Some(PauseAction::Options));
+        menu.selected = 4;
         menu.key(Scancode::Return);
         assert_eq!(menu.key(Scancode::Return), Some(PauseAction::Restart));
         assert_eq!(menu.key(Scancode::Escape), Some(PauseAction::Resume));
@@ -2067,7 +2329,7 @@ mod tests {
             let mut old_depth = vec![0.0; old_frame.len()];
             let mut new_frame = old_frame.clone();
             let mut new_depth = old_depth.clone();
-            render_profiled::<false>(
+            render_profiled::<false, u32>(
                 &mut old_frame,
                 &mut old_depth,
                 scene(),
@@ -2076,7 +2338,7 @@ mod tests {
                 None,
                 false,
             );
-            render_profiled::<true>(
+            render_profiled::<true, u32>(
                 &mut new_frame,
                 &mut new_depth,
                 scene(),

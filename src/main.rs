@@ -1,10 +1,13 @@
 mod archive;
 mod audio;
+mod bloom;
+mod color_pipeline;
 mod content;
 mod developer_console;
 mod explosion_render;
 mod frame_stats;
 mod gltf_model;
+mod graphics_settings;
 mod impact_render;
 mod launcher;
 mod object_height_loader;

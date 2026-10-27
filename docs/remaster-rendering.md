@@ -32,10 +32,16 @@ The component-wise ACES curve is `clamp(x*(2.51*x+0.03)/(x*(2.43*x+0.59)+0.14), 
 
 Evidence anchors: gamma shader registration `0x140055140`, uniform setup `0x14018c370`, material creation `0x1401885fc`, scene target `0x14018896a`, format mapping `0x1401ff120`, swapchain format selection `0x14007bd13`. Weapon calls `0x14018bea5`/`0x14018bf16` precede gamma `0x14018bf58`; the later HUD draw is `0x1400075a8`.
 
-Applying ACES directly to already shaded RGB bytes would be incorrect. The software renderer still needs a proper linear HDR colour path and final post-process to match this chain; current authored light sampling is not equivalent to the full remaster lighting system.
+Applying ACES directly to already shaded RGB bytes would be incorrect. The software renderer now has a linear HDR colour path and final post-process for this chain. Material decoding, lighting and alpha blending retain HDR values; the world and weapon share post-processing, while the HUD remains in display space. Current authored light sampling is still not equivalent to the full remaster lighting system. Damage feedback remains a provisional display-space tint.
 
 ## Light data distinction
 
 The original conversion helper uses `trunc((35 - raw) * 255 / 35)` for supported fine raw light values 0–35. The separate 64×64 ambient field is converted and remapped; verified examples are raw 0→255, 5→177, 10→102 and 15→25. Ambient is sampled as linear `R8_UNORM` and added to a separate HD lightmap in the wall shader. That HD lightmap is generated from map light-source records. The role of the fine 256×256 authored field in active HD rendering has not yet been proven.
 
 Consequently the current independent-reference conversion `(255 - 6*raw) * 1.3/255` is provisional. Replacing only that scalar with the fine-field helper is insufficient to reproduce the remaster's ambient, generated lighting, distance response, shadows and HDR output.
+
+## Selectable presentation
+
+The default `remaster` preset uses the verified colour pipeline with neutral gamma, brightness and saturation, ACES enabled, and bloom disabled. `legacy` retains the earlier RGB-byte software shading for comparison; it is not a claim to reproduce the DOS renderer. `enhanced` adds optional linear HDR bloom at strength 0.35. Bloom extracts exposed highlights before downsampling, applies a separable Gaussian blur at half resolution, and composites before tone mapping. HUD text does not bloom.
+
+Open **Escape → Graphics Options**, or enter `options` in the tilde console. `graphics remaster`, `graphics enhanced` and `graphics legacy` switch presets; `tonemap`, `gamma`, `brightness`, `saturation` and `bloom` adjust controls individually. Explicit changes are saved in SDL's per-user OpenChasm preference directory as a versioned `graphics.json`. Presets reset visual controls and preserve the FPS cap, counter and mouse sensitivity.

@@ -23,6 +23,11 @@ developer console; `help` lists commands, `status` shows frame timing and player
 position, `maxfps 0` removes the frame cap, and `maxfps 60` restores it. The console
 pauses gameplay and releases the mouse. See [console controls](docs/developer-console.md).
 
+Open **Escape → Graphics Options** to change the visual preset, tone mapping,
+colour controls, bloom and frame cap. `remaster` is the default; `enhanced` adds
+optional bloom. The tilde console also accepts `graphics enhanced`,
+`graphics remaster` and `options`. Changes are saved per user.
+
 Examples:
 
 ```sh

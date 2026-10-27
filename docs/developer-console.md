@@ -27,3 +27,17 @@ closing it resumes input capture when gameplay has focus.
 
 For repeatable profiling, `OPENCHASM_PROFILE=1` prints periodic timings to stderr.
 `OPENCHASM_UNCAPPED=1` starts without the frame cap; normal launches remain capped.
+
+Graphics controls are available with `options`, or from the pause menu. Use
+Up/Down to select a row, Left/Right or Enter to change it, and Escape to close.
+The client saves explicit changes to `graphics.json` in SDL's per-user
+OpenChasm preference directory. A missing file uses defaults; invalid files are
+reported and ignored by the host.
+
+- `graphics [legacy|remaster|enhanced]` selects or reports the visual preset.
+  Remaster uses the linear HDR pipeline; Enhanced also enables bloom. Legacy
+  selects the earlier encoded RGB pipeline. Choosing a preset resets visual
+  controls to that preset's defaults.
+- `tonemap [on|off|1|0]` controls tone mapping.
+- `gamma [0.05..16]`, `brightness [0..16]`, `saturation [0..16]` and
+  `bloom [0..1]` query or set those controls. Values must be finite.

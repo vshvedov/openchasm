@@ -209,9 +209,25 @@ impl WeaponRenderer {
 
     /// Draw with a bounded static light factor sampled at the camera position.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn render_with_light(
         &self,
         frame: &mut [u32],
+        width: usize,
+        height: usize,
+        weapon: usize,
+        pose: WeaponPose,
+        frame_index: usize,
+        light: f32,
+    ) {
+        self.render_to(frame, width, height, weapon, pose, frame_index, light);
+    }
+
+    /// Draw the weapon directly into an encoded or linear-HDR scene buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to<C: crate::color_pipeline::RenderPixel>(
+        &self,
+        frame: &mut [C],
         width: usize,
         height: usize,
         weapon: usize,
@@ -346,8 +362,8 @@ fn project(v: Vertex, width: usize, height: usize) -> Projected {
 fn edge(a: Projected, b: Projected, x: f32, y: f32) -> f32 {
     (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x)
 }
-struct Raster<'a> {
-    frame: &'a mut [u32],
+struct Raster<'a, C: crate::color_pipeline::RenderPixel> {
+    frame: &'a mut [C],
     depth: &'a mut [f32],
     width: usize,
     height: usize,
@@ -355,7 +371,7 @@ struct Raster<'a> {
     model: &'a Model,
     light: f32,
 }
-impl Raster<'_> {
+impl<C: crate::color_pipeline::RenderPixel> Raster<'_, C> {
     fn triangle(&mut self, triangle: [Projected; 3], flags: u8) {
         let [a, b, c] = triangle;
         let area = edge(a, b, c.x, c.y);
@@ -396,9 +412,7 @@ impl Raster<'_> {
                     continue;
                 }
                 let rgb = self.palette[index as usize];
-                let channel =
-                    |shift: u32| ((((rgb >> shift) & 255u32) as f32 * self.light) as u32).min(255);
-                self.frame[pixel] = channel(16) << 16 | channel(8) << 8 | channel(0);
+                self.frame[pixel] = C::shade_srgb8(rgb, self.light);
                 self.depth[pixel] = distance;
             }
         }
@@ -482,6 +496,12 @@ mod tests {
         renderer.render_with_light(&mut dark, 64, 64, 0, WeaponPose::Idle, 0, 0.25);
         let pixel = first.iter().position(|&rgb| rgb != 0).unwrap();
         assert_eq!(dark[pixel], 0x3f0000);
+        let mut hdr = vec![crate::color_pipeline::LinearRgb::default(); 64 * 64];
+        renderer.render_to(&mut hdr, 64, 64, 0, WeaponPose::Idle, 0, 1.3);
+        assert!(
+            hdr[pixel].0[0] > 1.0,
+            "weapon light must survive until final tone mapping"
+        );
         let mut invalid = vec![0; 64 * 64];
         renderer.render_with_light(&mut invalid, 64, 64, 0, WeaponPose::Idle, 0, f32::NAN);
         assert_eq!(first, invalid);

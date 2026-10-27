@@ -226,9 +226,9 @@ impl ImpactRenderer {
         }
         self.random = 0x7a84_3f29;
     }
-    pub fn render(
+    pub fn render_to<C: crate::color_pipeline::RenderPixel>(
         &self,
-        frame: &mut [u32],
+        frame: &mut [C],
         depth: &[f32],
         width: usize,
         height: usize,
@@ -244,7 +244,7 @@ impl ImpactRenderer {
         .into_iter()
         .flatten()
         {
-            sprite.render(frame, depth, width, height, camera);
+            sprite.render_to(frame, depth, width, height, camera);
         }
     }
 }

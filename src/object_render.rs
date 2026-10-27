@@ -4,6 +4,7 @@
 //! gameplay and actor state remain owned by the simulation. The caller supplies
 //! actor animation mode and elapsed fixed time for presentation.
 use crate::actors::{ActorDefinitions, ActorState};
+use crate::color_pipeline::RenderPixel;
 use crate::content::ResourceSet;
 use crate::gltf_model::{GltfModel, Image as GltfImage};
 use crate::model::{Animation, Model, Vertex as ModelVertex, SKIN_WIDTH};
@@ -335,18 +336,18 @@ fn edge(a: ScreenVertex, b: ScreenVertex, x: f32, y: f32) -> f32 {
 const MAX_TRANSLUCENT_LAYERS: u8 = 8;
 const NO_FRAGMENT: u32 = u32::MAX;
 #[derive(Clone, Copy)]
-struct Fragment {
+struct Fragment<C: RenderPixel> {
     next: u32,
     depth: f32,
-    rgb: u32,
+    rgb: C,
     alpha: u8,
 }
-struct Translucency {
+struct Translucency<C: RenderPixel> {
     heads: Vec<u32>,
     counts: Vec<u8>,
-    fragments: Vec<Fragment>,
+    fragments: Vec<Fragment<C>>,
 }
-impl Translucency {
+impl<C: RenderPixel> Translucency<C> {
     fn new(pixels: usize) -> Self {
         Self {
             heads: vec![NO_FRAGMENT; pixels],
@@ -354,7 +355,7 @@ impl Translucency {
             fragments: Vec::new(),
         }
     }
-    fn push(&mut self, pixel: usize, depth: f32, rgb: u32, alpha: u8) {
+    fn push(&mut self, pixel: usize, depth: f32, rgb: C, alpha: u8) {
         let mut current = self.heads[pixel];
         let mut farthest = NO_FRAGMENT;
         while current != NO_FRAGMENT {
@@ -394,7 +395,7 @@ impl Translucency {
             self.counts[pixel] += 1;
         }
     }
-    fn composite(&self, frame: &mut [u32], depth: &[f32]) {
+    fn composite(&self, frame: &mut [C], depth: &[f32]) {
         for (pixel, &head) in self.heads.iter().enumerate() {
             if head == NO_FRAGMENT {
                 continue;
@@ -402,7 +403,7 @@ impl Translucency {
             let mut sorted = [Fragment {
                 next: NO_FRAGMENT,
                 depth: 0.0,
-                rgb: 0,
+                rgb: C::default(),
                 alpha: 0,
             }; MAX_TRANSLUCENT_LAYERS as usize];
             let mut count = 0;
@@ -417,30 +418,24 @@ impl Translucency {
             }
             sorted[..count].sort_unstable_by(|a, b| b.depth.total_cmp(&a.depth));
             for f in &sorted[..count] {
-                let dst = frame[pixel];
-                let blend = |shift: u32| {
-                    let src = (f.rgb >> shift) & 255_u32;
-                    let back = (dst >> shift) & 255_u32;
-                    (src * u32::from(f.alpha) + back * (255 - u32::from(f.alpha))) / 255
-                };
-                frame[pixel] = (blend(16) << 16) | (blend(8) << 8) | blend(0);
+                frame[pixel] = f.rgb.over(frame[pixel], f32::from(f.alpha) / 255.0);
             }
         }
     }
 }
 
-struct Raster<'a> {
-    frame: &'a mut [u32],
+struct Raster<'a, C: RenderPixel> {
+    frame: &'a mut [C],
     depth: &'a mut [f32],
     width: usize,
     height: usize,
     palette: &'a [u32; 256],
-    translucent: Option<Translucency>,
+    translucent: Option<Translucency<C>>,
     instance_light: f32,
     instance_static_light: Option<f32>,
 }
-impl Raster<'_> {
-    fn put(&mut self, pixel: usize, distance: f32, rgb: u32, alpha: u8) {
+impl<C: RenderPixel> Raster<'_, C> {
+    fn put(&mut self, pixel: usize, distance: f32, rgb: C, alpha: u8) {
         if alpha == 255 {
             self.frame[pixel] = rgb;
             self.depth[pixel] = distance;
@@ -501,12 +496,7 @@ impl Raster<'_> {
                 let attenuation = self
                     .instance_static_light
                     .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
-                let channel = |base: u32| {
-                    ((base as f32 * attenuation * (1.0 + self.instance_light)) as u32).min(255)
-                };
-                let rgb = (channel((rgb >> 16) & 255) << 16)
-                    | (channel((rgb >> 8) & 255) << 8)
-                    | channel(rgb & 255);
+                let rgb = C::shade_srgb8(rgb, attenuation * (1.0 + self.instance_light));
                 // Both legacy translucent flag bits use provisional half alpha.
                 self.put(
                     offset,
@@ -519,7 +509,7 @@ impl Raster<'_> {
     }
 }
 
-impl Raster<'_> {
+impl<C: RenderPixel> Raster<'_, C> {
     /// Perspective-correct RGBA rasterization into the same depth buffer used
     /// by 3O models and walls. Partial alpha blending is approximate.
     fn gltf_triangle(&mut self, triangle: [ScreenVertex; 3], image: Option<&GltfImage>) {
@@ -578,10 +568,9 @@ impl Raster<'_> {
                 let attenuation = self
                     .instance_static_light
                     .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
-                let channel = |base: u8| {
-                    ((f32::from(base) * attenuation * (1.0 + self.instance_light)) as u32).min(255)
-                };
-                let rgb = channel(rgba[0]) << 16 | channel(rgba[1]) << 8 | channel(rgba[2]);
+                let source =
+                    u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
+                let rgb = C::shade_srgb8(source, attenuation * (1.0 + self.instance_light));
                 self.put(pixel, distance, rgb, rgba[3]);
             }
         }
@@ -616,7 +605,12 @@ fn actor_car_instance_vertices<'a>(mesh: &'a Mesh, instance: &Instance) -> &'a [
     }
 }
 
-fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: CameraView) {
+fn draw_gltf<C: RenderPixel>(
+    raster: &mut Raster<'_, C>,
+    mesh: &Mesh,
+    instance: &Instance,
+    camera: CameraView,
+) {
     let Some(model) = mesh.gltf.as_ref() else {
         return;
     };
@@ -1451,6 +1445,31 @@ impl ObjectScene {
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
         static_light: Option<&crate::map::StaticLightMap>,
     ) {
+        self.render_to(
+            frame,
+            depth,
+            width,
+            height,
+            camera,
+            mines,
+            lights,
+            static_light,
+        );
+    }
+
+    /// Render scene colors to either legacy RGB bytes or linear HDR pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to<C: RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        mines: &[openchasm::explosives::Mine],
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+        static_light: Option<&crate::map::StaticLightMap>,
+    ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
@@ -1687,6 +1706,78 @@ pub(crate) mod tests {
             .map(|i| (i.cell, i.object_definition_index, i.position, i.visible))
             .collect()
     }
+    #[test]
+    fn generic_scene_preserves_hdr_alpha_and_opaque_occlusion() {
+        use crate::color_pipeline::LinearRgb;
+        let scene = gltf_scene(128);
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut map_bytes = vec![0; 0x27001 + 4];
+        map_bytes[1..0x10001].fill(0);
+        let map = crate::map::Map::parse(&map_bytes).unwrap();
+        let background = LinearRgb([2.0, 0.0, 0.0]);
+        let mut hdr = vec![background; 64 * 64];
+        let mut depth = vec![f32::INFINITY; hdr.len()];
+        scene.render_to(
+            &mut hdr,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            Some(map.static_light()),
+        );
+        let changed = hdr.iter().find(|&&pixel| pixel != background).unwrap();
+        assert!(changed.0[0] > 1.0 && changed.0[0] < 2.0);
+        assert!(depth.iter().all(|z| z.is_infinite()));
+        hdr.fill(background);
+        depth.fill(0.1);
+        scene.render_to(
+            &mut hdr,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            Some(map.static_light()),
+        );
+        assert!(hdr.iter().all(|&pixel| pixel == background));
+        let mut legacy = vec![0; 64 * 64];
+        let mut generic = legacy.clone();
+        let mut a = vec![f32::INFINITY; legacy.len()];
+        let mut b = a.clone();
+        scene.render_with_static_light(
+            &mut legacy,
+            &mut a,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            Some(map.static_light()),
+        );
+        scene.render_to(
+            &mut generic,
+            &mut b,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            Some(map.static_light()),
+        );
+        assert_eq!(legacy, generic);
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn authored_light_shades_scene_mesh_without_changing_depth() {
         let light_map = |value| {
@@ -2872,7 +2963,7 @@ pub(crate) mod tests {
 
     #[test]
     fn translucent_layers_are_bounded_and_keep_nearest() {
-        let mut fragments = Translucency::new(1);
+        let mut fragments = Translucency::<u32>::new(1);
         for i in (1..=12).rev() {
             fragments.push(0, i as f32, i as u32, 128);
         }

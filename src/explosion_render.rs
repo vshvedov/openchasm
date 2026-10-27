@@ -254,9 +254,22 @@ impl ExplosionRenderer {
     }
     /// Draw back-to-front without modifying opaque depth. `depth` must contain
     /// perpendicular camera-space depths from walls/objects/projectiles.
+    #[cfg(test)]
     pub fn render(
         &self,
         frame: &mut [u32],
+        depth: &[f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+    ) {
+        self.render_to(frame, depth, width, height, camera);
+    }
+
+    /// Render authored fullbright sprites into an encoded or linear scene.
+    pub fn render_to<C: crate::color_pipeline::RenderPixel>(
+        &self,
+        frame: &mut [C],
         depth: &[f32],
         width: usize,
         height: usize,
@@ -318,7 +331,7 @@ impl ExplosionRenderer {
                     }
                     let index = image.pixels[ty * image.width + tx];
                     if index != 255 {
-                        frame[offset] = self.palette[index as usize];
+                        frame[offset] = C::from_srgb8(self.palette[index as usize]);
                     }
                 }
             }
@@ -355,6 +368,28 @@ mod tests {
         assert!(Sprite::parse(&[0, 0]).is_err());
         assert!(Sprite::parse(&[1, 0, 1, 0, 1, 0, 2, 0, 1]).is_err());
     }
+    #[test]
+    fn linear_effect_keeps_fullbright_color_and_respects_opaque_depth() {
+        use crate::color_pipeline::LinearRgb;
+        let mut renderer = renderer();
+        assert!(renderer.spawn([0.2, 0.0, 1.0]));
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut frame = vec![LinearRgb::default(); 64 * 64];
+        let depth = vec![f32::INFINITY; frame.len()];
+        renderer.render_to(&mut frame, &depth, 64, 64, camera);
+        assert!(frame.iter().any(|pixel| pixel.0[0] == 1.0));
+        frame.fill(LinearRgb::default());
+        renderer.render_to(&mut frame, &vec![0.1; depth.len()], 64, 64, camera);
+        assert!(frame.iter().all(|pixel| *pixel == LinearRgb::default()));
+    }
+
     #[test]
     fn effect_bounds_animation_and_wall_depth() {
         let mut renderer = renderer();

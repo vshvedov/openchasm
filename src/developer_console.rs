@@ -20,6 +20,13 @@ const COMMANDS: &[&str] = &[
     "restart",
     "quit",
     "sensitivity",
+    "options",
+    "graphics",
+    "tonemap",
+    "gamma",
+    "brightness",
+    "saturation",
+    "bloom",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,6 +39,13 @@ pub enum Command {
     Quit,
     /// Radians per mouse pixel; None requests the current value.
     Sensitivity(Option<f32>),
+    Options,
+    Graphics(Option<crate::graphics_settings::VisualPreset>),
+    ToneMap(Option<bool>),
+    Gamma(Option<f32>),
+    Brightness(Option<f32>),
+    Saturation(Option<f32>),
+    Bloom(Option<f32>),
 }
 
 #[derive(Default)]
@@ -212,7 +226,7 @@ impl Console {
         let args: Vec<_> = parts.collect();
         match command.as_str() {
             "help" | "cmdlist" if args.is_empty() => self
-                .push("help cmdlist clear echo version fps maxfps status restart quit sensitivity"),
+                .push("help cmdlist clear echo version fps maxfps status restart quit sensitivity options graphics tonemap gamma brightness saturation bloom"),
             "clear" if args.is_empty() => self.lines.clear(),
             "echo" => self.push(
                 trimmed
@@ -250,6 +264,39 @@ impl Console {
                 },
                 _ => self.push("usage: sensitivity [0.0001..1.0] (radians/pixel)"),
             },
+            "options" if args.is_empty() => return Some(Command::Options),
+            "graphics" => {
+                use crate::graphics_settings::VisualPreset;
+                let value = match args.as_slice() {
+                    [] => Some(None),
+                    [v] if v.eq_ignore_ascii_case("legacy") => Some(Some(VisualPreset::Legacy)),
+                    [v] if v.eq_ignore_ascii_case("remaster") => Some(Some(VisualPreset::Remaster)),
+                    [v] if v.eq_ignore_ascii_case("enhanced") => Some(Some(VisualPreset::Enhanced)),
+                    _ => None,
+                };
+                if let Some(value) = value { return Some(Command::Graphics(value)); }
+                self.push("usage: graphics [legacy|remaster|enhanced]");
+            }
+            "tonemap" => {
+                let value = match args.as_slice() {
+                    [] => Some(None),
+                    [v] if v.eq_ignore_ascii_case("on") || *v == "1" => Some(Some(true)),
+                    [v] if v.eq_ignore_ascii_case("off") || *v == "0" => Some(Some(false)),
+                    _ => None,
+                };
+                if let Some(value) = value { return Some(Command::ToneMap(value)); }
+                self.push("usage: tonemap [on|off|1|0]");
+            }
+            "gamma" | "brightness" | "saturation" | "bloom" => {
+                let (min, max) = match command.as_str() { "gamma" => (0.05, 16.0), "bloom" => (0.0, 1.0), _ => (0.0, 16.0) };
+                let value = match args.as_slice() {
+                    [] => Some(None),
+                    [v] => v.parse::<f32>().ok().filter(|v| v.is_finite() && (*v >= min && *v <= max)).map(Some),
+                    _ => None,
+                };
+                if let Some(value) = value { return Some(match command.as_str() { "gamma" => Command::Gamma(value), "brightness" => Command::Brightness(value), "saturation" => Command::Saturation(value), _ => Command::Bloom(value) }); }
+                self.push(&format!("usage: {command} [{min}..{max}]"));
+            }
             "status" | "restart" | "quit" if args.is_empty() => {
                 return Some(match command.as_str() {
                     "status" => Command::Status,
@@ -257,7 +304,7 @@ impl Console {
                     _ => Command::Quit,
                 })
             }
-            "help" | "cmdlist" | "clear" | "version" | "status" | "restart" | "quit" => {
+            "help" | "cmdlist" | "clear" | "version" | "status" | "restart" | "quit" | "options" => {
                 self.push(&format!("usage: {command}"))
             }
             _ => self.push(&format!("unknown command: {command}")),
@@ -372,6 +419,21 @@ mod tests {
         let mut c = Console::default();
         assert_eq!(submit(&mut c, "fps on"), Some(Command::Fps(Some(true))));
         assert_eq!(submit(&mut c, "fps"), Some(Command::Fps(None)));
+        assert_eq!(
+            submit(&mut c, "graphics enhanced"),
+            Some(Command::Graphics(Some(
+                crate::graphics_settings::VisualPreset::Enhanced
+            )))
+        );
+        assert_eq!(submit(&mut c, "options"), Some(Command::Options));
+        assert_eq!(
+            submit(&mut c, "tonemap off"),
+            Some(Command::ToneMap(Some(false)))
+        );
+        assert_eq!(submit(&mut c, "gamma 2"), Some(Command::Gamma(Some(2.0))));
+        assert_eq!(submit(&mut c, "bloom 1.01"), None);
+        assert_eq!(submit(&mut c, "gamma nan"), None);
+
         assert_eq!(submit(&mut c, "maxfps"), Some(Command::MaxFps(None)));
         assert_eq!(submit(&mut c, "maxfps 0"), Some(Command::MaxFps(Some(0))));
         assert_eq!(

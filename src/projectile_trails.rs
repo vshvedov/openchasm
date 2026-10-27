@@ -203,16 +203,18 @@ impl ProjectileTrails {
             sprite.renderer.clear();
         }
     }
-    pub fn render(
+    pub fn render_to<C: crate::color_pipeline::RenderPixel>(
         &self,
-        frame: &mut [u32],
+        frame: &mut [C],
         depth: &[f32],
         width: usize,
         height: usize,
         camera: CameraView,
     ) {
         for sprite in self.sprites.values() {
-            sprite.renderer.render(frame, depth, width, height, camera);
+            sprite
+                .renderer
+                .render_to(frame, depth, width, height, camera);
         }
     }
 }

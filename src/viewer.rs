@@ -737,6 +737,7 @@ pub struct ClientFeedback {
     pub projectile_renderer: ProjectileRenderer,
     pub explosion_renderer: Option<crate::explosion_render::ExplosionRenderer>,
     pub impact_renderer: Option<crate::impact_render::ImpactRenderer>,
+    pub projectile_trails: Option<crate::projectile_trails::ProjectileTrails>,
     pub difficulty: openchasm::pickups::Difficulty,
     pub teleport_load_error: Option<String>,
     /// Verified identity of the loaded gameplay inputs, if fingerprinting succeeded.
@@ -759,6 +760,7 @@ pub fn run(
         projectile_renderer,
         mut explosion_renderer,
         mut impact_renderer,
+        mut projectile_trails,
         difficulty,
         teleport_load_error,
         content_digest: _content_digest,
@@ -1059,6 +1061,9 @@ pub fn run(
             if let Some(renderer) = &mut impact_renderer {
                 renderer.clear();
             }
+            if let Some(renderer) = &mut projectile_trails {
+                renderer.clear();
+            }
             if !objects.restore(&initial_scene) {
                 return Err("initial scene snapshot no longer matches the level".into());
             }
@@ -1120,6 +1125,9 @@ pub fn run(
                             if let Some(renderer) = &mut impact_renderer {
                                 renderer.clear();
                             }
+                            if let Some(renderer) = &mut projectile_trails {
+                                renderer.clear();
+                            }
                             // Leave window focus/capture unchanged; discard all
                             // inputs accumulated before the restored state.
                             clear_held_controls(
@@ -1157,6 +1165,9 @@ pub fn run(
             let old_weapon = session.selected_weapon;
             let health_before = session.game.inventory.health;
             let enemy_health = crate::audio::enemy_health_before(&session);
+            let trail_before = projectile_trails
+                .as_ref()
+                .map(|_| crate::trail_motion::TrailSnapshot::capture(&session));
             let events = session.step(SessionInput {
                 movement,
                 yaw_delta,
@@ -1166,6 +1177,10 @@ pub fn run(
                 fire: firing,
                 select_weapon: pending_weapon,
             });
+            if let (Some(renderer), Some(before)) = (&mut projectile_trails, trail_before) {
+                renderer.tick();
+                crate::trail_motion::emit(renderer, &before, &session, &events);
+            }
             minimap.observe(&session.world);
             audio.update_ambient(session.ambient_grid(), session.world.player.position, STEP);
             pending_interact = false;
@@ -1411,6 +1426,9 @@ pub fn run(
             renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
         }
         if let Some(renderer) = &impact_renderer {
+            renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
+        }
+        if let Some(renderer) = &projectile_trails {
             renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
         }
         let (pose, frame_index) = weapon_clock

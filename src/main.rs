@@ -9,10 +9,12 @@ mod object_height_loader;
 mod object_render;
 mod planes;
 mod projectile_render;
+mod projectile_trails;
 mod replacement_manifest;
 mod scene_restore;
 mod sky;
 mod texture;
+mod trail_motion;
 mod viewer;
 mod weapon_render;
 
@@ -599,6 +601,14 @@ fn play(
         let projectile_renderer =
             projectile_render::ProjectileRenderer::load(resources, &rockets, &palette);
         let impact_renderer = impact_render::ImpactRenderer::load(resources, &palette, &rockets);
+        let projectile_trails =
+            match projectile_trails::ProjectileTrails::load(resources, &palette, &rockets) {
+                Ok(renderer) => Some(renderer),
+                Err(error) => {
+                    eprintln!("projectile trails unavailable: {error}");
+                    None
+                }
+            };
         let explosion_renderer =
             match explosion_render::ExplosionRenderer::load(resources, &palette, &rockets) {
                 Ok(renderer) => Some(renderer),
@@ -700,6 +710,7 @@ fn play(
                 projectile_renderer,
                 explosion_renderer,
                 impact_renderer: Some(impact_renderer),
+                projectile_trails,
                 difficulty,
                 teleport_load_error,
                 content_digest,

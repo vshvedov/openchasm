@@ -10,6 +10,7 @@
 //! Player damage uses the first monster definition's documented pain/death WAVs.
 //! Enemy reactions compare committed health once per tick: multiple hits merge,
 //! death replaces pain, and variants are chosen deterministically.
+//! Object BSFX ID 0 is silent as in PanzerChasm; remaster behavior is unverified.
 //! Ambient cell ID zero is provisionally silent, as in PanzerChasm; the
 //! remaster's behavior is unverified. Loops crossfade over 0.5 simulation
 //! seconds at authored volume / 128. Random `b:` cues are not implemented.
@@ -287,6 +288,90 @@ pub struct Audio {
     one_shots: Vec<Player>,
     ambient_samples: [Option<AmbientSample>; 32],
     ambient: AmbientPlayback,
+    break_sounds: BreakSoundBank,
+}
+
+#[derive(Default)]
+struct BreakSoundBank {
+    entries: BTreeMap<u8, BreakSample>,
+}
+struct BreakSample {
+    bytes: Arc<[u8]>,
+    volume: f32,
+}
+impl BreakSoundBank {
+    fn load(
+        resources: &mut ResourceSet,
+        definitions: &openchasm::sound_definitions::SoundDefinitions,
+    ) -> Self {
+        let paths: BTreeMap<String, String> = resources
+            .names()
+            .filter(|name| name.to_ascii_lowercase().starts_with("sound/"))
+            .map(|name| (name.to_ascii_lowercase(), name.to_owned()))
+            .collect();
+        let mut result = Self::default();
+        let mut cache: BTreeMap<String, Arc<[u8]>> = BTreeMap::new();
+        let mut total = 0usize;
+        for id in 1..=99 {
+            let Some(definition) = definitions.get(id) else {
+                continue;
+            };
+            let Some(path) = definition
+                .resource_path()
+                .and_then(|name| paths.get(&name.to_ascii_lowercase()))
+            else {
+                continue;
+            };
+            let bytes = if let Some(bytes) = cache.get(path) {
+                Arc::clone(bytes)
+            } else {
+                let Ok(data) = resources.read(path) else {
+                    continue;
+                };
+                if data.len() > 2 * 1024 * 1024 || total + data.len() > 32 * 1024 * 1024 {
+                    continue;
+                }
+                let bytes: Arc<[u8]> = Arc::from(data);
+                if rodio::Decoder::try_from(Cursor::new(Arc::clone(&bytes))).is_err() {
+                    continue;
+                }
+                total += bytes.len();
+                cache.insert(path.clone(), Arc::clone(&bytes));
+                bytes
+            };
+            result.entries.insert(
+                id,
+                BreakSample {
+                    bytes,
+                    volume: f32::from(definition.volume) / 128.0,
+                },
+            );
+        }
+        result
+    }
+    fn select(
+        &self,
+        sound_id: i32,
+        position: [f32; 2],
+        listener: [f32; 2],
+    ) -> Option<(&BreakSample, f32)> {
+        let id = u8::try_from(sound_id)
+            .ok()
+            .filter(|id| (1..=99).contains(id))?;
+        if !position
+            .iter()
+            .chain(listener.iter())
+            .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        let distance = (position[0] - listener[0]).hypot(position[1] - listener[1]);
+        if !distance.is_finite() || distance >= 24.0 {
+            return None;
+        }
+        let sample = self.entries.get(&id)?;
+        Some((sample, sample.volume * (1.0 - distance / 24.0)))
+    }
 }
 
 struct AmbientSample {
@@ -450,6 +535,7 @@ impl Audio {
             one_shots: Vec::new(),
             ambient_samples: std::array::from_fn(|_| None),
             ambient: AmbientPlayback::default(),
+            break_sounds: BreakSoundBank::default(),
         }
     }
     /// Play one committed player pain/death cue. A missing pain variant falls
@@ -565,6 +651,34 @@ impl Audio {
         }
     }
 
+    /// Load global and level-local object break sounds. Failure parsing either
+    /// table clears the prior bank; missing or undecodable samples are silent.
+    #[allow(dead_code)] // The committed destruction event integration owns the caller.
+    pub fn load_object_break_sounds(
+        &mut self,
+        resources: &mut ResourceSet,
+        inf: &[u8],
+        level: &[u8],
+    ) -> Result<(), openchasm::sound_definitions::SoundParseError> {
+        self.break_sounds = BreakSoundBank::default();
+        let definitions = openchasm::sound_definitions::SoundDefinitions::parse(inf, level)?;
+        self.break_sounds = BreakSoundBank::load(resources, &definitions);
+        Ok(())
+    }
+
+    /// Play a committed destruction's BSFX with provisional 24-tile attenuation.
+    #[allow(dead_code)] // Waiting for the authoritative destruction events.
+    pub fn play_object_break(&mut self, sound_id: i32, position: [f32; 2], listener: [f32; 2]) {
+        let Some(sink) = &self.sink else { return };
+        let Some((sample, volume)) = self.break_sounds.select(sound_id, position, listener) else {
+            return;
+        };
+        if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(&sample.bytes))) {
+            player.set_volume(volume);
+            track_one_shot(&mut self.one_shots, player);
+        }
+    }
+
     /// Preload valid level loops; unavailable or malformed assets remain silent.
     pub fn load_ambient(&mut self, resources: &mut ResourceSet, level_resource: &[u8]) {
         self.ambient.clear();
@@ -647,6 +761,52 @@ impl Audio {
 mod tests {
     use super::*;
     #[test]
+    fn break_selection_is_safe_without_audio_device() {
+        let mut bank = BreakSoundBank::default();
+        bank.entries.insert(
+            81,
+            BreakSample {
+                bytes: Arc::from(&b"test"[..]),
+                volume: 0.75,
+            },
+        );
+        assert_eq!(bank.select(81, [12.0, 0.0], [0.0, 0.0]).unwrap().1, 0.375);
+        for id in [-1, 0, 70, 100] {
+            assert!(bank.select(id, [0.0, 0.0], [0.0, 0.0]).is_none());
+        }
+        assert!(bank.select(81, [f32::NAN, 0.0], [0.0, 0.0]).is_none());
+        assert!(bank.select(81, [24.0, 0.0], [0.0, 0.0]).is_none());
+    }
+    #[test]
+    fn installed_break_sound_bank_resolves_level_volume_and_rejects_invalid_ids() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let global = resources.read("chasm.inf").unwrap();
+        let level = resources.read("map/resource.02").unwrap();
+        let definitions =
+            openchasm::sound_definitions::SoundDefinitions::parse(&global, &level).unwrap();
+        let bank = BreakSoundBank::load(&mut resources, &definitions);
+        let (sample, volume) = bank
+            .select(81, [0.0, 0.0], [0.0, 0.0])
+            .expect("level 2 metal_d.wav");
+        assert_eq!(sample.volume, 0.75);
+        assert_eq!(volume, 0.75);
+        assert_eq!(bank.select(81, [12.0, 0.0], [0.0, 0.0]).unwrap().1, 0.375);
+        assert!(bank.select(70, [0.0, 0.0], [0.0, 0.0]).is_some());
+        for id in [-1, 0, 100, 1000] {
+            assert!(bank.select(id, [0.0, 0.0], [0.0, 0.0]).is_none());
+        }
+        assert!(bank.select(81, [f32::NAN, 0.0], [0.0, 0.0]).is_none());
+        assert!(bank.select(81, [24.0, 0.0], [0.0, 0.0]).is_none());
+    }
+    #[test]
     fn ambient_grid_selection_and_bounded_crossfade() {
         let mut bytes = vec![0; 0x27005];
         bytes[0x26001 + 2 * 64 + 3] = 7;
@@ -695,6 +855,7 @@ mod tests {
             one_shots: Vec::new(),
             ambient_samples: std::array::from_fn(|_| None),
             ambient: AmbientPlayback::default(),
+            break_sounds: BreakSoundBank::default(),
         };
         let mut loaded = 0;
         for level in 1..=19 {
@@ -731,6 +892,7 @@ mod tests {
             one_shots: Vec::new(),
             ambient_samples: std::array::from_fn(|_| None),
             ambient: AmbientPlayback::default(),
+            break_sounds: BreakSoundBank::default(),
         };
         let mut outputs = Vec::new();
         for _ in 0..=MAX_ONE_SHOTS {

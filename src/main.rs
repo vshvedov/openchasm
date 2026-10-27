@@ -350,16 +350,51 @@ fn run() -> Result<(), Box<dyn Error>> {
                         })
                     })
                     .collect();
-                let processes = process_runtime::ProcessRuntime::with_wind(
-                    &script,
-                    &world,
-                    process_runtime::ProcessCapabilities {
-                        wall_elevation: true,
-                        initial_cell_types: None,
-                    },
-                    &cells,
-                    &process_objects,
-                )?;
+                let scripted =
+                    match openchasm::object_states::ObjectStates::new(&instances, &definitions) {
+                        Ok(states) => {
+                            let manifest = replacement_manifest::build_replacement_manifest(
+                                &mut resources,
+                                &mut object_scene,
+                                &definitions,
+                                &instances,
+                                &script,
+                                openchasm::pickups::Difficulty::Normal,
+                            );
+                            Some(openchasm::session::ScriptedObjects::new(
+                                states,
+                                definitions.clone(),
+                                manifest,
+                                &script,
+                                true,
+                            ))
+                        }
+                        Err(error) => {
+                            eprintln!("scripted object transitions disabled: {error}");
+                            None
+                        }
+                    };
+                let capabilities = process_runtime::ProcessCapabilities {
+                    wall_elevation: true,
+                    initial_cell_types: None,
+                };
+                let processes = if scripted.is_some() {
+                    process_runtime::ProcessRuntime::with_staged_actions(
+                        &script,
+                        &world,
+                        capabilities,
+                        &cells,
+                        &process_objects,
+                    )?
+                } else {
+                    process_runtime::ProcessRuntime::with_wind(
+                        &script,
+                        &world,
+                        capabilities,
+                        &cells,
+                        &process_objects,
+                    )?
+                };
                 let info = resources.read("chasm.inf")?;
                 let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
                 let mut audio = audio::Audio::new(&mut resources, &info);
@@ -398,6 +433,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &script,
                     openchasm::pickups::Difficulty::Normal,
                 ));
+                if let Some(scripted) = scripted {
+                    session.set_scripted_objects(scripted);
+                }
                 session.set_mission(openchasm::mission::MissionPlan::parse(
                     &script,
                     &String::from_utf8_lossy(&script_data),

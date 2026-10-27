@@ -17,7 +17,7 @@ use sdl2::{
     mouse::MouseButton,
     pixels::PixelFormatEnum,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,36 @@ fn render(
     );
 }
 
+// Script state retains decorative and dummy placements that combat visibility
+// omits. The client currently runs normal difficulty (bit 2).
+fn level_object_visible(session: &Session, cell: [usize; 2], fallback: bool) -> bool {
+    let Some(state) = session
+        .scripted_objects
+        .as_ref()
+        .and_then(|scripted| scripted.states.get(cell))
+    else {
+        return fallback;
+    };
+    let active = session
+        .objects
+        .as_ref()
+        .and_then(|combat| combat.is_active(cell));
+    scripted_object_visible(state.placement.difficulty_flags, active)
+}
+
+fn scripted_object_visible(difficulty_flags: u16, active: Option<bool>) -> bool {
+    difficulty_flags & 2 != 0 && active.unwrap_or(true)
+}
+
+fn restore_level_visibility(objects: &mut ObjectScene, session: &Session) {
+    if let Some(scripted) = &session.scripted_objects {
+        for state in scripted.states.iter() {
+            let cell = state.placement.grid_cell;
+            objects.set_visible(cell, level_object_visible(session, cell, true));
+        }
+    }
+}
+
 pub struct ClientFeedback {
     pub session: Session,
     pub audio: Audio,
@@ -239,6 +269,7 @@ pub fn run(
             objects.set_visible(cell, visible);
         }
     }
+    restore_level_visibility(&mut objects, &session);
     for cell in session.game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
@@ -402,6 +433,7 @@ pub fn run(
         };
         if restart_requested {
             session = initial_session.clone();
+            objects.reset_level_objects();
             objects.reset_object_animations();
             for pose in session.processes.objects() {
                 objects.set_pose(
@@ -416,6 +448,7 @@ pub fn run(
                     objects.set_visible(cell, visible);
                 }
             }
+            restore_level_visibility(&mut objects, &session);
             for (cell, visible) in session.game.pickups.visibility() {
                 objects.set_visible(cell, visible);
             }
@@ -475,6 +508,36 @@ pub fn run(
                     MissionEvent::LevelComplete => completed = true,
                 }
             }
+            let mut affected_cells = BTreeSet::new();
+            for transition in &events.object_transitions {
+                if !objects.replace_level_object(transition.cell, transition.new_type) {
+                    return Err(format!(
+                        "committed replacement unavailable at {:?}: type {}",
+                        transition.cell, transition.new_type
+                    )
+                    .into());
+                }
+                affected_cells.insert(transition.cell);
+            }
+            for &(cell, destroyed) in &events.object_hits {
+                if destroyed {
+                    affected_cells.insert(cell);
+                }
+            }
+            for cell in affected_cells {
+                // A hit and one or more replacements may occur in one tick.
+                // Final authoritative combat state decides visibility.
+                let hit_destroyed = events
+                    .object_hits
+                    .iter()
+                    .any(|&(at, destroyed)| at == cell && destroyed);
+                let replaced = events
+                    .object_transitions
+                    .iter()
+                    .any(|event| event.cell == cell);
+                let fallback = !hit_destroyed || replaced;
+                objects.set_visible(cell, level_object_visible(&session, cell, fallback));
+            }
             for effect in events.process_effects {
                 match effect {
                     openchasm::process_runtime::ProcessEffect::PlayAnimation { object_id } => {
@@ -497,11 +560,6 @@ pub fn run(
                 }
             }
             objects.tick_object_animations(STEP);
-            for (cell, destroyed) in events.object_hits {
-                if destroyed {
-                    objects.set_visible(cell, false);
-                }
-            }
             for event in events.pickups {
                 objects.set_visible(event.cell, false);
                 let sound = match event.pickup {
@@ -898,5 +956,15 @@ mod tests {
             assert_eq!(camera.player.position, player.position);
         }
         assert_eq!(player.angle, 1.0);
+    }
+    #[test]
+    fn replacement_visibility_uses_final_combat_state_and_difficulty() {
+        // A destroyed object replaced by a live target is shown; a destroyed
+        // final target stays hidden, and an unshootable dummy stays represented.
+        assert!(scripted_object_visible(7, Some(true)));
+        assert!(!scripted_object_visible(7, Some(false)));
+        assert!(scripted_object_visible(7, None));
+        assert!(!scripted_object_visible(1, Some(true)));
+        assert!(!scripted_object_visible(1, None));
     }
 }

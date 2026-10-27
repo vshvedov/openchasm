@@ -1,0 +1,9 @@
+# Actor definitions and placements
+
+The installed `chasm.inf` has a `[MONSTERS]` table: a count followed by rows of a model name and eight numeric values labeled `WRad`, `ARad`, `SPEED`, `R`, `LIFE`, `Kick`, `Rock`, and `SepLimit`. The 2022 modding manual describes the radii, speed, rotation, life, and attack fields. The loader retains those raw values, the complete line (including comments), and any extra columns; it does not interpret their units or define gameplay behavior.
+
+In the inspected map files, actor IDs `100 + n` correspond to table row `n`. ID 100 is used for player spawn records and is not instantiated as a monster. Other records receive their original array index as a stable identifier within the loaded map, their full raw map record, an initial map-tile position and angle, and health initialized from the matching table row. Unknown IDs are surfaced separately; player spawns are retained separately. No difficulty, multiplayer, or spawn filtering is applied. Actor flags are retained, but their meanings and filtering rules need verification.
+
+Resource paths are generated only when the table explicitly names a `.car` file. In this archive the table's Faust entry is `faust` while there are separately named `faust.gltf` and `faust1.car` assets; the loader does not guess which represents equivalent original data. The loader also does not derive AI states, animation timing, collisions, damage, audio, or network protocol identifiers.
+
+A standalone corpus check parsed the 24 table definitions and all 20 maps in the locally installed full release. It resolved 921 monster placements and preserved 185 player spawn records, with no unresolved IDs. The demo's byte-identical archive was not counted a second time. Synthetic tests check missing or malformed tables, unknown records, preservation of raw flags and fields, and extensionless model names.

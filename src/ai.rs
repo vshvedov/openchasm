@@ -2,8 +2,9 @@
 //!
 //! The caller advances this once at 60 Hz. Visibility, navigation, attack range,
 //! cooldown and collision are initial approximations, not original AI behavior.
-//! AI emits melee damage events; the owning simulation decides how to apply them.
+//! AI emits melee and projectile launch events; the owning simulation resolves damage.
 use crate::actors::{ActorDefinitions, ActorState};
+use crate::combat::RocketDefinitions;
 use crate::pickups::Difficulty;
 use crate::world::{Wall, World};
 use std::collections::BTreeMap;
@@ -22,11 +23,26 @@ pub enum Mode {
     Dead,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EnemyAttackKind {
+    Melee,
+    /// A projectile is launched toward the target's position at attack time.
+    /// A non-instant projectile must be advanced and collision-tested by the
+    /// caller; do not apply its damage merely because this event was emitted.
+    Ranged {
+        rocket_id: usize,
+        instant: bool,
+        origin: [f32; 2],
+        target: [f32; 2],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EnemyAttack {
     /// Stable source placement index from ActorState, not an actor array index.
     pub source_index: usize,
     pub damage: u16,
+    pub kind: EnemyAttackKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +74,27 @@ fn line_of_sight(from: [f32; 2], to: [f32; 2], walls: &[Wall]) -> bool {
     let ray = sub(to, from);
     !walls.iter().any(|wall| {
         if !(1..=86).contains(&wall.texture) {
+            return false;
+        }
+        let edge = sub(wall.b, wall.a);
+        let divisor = cross(ray, edge);
+        if divisor.abs() < 1e-8 {
+            return false;
+        }
+        let offset = sub(wall.a, from);
+        let t = cross(offset, edge) / divisor;
+        let u = cross(offset, ray) / divisor;
+        (1e-5..(1.0 - 1e-5)).contains(&t) && (0.0..=1.0).contains(&u)
+    })
+}
+
+/// Conservative projectile obstruction until material-specific shooting flags
+/// are part of World: treat any ordinary, transparent, or invisible wall as an
+/// obstacle. Sight remains independent and can pass through transparent walls.
+fn shot_clear(from: [f32; 2], to: [f32; 2], walls: &[Wall]) -> bool {
+    let ray = sub(to, from);
+    !walls.iter().any(|wall| {
+        if !(1..=120).contains(&wall.texture) {
             return false;
         }
         let edge = sub(wall.b, wall.a);
@@ -187,6 +224,28 @@ impl EnemyAi {
         definitions: &ActorDefinitions,
         world: &World,
     ) -> Vec<EnemyAttack> {
+        self.tick_inner(actors, definitions, None, world)
+    }
+
+    /// As `tick`, also emitting projectile launch events from each actor's
+    /// rocket definition. Missing, invalid or negative rocket IDs are ignored.
+    pub fn tick_with_rockets(
+        &mut self,
+        actors: &mut ActorState,
+        definitions: &ActorDefinitions,
+        rockets: &RocketDefinitions,
+        world: &World,
+    ) -> Vec<EnemyAttack> {
+        self.tick_inner(actors, definitions, Some(rockets), world)
+    }
+
+    fn tick_inner(
+        &mut self,
+        actors: &mut ActorState,
+        definitions: &ActorDefinitions,
+        rockets: Option<&RocketDefinitions>,
+        world: &World,
+    ) -> Vec<EnemyAttack> {
         let mut attacks = Vec::new();
         let target = world.player.position;
         if !target.iter().all(|v| v.is_finite()) {
@@ -241,10 +300,35 @@ impl EnemyAi {
                     attacks.push(EnemyAttack {
                         source_index: actor.source_index,
                         damage: def.kick.clamp(0, u16::MAX as i32) as u16,
+                        kind: EnemyAttackKind::Melee,
                     });
                     brain.cooldown = ATTACK_COOLDOWN_TICKS;
                 }
                 continue;
+            }
+            if sees_player && shot_clear(actor.position, target, &world.walls) {
+                let rocket = rockets.and_then(|table| {
+                    usize::try_from(def.rocket)
+                        .ok()
+                        .and_then(|index| table.0.get(index).map(|entry| (index, entry)))
+                });
+                if let Some((rocket_id, rocket)) = rocket.filter(|(_, rocket)| rocket.power > 0) {
+                    brain.mode = Mode::Attacking;
+                    if brain.cooldown == 0 {
+                        attacks.push(EnemyAttack {
+                            source_index: actor.source_index,
+                            damage: rocket.power.clamp(0, u16::MAX as i32) as u16,
+                            kind: EnemyAttackKind::Ranged {
+                                rocket_id,
+                                instant: rocket.model_name.is_empty(),
+                                origin: actor.position,
+                                target,
+                            },
+                        });
+                        brain.cooldown = ATTACK_COOLDOWN_TICKS;
+                    }
+                    continue;
+                }
             }
             if !sees_player && goal_distance < 0.05 {
                 brain.mode = Mode::Idle;
@@ -338,7 +422,8 @@ mod tests {
             ai.tick(&mut state, &defs, &w),
             vec![EnemyAttack {
                 source_index: 0,
-                damage: 20
+                damage: 20,
+                kind: EnemyAttackKind::Melee,
             }]
         );
         for _ in 0..59 {
@@ -349,6 +434,87 @@ mod tests {
         assert!(ai.tick(&mut state, &defs, &w).is_empty());
         assert_eq!(ai.mode(0), Some(Mode::Dead));
         assert!(!ai.alert(0, [1.0, 1.0]));
+    }
+    fn rockets() -> RocketDefinitions {
+        RocketDefinitions(vec![
+            crate::combat::RocketDefinition {
+                model_name: "".into(),
+                power: 12,
+                raw_fields: vec![],
+            },
+            crate::combat::RocketDefinition {
+                model_name: "disk.3o".into(),
+                power: 25,
+                raw_fields: vec![],
+            },
+        ])
+    }
+    #[test]
+    fn ranged_events_distinguish_projectiles_and_obey_cooldown() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].rocket = 1;
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let w = world([3.0, 0.0], vec![]);
+        let events = ai.tick_with_rockets(&mut state, &defs, &rockets(), &w);
+        assert_eq!(
+            events,
+            vec![EnemyAttack {
+                source_index: 0,
+                damage: 25,
+                kind: EnemyAttackKind::Ranged {
+                    rocket_id: 1,
+                    instant: false,
+                    origin: [0.0, 0.0],
+                    target: [3.0, 0.0]
+                }
+            }]
+        );
+        for _ in 0..59 {
+            assert!(ai
+                .tick_with_rockets(&mut state, &defs, &rockets(), &w)
+                .is_empty());
+        }
+        assert_eq!(
+            ai.tick_with_rockets(&mut state, &defs, &rockets(), &w)
+                .len(),
+            1
+        );
+        defs.entries[1].rocket = 0;
+        for _ in 0..59 {
+            ai.tick_with_rockets(&mut state, &defs, &rockets(), &w);
+        }
+        let events = ai.tick_with_rockets(&mut state, &defs, &rockets(), &w);
+        assert_eq!(events[0].damage, 12);
+        assert!(matches!(
+            events[0].kind,
+            EnemyAttackKind::Ranged {
+                rocket_id: 0,
+                instant: true,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn ranged_requires_valid_rocket_and_clear_shot_and_prefers_melee() {
+        let (mut state, mut defs) = actor(100, 7);
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let clear = world([3.0, 0.0], vec![]);
+        assert!(ai
+            .tick_with_rockets(&mut state, &defs, &rockets(), &clear)
+            .is_empty()); // -1
+        defs.entries[1].rocket = 3;
+        assert!(ai
+            .tick_with_rockets(&mut state, &defs, &rockets(), &clear)
+            .is_empty()); // no such rocket
+        defs.entries[1].rocket = 1;
+        let blocked = world([3.0, 0.0], vec![wall(87, true)]);
+        assert!(ai
+            .tick_with_rockets(&mut state, &defs, &rockets(), &blocked)
+            .is_empty()); // sees through, but no clear shot
+        let near = world([0.5, 0.0], vec![]);
+        let events = ai.tick_with_rockets(&mut state, &defs, &rockets(), &near);
+        assert!(matches!(events[0].kind, EnemyAttackKind::Melee));
+        assert_eq!(events[0].damage, 20);
     }
     #[test]
     fn difficulty_and_invalid_positions_do_not_activate_actors() {

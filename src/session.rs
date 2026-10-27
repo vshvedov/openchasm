@@ -25,6 +25,8 @@ pub struct LevelSetup {
 #[derive(Default)]
 pub struct SessionInput {
     pub movement: Input,
+    /// Horizontal look displacement in radians for this tick, independent of frame rate.
+    pub yaw_delta: f32,
     pub interact: bool,
     pub fire: bool,
     pub select_weapon: Option<usize>,
@@ -117,6 +119,15 @@ impl Session {
             index < self.game.inventory.weapons.len() && self.game.inventory.weapons[index]
         }) {
             self.selected_weapon = index;
+        }
+        // Process look as simulation input so a future server can own the view
+        // direction. Discard non-finite values and bound a single tick's turn.
+        if input.yaw_delta.is_finite() && self.world.player.angle.is_finite() {
+            let delta = input
+                .yaw_delta
+                .clamp(-std::f32::consts::PI, std::f32::consts::PI);
+            self.world.player.angle =
+                (self.world.player.angle + delta).rem_euclid(std::f32::consts::TAU);
         }
         self.world.step(input.movement, DT);
         events.pickups = self.game.collect_near(self.world.player.position);
@@ -365,6 +376,32 @@ mod tests {
         session.set_mission(MissionPlan::parse(&script, text));
         session
     }
+    #[test]
+    fn look_input_is_finite_bounded_and_applied_before_movement() {
+        let mut session = mission_session("");
+        session.step(SessionInput {
+            yaw_delta: std::f32::consts::FRAC_PI_2,
+            movement: Input {
+                forward: 1.0,
+                ..Input::default()
+            },
+            ..Default::default()
+        });
+        assert!((session.world.player.angle - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert!(session.world.player.position[1] > 0.5);
+        let angle = session.world.player.angle;
+        session.step(SessionInput {
+            yaw_delta: f32::NAN,
+            ..Default::default()
+        });
+        assert_eq!(session.world.player.angle, angle);
+        session.step(SessionInput {
+            yaw_delta: 100_000.0,
+            ..Default::default()
+        });
+        assert!((session.world.player.angle - (angle + std::f32::consts::PI)).abs() < 1e-6);
+    }
+
     #[test]
     fn end_process_emits_message_and_completion_once_and_restart_restores_state() {
         let text = "#mess1\nDelay 3\nTextA: 0 0 \"Done!\"\n#end\n#proc1\nEndDelay 0.05\nOnMessage 1\n#action\nplayani 8\n#end\n#links\nfloor 0 0 1\n#end\n";

@@ -1,0 +1,4 @@
+# SDL2 2.26's PipeWire backend does not build against newer PipeWire/GCC.
+# Audio is handled separately by rodio; avoid the unused SDL backend.
+[env]
+SDL2_TOOLCHAIN = { value = "build/sdl2-toolchain.cmake", relative = true }

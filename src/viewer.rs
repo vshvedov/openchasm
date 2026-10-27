@@ -7,17 +7,53 @@ use crate::texture::CelImage;
 use crate::weapon_render::{WeaponPose, WeaponRenderer};
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
-use minifb::{Key, KeyRepeat, MouseButton, ScaleMode, Window, WindowOptions};
 use openchasm::ai::Mode;
 use openchasm::combat::FireResult;
 use openchasm::mission::MissionEvent;
 use openchasm::session::{Session, SessionInput};
+use sdl2::{
+    event::{Event, WindowEvent},
+    keyboard::Scancode,
+    mouse::MouseButton,
+    pixels::PixelFormatEnum,
+};
+use std::collections::HashSet;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
 const WIDTH: usize = 640;
 const HEIGHT: usize = 400;
 const STEP: f32 = 1.0 / 60.0;
+const MOUSE_SENSITIVITY: f32 = 0.002;
+const FRAME_DURATION: Duration = Duration::from_micros(16_667);
+
+#[derive(Default)]
+struct RelativeLook {
+    focused: bool,
+    captured: bool,
+    pending_dx: i64,
+}
+impl RelativeLook {
+    fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        if !focused {
+            self.release();
+        }
+    }
+    fn release(&mut self) {
+        self.captured = false;
+        self.pending_dx = 0;
+    }
+    fn motion(&mut self, dx: i32) {
+        if self.focused && self.captured {
+            self.pending_dx = self.pending_dx.saturating_add(i64::from(dx));
+        }
+    }
+    fn take_yaw(&mut self) -> f32 {
+        let dx = std::mem::take(&mut self.pending_dx).clamp(-100_000, 100_000);
+        dx as f32 * MOUSE_SENSITIVITY
+    }
+}
 
 struct ViewerTexture {
     width: usize,
@@ -134,7 +170,7 @@ fn render(
         frame,
         8,
         20,
-        "WASD MOVE  ARROWS TURN  E USE  SPACE FIRE  1-8 WEAPONS  ESC QUIT",
+        "WASD MOVE  MOUSE/ARROWS TURN  E USE  SPACE FIRE  1-8  ESC QUIT",
     );
     text(
         frame,
@@ -172,51 +208,151 @@ pub fn run(
         .into_iter()
         .map(|item| item.map(ViewerTexture::from))
         .collect();
-    let mut window = Window::new(
-        "OpenChasm - early gameplay preview",
-        WIDTH,
-        HEIGHT,
-        WindowOptions {
-            resize: true,
-            scale_mode: ScaleMode::AspectRatioStretch,
-            ..WindowOptions::default()
-        },
+    let sdl = sdl2::init()?;
+    let video = sdl.video()?;
+    let window = video
+        .window(
+            "OpenChasm - early gameplay preview",
+            WIDTH as u32,
+            HEIGHT as u32,
+        )
+        .resizable()
+        .position_centered()
+        .build()?;
+    let mut canvas = window.into_canvas().software().build()?;
+    canvas.set_logical_size(WIDTH as u32, HEIGHT as u32)?;
+    let texture_creator = canvas.texture_creator();
+    let mut texture = texture_creator.create_texture_streaming(
+        PixelFormatEnum::ARGB8888,
+        WIDTH as u32,
+        HEIGHT as u32,
     )?;
-    window.set_target_fps(60);
+    let mut event_pump = sdl.event_pump()?;
+    let mut look = RelativeLook {
+        focused: canvas.window().has_input_focus(),
+        ..RelativeLook::default()
+    };
+    let mut held = HashSet::new();
+    let mut mouse_fire = false;
     let mut frame = vec![0; WIDTH * HEIGHT];
     let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
-    let started = Instant::now();
-    let mut last = started;
+    let mut last = Instant::now();
     let mut accumulator = 0.0f32;
+    let mut animation_tick = 0_u64;
     let mut pending_interact = false;
     let mut pending_weapon = None;
     let mut shoot_ticks = 0usize;
     let mut current_message: Option<(Vec<String>, f32)> = None;
     let mut completed = false;
     let number_keys = [
-        Key::Key1,
-        Key::Key2,
-        Key::Key3,
-        Key::Key4,
-        Key::Key5,
-        Key::Key6,
-        Key::Key7,
-        Key::Key8,
+        Scancode::Num1,
+        Scancode::Num2,
+        Scancode::Num3,
+        Scancode::Num4,
+        Scancode::Num5,
+        Scancode::Num6,
+        Scancode::Num7,
+        Scancode::Num8,
     ];
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    let mut running = true;
+    while running {
+        let frame_start = Instant::now();
+        let mut restart_requested = false;
+        let mut advance_requested = false;
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => running = false,
+                Event::Window {
+                    win_event: WindowEvent::Close,
+                    ..
+                } => running = false,
+                Event::Window {
+                    win_event: WindowEvent::FocusGained,
+                    ..
+                } => look.set_focus(true),
+                Event::Window {
+                    win_event: WindowEvent::FocusLost,
+                    ..
+                } => {
+                    look.set_focus(false);
+                    sdl.mouse().set_relative_mouse_mode(false);
+                    held.clear();
+                    mouse_fire = false;
+                    pending_interact = false;
+                    pending_weapon = None;
+                    accumulator = 0.0;
+                }
+                Event::KeyDown {
+                    scancode: Some(code),
+                    repeat,
+                    ..
+                } if look.focused => {
+                    held.insert(code);
+                    if !repeat {
+                        if code == Scancode::Escape {
+                            running = false;
+                        } else if code == Scancode::R {
+                            restart_requested = true;
+                        } else if code == Scancode::Return {
+                            advance_requested = true;
+                        } else if code == Scancode::E {
+                            pending_interact = true;
+                        }
+                        if let Some(index) = number_keys.iter().position(|&key| key == code) {
+                            pending_weapon = Some(index);
+                        }
+                    }
+                }
+                Event::KeyUp {
+                    scancode: Some(code),
+                    ..
+                } => {
+                    held.remove(&code);
+                }
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } if look.focused => {
+                    if look.captured {
+                        mouse_fire = true;
+                    } else {
+                        // The click that captures the cursor must not also shoot.
+                        sdl.mouse().set_relative_mouse_mode(true);
+                        look.captured = sdl.mouse().relative_mouse_mode();
+                        if !look.captured {
+                            eprintln!("relative mouse capture unavailable; use arrow keys to turn");
+                            mouse_fire = true;
+                        }
+                    }
+                }
+                Event::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => mouse_fire = false,
+                Event::MouseMotion { xrel, .. } => look.motion(xrel),
+                _ => {}
+            }
+        }
+        if !running {
+            break;
+        }
         let now = Instant::now();
-        accumulator += now
-            .duration_since(last)
-            .min(Duration::from_millis(100))
-            .as_secs_f32();
+        if look.focused {
+            accumulator += now
+                .duration_since(last)
+                .min(Duration::from_millis(100))
+                .as_secs_f32();
+        } else {
+            accumulator = 0.0;
+        }
         last = now;
-        let key = |k| if window.is_key_down(k) { 1.0 } else { 0.0 };
+        let key = |code| if held.contains(&code) { 1.0 } else { 0.0 };
         let movement = Input {
-            forward: key(Key::W) - key(Key::S),
-            strafe: key(Key::D) - key(Key::A),
-            turn: key(Key::Right) - key(Key::Left),
+            forward: key(Scancode::W) - key(Scancode::S),
+            strafe: key(Scancode::D) - key(Scancode::A),
+            turn: key(Scancode::Right) - key(Scancode::Left),
         };
-        if window.is_key_pressed(Key::R, KeyRepeat::No) {
+        if restart_requested {
             session = initial_session.clone();
             for (cell, visible) in session.game.pickups.visibility() {
                 objects.set_visible(cell, visible);
@@ -224,22 +360,23 @@ pub fn run(
             pending_interact = false;
             pending_weapon = None;
             shoot_ticks = 0;
+            animation_tick = 0;
             current_message = None;
             completed = false;
+            look.pending_dx = 0;
         }
-        if completed && window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+        if completed && advance_requested {
+            sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
         }
-        pending_interact |= window.is_key_pressed(Key::E, KeyRepeat::No);
-        for (index, key) in number_keys.iter().enumerate() {
-            if window.is_key_pressed(*key, KeyRepeat::No) {
-                pending_weapon = Some(index);
-            }
-        }
-        let firing = window.is_key_down(Key::Space) || window.get_mouse_down(MouseButton::Left);
+        let firing = held.contains(&Scancode::Space) || mouse_fire;
         while accumulator >= STEP {
+            // Deltas are motion, not velocity: consume exactly once per tick.
+            let yaw_delta = look.take_yaw();
+            animation_tick = animation_tick.saturating_add(1);
             let events = session.step(SessionInput {
                 movement,
+                yaw_delta,
                 interact: pending_interact,
                 fire: firing,
                 select_weapon: pending_weapon,
@@ -271,6 +408,11 @@ pub fn run(
                         }
                     }
                     MissionEvent::LevelComplete => completed = true,
+                }
+            }
+            for (cell, destroyed) in events.object_hits {
+                if destroyed {
+                    objects.set_visible(cell, false);
                 }
             }
             for event in events.pickups {
@@ -349,7 +491,7 @@ pub fn run(
         let frame_index = if shoot_ticks > 0 {
             (12 - shoot_ticks) * count / 12
         } else {
-            (started.elapsed().as_millis() as usize / 100) % count
+            (animation_tick as usize / 6) % count
         };
         weapon_overlay.render(
             &mut frame,
@@ -401,8 +543,26 @@ pub fn run(
                 "YOU DIED - R TO RESTART",
             );
         }
-        window.update_with_buffer(&frame, WIDTH, HEIGHT)?;
+        if !look.focused {
+            text(&mut frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
+        } else if !look.captured {
+            text(&mut frame, 8, HEIGHT - 30, "CLICK TO CAPTURE MOUSE");
+        }
+        texture.with_lock(None, |bytes, pitch| {
+            for (row, pixels) in bytes.chunks_mut(pitch).zip(frame.chunks(WIDTH)) {
+                for (dst, &pixel) in row[..WIDTH * 4].chunks_mut(4).zip(pixels) {
+                    dst.copy_from_slice(&(pixel | 0xff00_0000).to_ne_bytes());
+                }
+            }
+        })?;
+        canvas.clear();
+        canvas.copy(&texture, None, None)?;
+        canvas.present();
+        if let Some(delay) = FRAME_DURATION.checked_sub(frame_start.elapsed()) {
+            std::thread::sleep(delay);
+        }
     }
+    sdl.mouse().set_relative_mouse_mode(false);
     Ok(None)
 }
 
@@ -410,6 +570,26 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::world::{Player, Wall};
+
+    #[test]
+    fn relative_motion_is_consumed_once_and_cleared_on_focus_loss() {
+        let mut look = RelativeLook::default();
+        look.motion(100);
+        assert_eq!(look.take_yaw(), 0.0);
+        look.set_focus(true);
+        look.captured = true;
+        look.motion(10);
+        look.motion(-4);
+        assert!((look.take_yaw() - 0.012).abs() < 1e-6);
+        assert_eq!(look.take_yaw(), 0.0);
+        look.motion(30);
+        look.set_focus(false);
+        assert!(!look.captured);
+        assert_eq!(look.take_yaw(), 0.0);
+        look.set_focus(true);
+        look.motion(50);
+        assert_eq!(look.take_yaw(), 0.0);
+    }
 
     #[test]
     fn composites_masked_walls_over_the_walls_behind_them() {

@@ -13,12 +13,13 @@ use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
 use crate::object_combat::ObjectCombat;
+use crate::object_heights::ObjectHeightCatalog;
 use crate::object_states::{ObjectStates, ObjectTransition};
 use crate::objects::ObjectDefinitions;
 use crate::pickups::{Difficulty, PickupEvent};
 use crate::process::Script;
 use crate::process_runtime::{
-    ImmediateAction, ProcessEffect, ProcessEvent, ProcessOutcome, ProcessRuntime,
+    ImmediateAction, ProcessEffect, ProcessEvent, ProcessObject, ProcessOutcome, ProcessRuntime,
 };
 use crate::process_transaction::{PresentationManifest, ProcessTransaction};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
@@ -177,10 +178,45 @@ impl ScriptedObjects {
 }
 
 #[derive(Clone)]
+struct SessionObjectHeights {
+    catalog: ObjectHeightCatalog,
+    initial_raw_cells: Box<[u8; 4096]>,
+}
+
+fn object_blocks_height(
+    heights: Option<&SessionObjectHeights>,
+    processes: &ProcessRuntime,
+    object: &ProcessObject,
+    bottom: f32,
+    top: f32,
+    legacy_top: f32,
+) -> bool {
+    if object.blocking_radius <= 0.0 {
+        return false;
+    }
+    let Some(heights) = heights else {
+        return object.elevation_raw / 64.0 < legacy_top;
+    };
+    let cell = object.cell;
+    if cell[0] >= 64 || cell[1] >= 64 || !object.elevation_raw.is_finite() {
+        return true;
+    }
+    let initial = heights.initial_raw_cells[usize::from(cell[0]) * 64 + usize::from(cell[1])];
+    let raw = processes.cell_type(cell).unwrap_or(initial);
+    if !(131..=226).contains(&raw) {
+        return true;
+    }
+    heights
+        .catalog
+        .overlaps(raw, object.elevation_raw / 64.0, bottom, top)
+}
+
+#[derive(Clone)]
 pub struct Session {
     pub world: World,
     wall_collision_mode: WallCollisionMode,
     teleports: Option<(Vec<Teleport>, TeleportState)>,
+    object_heights: Option<SessionObjectHeights>,
     pub vertical: VerticalState,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
@@ -231,6 +267,7 @@ impl Session {
             world: setup.world,
             wall_collision_mode: WallCollisionMode::TwoSided,
             teleports: None,
+            object_heights: None,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
             processes: setup.processes,
             actors: setup.actors,
@@ -255,6 +292,36 @@ impl Session {
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Opt into model-height collision using original x-major map cells.
+    /// Missing heights remain blocking. Call before the restart snapshot.
+    /// Reject raw cells that disagree with represented runtime objects.
+    pub fn set_object_heights(
+        &mut self,
+        catalog: ObjectHeightCatalog,
+        raw_cells: [u8; 4096],
+    ) -> bool {
+        for object in self.processes.objects() {
+            let [x, y] = object.cell;
+            if x >= 64 || y >= 64 {
+                return false;
+            }
+            let raw = raw_cells[usize::from(x) * 64 + usize::from(y)];
+            if !(131..=226).contains(&raw)
+                || self
+                    .processes
+                    .cell_type(object.cell)
+                    .is_some_and(|current| current != raw)
+            {
+                return false;
+            }
+        }
+        self.object_heights = Some(SessionObjectHeights {
+            catalog,
+            initial_raw_cells: Box::new(raw_cells),
+        });
+        true
+    }
+
     /// Opt into player teleports; configure before taking a restart snapshot.
     /// The host must present teleport events and keep floor geometry in sync.
     pub fn set_teleports(&mut self, definitions: Vec<Teleport>, policy: RearmPolicy) {
@@ -986,14 +1053,20 @@ impl Session {
             })
             .collect();
         // Only opt-in, live, represented objects have a process-owned pose.
-        // Their authored 2D radii are provisional circular approximations;
-        // object height is not yet known, so do not allow jumping over them.
+        // Radii are provisional circles; optional mesh heights filter
+        // vertically separated objects, with conservative unknown fallback.
         circles.extend(
             self.processes
                 .objects()
                 .filter(|object| {
-                    object.blocking_radius > 0.0
-                        && object.elevation_raw / 64.0 < self.vertical.head()
+                    object_blocks_height(
+                        self.object_heights.as_ref(),
+                        &self.processes,
+                        object,
+                        self.vertical.feet(),
+                        self.vertical.head(),
+                        self.vertical.head(),
+                    )
                 })
                 .map(|object| crate::world::CollisionCircle {
                     center: object.position,
@@ -1056,8 +1129,14 @@ impl Session {
                 self.processes
                     .objects()
                     .filter(|object| {
-                        object.blocking_radius > 0.0
-                            && object.elevation_raw / 64.0 < self.vertical.head()
+                        object_blocks_height(
+                            self.object_heights.as_ref(),
+                            &self.processes,
+                            object,
+                            0.0,
+                            1.0,
+                            self.vertical.head(),
+                        )
                     })
                     .map(|object| CollisionCircle {
                         center: object.position,
@@ -1107,8 +1186,14 @@ impl Session {
                 self.processes
                     .objects()
                     .filter(|object| {
-                        object.blocking_radius > 0.0
-                            && object.elevation_raw / 64.0 < destination_head
+                        object_blocks_height(
+                            self.object_heights.as_ref(),
+                            &self.processes,
+                            object,
+                            0.0,
+                            destination_head,
+                            destination_head,
+                        )
                     })
                     .map(|object| CollisionCircle {
                         center: object.position,
@@ -1386,7 +1471,16 @@ impl Session {
         let enemy_objects: Vec<_> = self
             .processes
             .objects()
-            .filter(|object| object.blocking_radius > 0.0 && object.elevation_raw < 64.0)
+            .filter(|object| {
+                object_blocks_height(
+                    self.object_heights.as_ref(),
+                    &self.processes,
+                    object,
+                    0.0,
+                    1.0,
+                    1.0,
+                )
+            })
             .map(|object| CollisionCircle {
                 center: object.position,
                 radius: object.blocking_radius,
@@ -1894,6 +1988,118 @@ mod tests {
         assert_eq!(session.actors.actors[0].health, 0);
         assert!(session.mission.as_ref().unwrap().end_remaining().is_some());
     }
+    #[test]
+    fn object_height_filters_teleport_clearance_and_unknown_stays_solid() {
+        use crate::object_heights::{HeightBounds, ObjectHeightCatalog};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        use crate::teleport::{self, RearmPolicy, TeleportFailure};
+        let mut session = mission_session("");
+        let mut cells = [0u8; 4096];
+        cells[2 * 64] = 165;
+        let roof = ProcessObject {
+            cell: [2, 0],
+            position: [2.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.5,
+        };
+        session.processes = ProcessRuntime::with_wind(
+            &Script::default(),
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[roof],
+        )
+        .unwrap();
+        session.set_teleports(
+            teleport::parse("#teleports\ntcenter 0 0 2 0 3\n#end\n").unwrap(),
+            RearmPolicy::ReferenceContinuous,
+        );
+        let mut unknown = session.clone();
+        assert!(unknown.set_object_heights(ObjectHeightCatalog::new(), cells));
+        assert!(matches!(
+            unknown.step(SessionInput::default()).teleport_failure,
+            Some(TeleportFailure::DestinationBlocked { .. })
+        ));
+        let mut catalog = ObjectHeightCatalog::new();
+        assert!(catalog.set(165, HeightBounds::new(2.0, 4.7).unwrap()));
+        let mut invalid = cells;
+        invalid[2 * 64] = 0;
+        assert!(!session.set_object_heights(catalog.clone(), invalid));
+        assert!(session.set_object_heights(catalog, cells));
+        let mut snapshot = session.clone();
+        assert!(session.step(SessionInput::default()).teleport.is_some());
+        assert!(snapshot.step(SessionInput::default()).teleport.is_some());
+    }
+
+    #[test]
+    fn object_height_lookup_uses_live_changed_type_and_pose_elevation() {
+        use crate::object_heights::{HeightBounds, ObjectHeightCatalog};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text = "#proc1\n#action\nchange 2 0 166\n#end\n#links\nlink 0 0 1\n#end\n";
+        let world = mission_session("").world;
+        let mut cells = [0u8; 4096];
+        cells[2 * 64] = 165;
+        let roof = ProcessObject {
+            cell: [2, 0],
+            position: [2.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.5,
+        };
+        let mut runtime = ProcessRuntime::with_wind(
+            &Script::parse(text),
+            &world,
+            ProcessCapabilities {
+                wall_elevation: false,
+                initial_cell_types: Some(&cells),
+            },
+            &cells,
+            &[roof],
+        )
+        .unwrap();
+        let mut catalog = ObjectHeightCatalog::new();
+        catalog.set(165, HeightBounds::new(2.0, 4.0).unwrap());
+        catalog.set(166, HeightBounds::new(0.0, 1.0).unwrap());
+        let heights = SessionObjectHeights {
+            catalog,
+            initial_raw_cells: Box::new(cells),
+        };
+        assert!(!object_blocks_height(
+            Some(&heights),
+            &runtime,
+            &roof,
+            0.0,
+            0.9,
+            0.9
+        ));
+        let mut moved = roof;
+        moved.elevation_raw = -128.0;
+        assert!(object_blocks_height(
+            Some(&heights),
+            &runtime,
+            &moved,
+            0.0,
+            0.9,
+            0.9
+        ));
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let mut world = world;
+        runtime.tick(&mut world, 1.0 / 60.0, false);
+        assert_eq!(runtime.cell_type([2, 0]), Some(166));
+        assert!(object_blocks_height(
+            Some(&heights),
+            &runtime,
+            &roof,
+            0.0,
+            0.9,
+            0.9
+        ));
+    }
+
     #[test]
     fn teleport_resets_vertical_and_dispatches_only_destination_floor() {
         use crate::teleport::{self, RearmPolicy};

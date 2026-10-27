@@ -343,6 +343,98 @@ fn parse_options(
     Ok((source, difficulty.unwrap_or(Difficulty::Normal), supplied))
 }
 
+/// Increment whenever simulation rules or startup interpretation changes.
+const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v1";
+
+fn finish_level_fingerprint(
+    mut trace: content::ResourceTrace,
+    level: &str,
+    difficulty: Difficulty,
+    session: &openchasm::session::Session,
+    clips: &[Option<openchasm::actor_clips::ActorClipSet>],
+    heights: &openchasm::object_heights::ObjectHeightCatalog,
+    wall_materials: &openchasm::wall_transitions::WallMaterialCatalog,
+) -> Result<openchasm::save_format::ContentDigest, Box<dyn Error>> {
+    use openchasm::actor_clips::ClipSource;
+    use openchasm::save_format::ContentDigest;
+    trace.add_metadata("rules", SAVE_RULES_ID)?;
+    trace.add_metadata("level", level.as_bytes())?;
+    trace.add_metadata("difficulty", &difficulty_mask(difficulty).to_le_bytes())?;
+    // Only immutable baseline/configuration state belongs here. In particular,
+    // carried inventory is gameplay state and must not alter content identity.
+    let snapshot = session
+        .snapshot(ContentDigest([0; 32]))
+        .map_err(|error| format!("baseline snapshot unavailable: {error:?}"))?;
+    trace.add_metadata(
+        "baseline-geometry",
+        &serde_json::to_vec(&(
+            &snapshot.capabilities,
+            &snapshot.world,
+            &snapshot.processes,
+            &snapshot.wall_elevations,
+            &snapshot.elevation_by_cell,
+        ))?,
+    )?;
+    trace.add_metadata(
+        "baseline-entities",
+        &serde_json::to_vec(&(
+            &snapshot.actors,
+            &snapshot.ai,
+            &snapshot.pickups,
+            &snapshot.object_states,
+            &snapshot.object_combat,
+            &snapshot.mission,
+            &snapshot.teleport,
+        ))?,
+    )?;
+    let clip_summary: Vec<_> = clips
+        .iter()
+        .map(|clip| {
+            clip.as_ref().map(|set| {
+                let source = match set.source {
+                    ClipSource::Car => 0u8,
+                    ClipSource::Gltf => 1,
+                };
+                let frames: Vec<_> = set
+                    .clips
+                    .iter()
+                    .map(|clip| clip.map(|c| (c.first_frame, c.frame_count)))
+                    .collect();
+                (source, set.bounds_verified, frames)
+            })
+        })
+        .collect();
+    trace.add_metadata("actor-clips", &serde_json::to_vec(&clip_summary)?)?;
+    let height_summary: Vec<_> = (131..=226u8)
+        .filter_map(|raw| {
+            heights
+                .get(raw)
+                .map(|bounds| (raw, bounds.bottom.to_bits(), bounds.top.to_bits()))
+        })
+        .collect();
+    trace.add_metadata("object-heights", &serde_json::to_vec(&height_summary)?)?;
+    let material_summary: Vec<_> = (1..=127u8)
+        .filter_map(|raw| {
+            wall_materials.get(raw).map(|m| {
+                (
+                    raw,
+                    m.blocks_movement,
+                    m.blocks_shots,
+                    m.presentation_available,
+                )
+            })
+        })
+        .collect();
+    trace.add_metadata("wall-materials", &serde_json::to_vec(&material_summary)?)?;
+    let replacements: Vec<_> = session
+        .scripted_objects
+        .as_ref()
+        .map(|s| s.manifest.fingerprint_entries().collect())
+        .unwrap_or_default();
+    trace.add_metadata("replacement-manifest", &serde_json::to_vec(&replacements)?)?;
+    Ok(trace.finish()?)
+}
+
 fn play(
     resources: &mut ResourceSet,
     difficulty: Difficulty,
@@ -351,6 +443,14 @@ fn play(
     let mut carry: Option<openchasm::inventory::Inventory> = None;
     let info = resources.read("chasm.inf")?;
     loop {
+        let tracing = resources.begin_trace().is_ok();
+        if tracing {
+            let _ = resources
+                .trace_mut()
+                .and_then(|trace| trace.record_preloaded("chasm.inf", &info));
+        } else {
+            eprintln!("save content fingerprint unavailable: resource tracing already active");
+        }
         let map_bytes = resources.read(&format!("map/map.{id}"))?;
         let map = Map::parse(&map_bytes)?;
         let resource = resources.read(&format!("map/resource.{id}"))?;
@@ -466,12 +566,6 @@ fn play(
             )?
         };
         let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
-        let mut audio = audio::Audio::new(resources, &info);
-        audio.play_level_music(resources, &resource);
-        audio.load_ambient(resources, &resource);
-        if let Err(error) = audio.load_object_break_sounds(resources, &info, &resource) {
-            eprintln!("object break audio unavailable: {error}");
-        }
         let weapon_overlay = weapon_render::WeaponRenderer::load(resources, &info, &palette)?;
         let mut game =
             openchasm::game::GameInventory::new(weapons, &instances, &definitions, difficulty);
@@ -502,15 +596,16 @@ fn play(
             shot_blocking,
             difficulty,
         });
-        if !session.set_wall_material_catalog(wall_material_catalog(&graphics, &textures)) {
+        let wall_materials = wall_material_catalog(&graphics, &textures);
+        if !session.set_wall_material_catalog(wall_materials.clone()) {
             eprintln!("wall material catalog rejected; scripted wall changes disabled");
         }
         let object_heights = object_height_loader::load_object_heights(resources, &definitions);
-        if !session.set_object_heights(object_heights, cells) {
+        if !session.set_object_heights(object_heights.clone(), cells) {
             eprintln!("object height catalog rejected; using conservative collision");
         }
         session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
-        session.ai.set_clip_metadata(actor_clips);
+        session.ai.set_clip_metadata(actor_clips.clone());
         session.set_explosions_enabled(true);
         session.set_mines_enabled(mine_available);
         session.set_protective_powerups_enabled(true);
@@ -536,6 +631,36 @@ fn play(
             &script,
             &String::from_utf8_lossy(&script_data),
         ));
+        let content_digest = if tracing {
+            match resources
+                .take_trace()
+                .map_err(Box::<dyn Error>::from)
+                .and_then(|trace| {
+                    finish_level_fingerprint(
+                        trace,
+                        &id,
+                        difficulty,
+                        &session,
+                        &actor_clips,
+                        &object_heights,
+                        &wall_materials,
+                    )
+                }) {
+                Ok(digest) => Some(digest),
+                Err(error) => {
+                    eprintln!("save content fingerprint unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut audio = audio::Audio::new(resources, &info);
+        audio.play_level_music(resources, &resource);
+        audio.load_ambient(resources, &resource);
+        if let Err(error) = audio.load_object_break_sounds(resources, &info, &resource) {
+            eprintln!("object break audio unavailable: {error}");
+        }
         let next_level = viewer::run(
             textures,
             planes,
@@ -548,6 +673,7 @@ fn play(
                 explosion_renderer,
                 difficulty,
                 teleport_load_error,
+                content_digest,
             },
             &format!("{id}: {name} ({difficulty:?})"),
         )?;
@@ -781,6 +907,120 @@ fn main() {
 #[cfg(test)]
 mod wall_graphics_tests {
     use super::*;
+    fn fingerprint_fixture(
+        path: &Path,
+        difficulty: Difficulty,
+        fallback: bool,
+    ) -> openchasm::save_format::ContentDigest {
+        let mut resources = ResourceSet::open(path).unwrap();
+        resources.begin_trace().unwrap();
+        let info = resources.read("chasm.inf").unwrap();
+        let map_bytes = resources.read("map/map.01").unwrap();
+        let map = Map::parse(&map_bytes).unwrap();
+        let resource = resources.read("map/resource.01").unwrap();
+        let graphics = parse_wall_graphics(&resource);
+        let textures = load_wall_textures(&mut resources, &graphics);
+        let materials = wall_material_catalog(&graphics, &textures);
+        let world = make_world(&map, &graphics).unwrap();
+        resources.read("map/floors.01").unwrap();
+        let script = process::Script::parse(&String::from_utf8_lossy(
+            &resources.read("map/process.01").unwrap(),
+        ));
+        let definitions = objects::ObjectDefinitions::parse(&info, &resource).unwrap();
+        let heights = object_height_loader::load_object_heights(&mut resources, &definitions);
+        let (actor_definitions, actor_state) = level_actor_state(&map, &map_bytes, &info).unwrap();
+        let clips = load_actor_clips(&mut resources, &actor_state, &actor_definitions);
+        let cells = raw_cells(&map);
+        let runtime = process_runtime::ProcessRuntime::with_source_lights(
+            &script,
+            &world,
+            process_runtime::ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        let instances = objects::instances(&map);
+        let game = openchasm::game::GameInventory::new(
+            openchasm::inventory::WeaponDefinitions::parse(&info).unwrap(),
+            &instances,
+            &definitions,
+            difficulty,
+        );
+        let mut session = openchasm::session::Session::new(openchasm::session::LevelSetup {
+            world,
+            processes: runtime,
+            actors: actor_state,
+            actor_definitions,
+            game,
+            rockets: openchasm::combat::RocketDefinitions::parse(&info).unwrap(),
+            shot_blocking: std::array::from_fn(|i| !graphics[i].disable_shoot_collision),
+            difficulty,
+        });
+        assert!(session.set_wall_material_catalog(materials.clone()));
+        assert!(session.set_object_heights(heights.clone(), cells));
+        session.ai.set_clip_metadata(clips.clone());
+        if fallback {
+            assert!(resources.read("optional/not-present.test").is_err());
+        }
+        finish_level_fingerprint(
+            resources.take_trace().unwrap(),
+            "01",
+            difficulty,
+            &session,
+            &clips,
+            &heights,
+            &materials,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn installed_content_fingerprint_binds_difficulty_and_missing_fallback() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let normal = fingerprint_fixture(&path, Difficulty::Normal, false);
+        assert_eq!(
+            normal,
+            fingerprint_fixture(&path, Difficulty::Normal, false)
+        );
+        assert_ne!(normal, fingerprint_fixture(&path, Difficulty::Hard, false));
+        assert_ne!(normal, fingerprint_fixture(&path, Difficulty::Normal, true));
+        let sources = content::discover();
+        let full = sources.iter().find(|s| s.kind == SourceKind::SteamFull);
+        let demo = sources.iter().find(|s| s.kind == SourceKind::SteamDemo);
+        if let (Some(full), Some(demo)) = (full, demo) {
+            use std::io::Read;
+            let mut a = std::io::BufReader::new(std::fs::File::open(&full.path).unwrap());
+            let mut b = std::io::BufReader::new(std::fs::File::open(&demo.path).unwrap());
+            let mut same = true;
+            loop {
+                let mut left = [0u8; 65536];
+                let mut right = [0u8; 65536];
+                let n = a.read(&mut left).unwrap();
+                let m = b.read(&mut right).unwrap();
+                if n != m || left[..n] != right[..m] {
+                    same = false;
+                    break;
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            if same {
+                assert_eq!(
+                    fingerprint_fixture(&full.path, Difficulty::Normal, false),
+                    fingerprint_fixture(&demo.path, Difficulty::Normal, false)
+                );
+            }
+        }
+    }
+
     #[test]
     fn installed_addon_client_maps_authored_actor_ids_to_merged_models() {
         let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");

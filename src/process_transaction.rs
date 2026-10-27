@@ -24,6 +24,10 @@ impl PresentationManifest {
     pub fn allow(&mut self, cell: [usize; 2], raw_type: u8) {
         self.replacements.insert((cell, raw_type));
     }
+    /// Stable ordered preflight decisions for content identity.
+    pub fn fingerprint_entries(&self) -> impl Iterator<Item = ([usize; 2], u8)> + '_ {
+        self.replacements.iter().copied()
+    }
     pub fn contains(&self, cell: [usize; 2], raw_type: u8) -> bool {
         self.replacements.contains(&(cell, raw_type))
     }

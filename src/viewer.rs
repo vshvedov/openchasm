@@ -54,6 +54,7 @@ fn effective_fps_limit(stored: u32, uncapped_override: bool) -> Option<Duration>
 struct RelativeLook {
     focused: bool,
     captured: bool,
+    discard_capture_motion: bool,
     pending_dx: i64,
     pending_dy: i64,
 }
@@ -73,12 +74,26 @@ impl RelativeLook {
         self.pending_dx = 0;
         self.pending_dy = 0;
         self.captured = enable();
+        self.discard_capture_motion = self.captured;
         self.captured
     }
     fn release(&mut self) {
         self.captured = false;
+        self.discard_capture_motion = false;
         self.pending_dx = 0;
         self.pending_dy = 0;
+    }
+    fn relative_motion(&mut self, dx: i32, dy: i32) {
+        if !self.focused || !self.captured {
+            return;
+        }
+        // Native pointer locking may deliver an initial recentering delta
+        // after the mode switch, despite clearing previously queued deltas.
+        if std::mem::take(&mut self.discard_capture_motion) {
+            return;
+        }
+        self.motion(dx);
+        self.motion_y(dy);
     }
     fn motion(&mut self, dx: i32) {
         if self.focused && self.captured {
@@ -1698,8 +1713,7 @@ pub fn run(
                     }
                 }
                 Event::MouseMotion { xrel, yrel, .. } => {
-                    look.motion(xrel);
-                    look.motion_y(yrel);
+                    look.relative_motion(xrel, yrel);
                 }
                 _ => {}
             }
@@ -2333,6 +2347,27 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_recenter_does_not_turn_the_camera() {
+        let mut look = RelativeLook {
+            focused: true,
+            ..RelativeLook::default()
+        };
+        assert!(look.capture_with(|| true));
+        look.relative_motion(-341, -185);
+        assert_eq!(look.take_yaw(), 0.0);
+        assert_eq!(look.take_pitch(), 0.0);
+        look.relative_motion(10, -4);
+        assert!((look.take_yaw() + 10.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
+        assert!((look.take_pitch() - 4.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
+        look.release();
+        look.relative_motion(500, 500);
+        assert!(look.capture_with(|| true));
+        look.relative_motion(200, 100);
+        assert_eq!(look.take_yaw(), 0.0);
+        assert_eq!(look.take_pitch(), 0.0);
+    }
+
     #[test]
     fn environment_uncapped_override_leaves_saved_cap_unchanged() {
         let mut settings = GraphicsSettings::default();
@@ -3365,6 +3400,7 @@ mod tests {
             captured: true,
             pending_dx: 42,
             pending_dy: 0,
+            ..RelativeLook::default()
         };
         let mut accumulator = 0.1;
         assert_eq!(held_movement(&held).forward, 1.0);
@@ -3393,8 +3429,7 @@ mod tests {
         let mut look = RelativeLook {
             focused: true,
             captured: false,
-            pending_dx: 0,
-            pending_dy: 0,
+            ..RelativeLook::default()
         };
         assert_eq!(wheel_weapon(&look, &inventory, 0, 1), Some(1));
         look.captured = true;

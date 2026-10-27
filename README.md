@@ -18,6 +18,11 @@ The launcher lets you choose a discovered full, demo or local installation, or e
 
 The game captures the mouse when its window is focused; move it to look and aim, or use **left/right arrows** to turn. If capture is unavailable, click the window to retry. Use **WASD** to move, **E** to use nearby linked objects, **Space** or the right mouse button to jump, the left mouse button to fire, **1–8** to select owned weapons or the **mouse wheel** to cycle through owned weapons with ammunition, **Tab** to toggle the provisional explored-wall map, **R** to request a restart, **F5** to save an in-memory checkpoint, **F9** to restore it, and **Escape** to open the pause menu. Use the arrow keys and Enter in the menu; restart and exit require confirmation. The map reveals opaque walls seen by the player; its visibility and wall-occlusion rules are approximate. The checkpoint lasts only for the current level and is lost on exit. After a supported level exit, press **Enter** to continue. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Select `easy`, `normal`, or `hard` with `--difficulty` before `view`; the default is `normal`. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
 
+The FPS counter is shown during gameplay. Press **backtick/tilde** to open the
+developer console; `help` lists commands, `status` shows frame timing and player
+position, `maxfps 0` removes the frame cap, and `maxfps 60` restores it. The console
+pauses gameplay and releases the mouse. See [console controls](docs/developer-console.md).
+
 Examples:
 
 ```sh

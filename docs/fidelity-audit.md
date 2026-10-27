@@ -1,0 +1,37 @@
+# Original-game fidelity audit
+
+This review compares the current Rust implementation with the owned Steam 2022 resources, the installed modding manual, a local run of the shipped Windows executable through Proton, and the independent [Chasm-Reverse reconstruction](https://github.com/Panzerschrek/Chasm-Reverse). The reconstruction is useful evidence, but its approximations do not establish the original executable's behavior.
+
+The original and clone were launched on level 01 at normal difficulty. Local captures show the original briefing, first-person view and HUD, and the clone's first-person view. The captures were not synchronized to the same camera pose, resolution or animation frame, so they are qualitative observations rather than pixel comparisons. Captures and proprietary assets remain outside Git.
+
+## Corrected during this review
+
+- Solid floors and ceilings now contribute perpendicular depth. Walls, models, projectiles and sprites behind those surfaces can no longer overwrite them merely because planes were drawn before an empty depth buffer. Synthetic tests cover pitched planes, open sky and elevated walls.
+- An installed level-16 teleporter was rejected because the destination was checked at ground level inside its raised platform. It now lands at the known model top, subject to body clearance. A controlled real-map test follows both linked teleports into the heart area, with a snapshot round-trip on the platform. A separate controlled encounter destroys the authored heart and follows the exit message and timer. These tests exclude enemies and do not prove an uninterrupted campaign route.
+- Projectile animation follows each authored ANI filename and individual launch age. Emissive projectiles respect their authored `FBright` field; ordinary projectiles still receive provisional distance shading.
+- Shot and physical-projectile plane contacts now use the actual contact cell's floor/ceiling mask. Open sky no longer creates an invisible ceiling. Installed level-01 and synthetic tests cover sky, nearby roof tiles, solid/open floors, platform support and snapshot configuration mismatches.
+- Authored projectile smoke trails now follow fixed-tick 3D motion and terminal impacts, splitting at reflector contacts. Particle timing and spacing follow the independent reconstruction. Missing first-tick path information, lighting and ordering across different translucent renderers remain approximate.
+- Static light bytes are now retained and sampled for walls, floors, ceilings, objects, actors, mines, ordinary projectiles and the weapon. Brightness conversion and wall sample offsets follow a bounded independent-reference approximation; matching the remaster's colour pipeline is still unfinished.
+- Horizontal and vertical projection now share one focal length, correcting stretched geometry across aspect ratios. The original executable confirms a 75-degree vertical world FOV and a separate fixed weapon FOV; both are implemented. See [original rendering evidence](remaster-rendering.md).
+- Monster idle/run/death timing uses the manual's 60 ms per frame. Authored CAR and glTF firing meshes now follow the authoritative ranged attack phase. Pain, dismemberment and detached-part animation still require work.
+- The original executable's view matrix, spawn loader and input transforms prove the former world camera was horizontally mirrored. The corrected view uses the same forward yaw and raw map positions, with the original right vector; mouse turning and strafing were corrected consistently. Landmark tests cover the first-map streetlight side. Weapon and HUD orientation are preserved.
+
+The installed remaster configuration enables tone mapping, shadows and motion blur, with gamma, brightness and saturation at neutral values. Further executable analysis confirms the material sRGB, linear HDR, exposure, ACES and output sRGB chain, including weapon-before/HUD-after post-process ordering. Implementing this correctly requires more than a byte-space colour filter. See [original rendering evidence](remaster-rendering.md).
+
+## Remaining material gaps
+
+| Priority | Finding | Evidence and required work |
+| --- | --- | --- |
+| High | Exact lighting and colour response remain uncalibrated. | Authored static lighting is now present, but the reconstruction's conversion formula is explicitly provisional. The original visibly has spatial pools of light and darkness and enables tone mapping. Compare controlled views and verify the original shader/lighting equations before claiming parity. |
+| High | Multi-bullet weapons collapse pellets into one hit. | The installed manual defines `RCount` as bullets per shot. The shotgun and Volcano use four and two respectively; current combat multiplies power on a single ray. Implement ordered independent pellets with authoritative random state, one ammunition/cooldown operation, individual impacts and snapshot/rollback tests. Exact spread and damage variance need original-game measurement. |
+| High | Several authored projectile behaviors are incomplete. | The owned definitions/manual describe gravity, ricochet and homing fields. Current trajectories are mostly straight, despite normalized 3D aim. Implement each behavior with bounded deterministic simulation and continuous collision; compare constants and target selection with the executable. |
+| Medium | Pitch uses a shifted horizon instead of a rotated camera. | The center aiming slope agrees with the image, but the column renderer shears the view at steep angles. Exact perspective requires a consistent camera transform across world geometry, sky, objects, weapon view and depth. |
+| Medium | Transparent objects and later projectile/effect passes do not share one composition order. | A translucent object can be composited before a projectile behind it. A common transparent pass or fragment ordering is needed; opaque depth alone cannot produce the expected glass result. |
+| Medium | Collision dimensions and shapes require reconciliation. | The installed manual distinguishes wall and actor/shot radii, but several systems use wall radius for both. The independent reconstruction also interprets odd object radii as square footprints, while the clone uses circles. Verify against the executable before changing all collision rules. |
+| Medium | Presentation remains a preview. | The original run has a briefing, graphical HUD and original menus. The clone has a development overlay and launcher. Weapon framing, light response, animation timing, audio and input feel still need controlled comparisons. |
+
+## Verification limits
+
+The local tests establish parser, simulation and rendering invariants, plus specific installed-data scenarios. They do not establish complete campaign playability or original-game equivalence. Native GitHub CI has built and tested the client on macOS, Windows and Linux; physical mouse, audio and complete game-data playthroughs on each platform remain separate checks.
+
+Future fidelity work should record a reproducible original-game scenario (level, starting position, angle, pitch, difficulty, weapon and inputs), compare it with the clone, and retain explicit provenance for every inferred rule. Passing an implementation-shaped test is not evidence of original behavior.

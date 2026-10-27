@@ -154,6 +154,8 @@ fn destroying_level_16_heart_runs_its_atomic_process() {
         &script,
         true,
     ));
+    let mut without_ambient = session.clone();
+    session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
     let mut blocked = session.clone();
     let before = blocked
         .scripted_objects
@@ -206,7 +208,23 @@ fn destroying_level_16_heart_runs_its_atomic_process() {
         scripted
             .manifest
             .allow(cell, if cell == [29, 48] { 200 } else { raw + 1 });
+        without_ambient
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow(cell, if cell == [29, 48] { 200 } else { raw + 1 });
     }
+    let rejected = without_ambient.step(SessionInput {
+        fire: true,
+        ..Default::default()
+    });
+    assert_eq!(rejected.object_hits, [([27, 47], false)]);
+    assert!(rejected.object_transitions.is_empty());
+    assert_eq!(
+        without_ambient.processes.activate_at("floor", [27, 47])[0].outcome,
+        ProcessOutcome::Locked
+    );
     let events = session.step(SessionInput {
         fire: true,
         ..Default::default()
@@ -234,6 +252,25 @@ fn destroying_level_16_heart_runs_its_atomic_process() {
     assert_eq!(session.wind.cell([25, 47]), Some([12, 0]));
     assert_eq!(session.wind.cell([21, 47]), Some([10, 0]));
     assert_eq!(session.wind.cell([17, 47]), Some([8, 0]));
+    let mut delayed_quake_reset = false;
+    for _ in 0..125 {
+        let delayed = session.step(SessionInput::default());
+        delayed_quake_reset |= delayed.quake_changes.iter().any(|zone| zone.power == 0);
+    }
+    assert!(
+        delayed_quake_reset,
+        "procedure 8 should reset quake after its delay"
+    );
+    assert_eq!(
+        session
+            .scripted_objects
+            .as_ref()
+            .unwrap()
+            .quake
+            .cell([17, 40]),
+        Some(0)
+    );
+    assert_eq!(session.ambient_grid().unwrap().cell([17, 40]), Some(1));
     assert_eq!(
         session.processes.activate_at("floor", [27, 47])[0].outcome,
         ProcessOutcome::Accepted

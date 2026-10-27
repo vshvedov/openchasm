@@ -211,4 +211,70 @@ mod tests {
         assert!(!manifest.contains([28, 47], 202));
         assert!(scene.replace_level_object([27, 46], 202));
     }
+    #[test]
+    #[ignore]
+    fn timing_probe() {
+        use crate::object_render::CameraView;
+        use crate::texture::Palette;
+        use crate::world::Player;
+        use std::time::Instant;
+        let path = std::env::var_os("OPENCHASM_TEST_CONTENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        let mut resources =
+            ResourceSet::open(&path).expect("timing probe requires an owned game archive");
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let inf = resources.read("chasm.inf").unwrap();
+        for id in ["01", "02", "16"] {
+            let map =
+                openchasm::map::Map::parse(&resources.read(&format!("map/map.{id}")).unwrap())
+                    .unwrap();
+            let definitions = ObjectDefinitions::parse(
+                &inf,
+                &resources.read(&format!("map/resource.{id}")).unwrap(),
+            )
+            .unwrap();
+            let script_bytes = resources.read(&format!("map/process.{id}")).unwrap();
+            let script = Script::parse(std::str::from_utf8(&script_bytes).unwrap());
+            let instances = openchasm::objects::instances(&map);
+            let start = Instant::now();
+            let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+            let actor_defs = openchasm::actors::ActorDefinitions::parse(&inf).unwrap();
+            let actors = openchasm::actors::ActorState::from_placements(&map.monsters, &actor_defs);
+            scene.add_actors(&mut resources, &actors, &actor_defs);
+            let load = start.elapsed();
+            let start = Instant::now();
+            let _ = build_replacement_manifest(
+                &mut resources,
+                &mut scene,
+                &definitions,
+                &instances,
+                &script,
+                Difficulty::Normal,
+            );
+            let preload = start.elapsed();
+            let player = map.monsters.iter().find(|m| m.is_player_spawn()).unwrap();
+            let camera = CameraView {
+                player: Player {
+                    position: [
+                        f32::from(player.position[0]) / 256.0,
+                        f32::from(player.position[1]) / 256.0,
+                    ],
+                    angle: player.direction_radians(),
+                },
+                eye_height: 0.75,
+            };
+            let mut frame = vec![0; 640 * 400];
+            let mut depth = vec![f32::INFINITY; 640 * 400];
+            let start = Instant::now();
+            for _ in 0..30 {
+                depth.fill(f32::INFINITY);
+                scene.render(&mut frame, &mut depth, 640, 400, camera);
+            }
+            let render = start.elapsed() / 30;
+            eprintln!(
+                "PROBE map{id} scene={load:?} preload={preload:?} render_no_wall_depth={render:?}"
+            );
+        }
+    }
 }

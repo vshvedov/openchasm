@@ -22,3 +22,12 @@ rectangle to zero. Both contain `nonstop`. The overwrite interpretation permits
 this authored sequence to stop the effect; inclusive cells and exact activation
 timing still require comparison to the original. Do not claim that merely
 recording these values implements the visible quake effect.
+
+The client viewer samples the active field at the player's location and applies
+a provisional camera shake to rendering only. Power 10000 or greater is capped
+at 0.012 radians of yaw and 0.012 tiles of vertical eye displacement; smaller
+powers scale linearly. Fixed-tick sinusoidal motion makes the result bounded and
+repeatable. Walls, planes, objects, and projectiles use the same displaced camera;
+the weapon and HUD stay fixed. The conversion and waveform are invented for a
+visible preview and require comparison with the original game. A zero power or
+out-of-map sample produces no shake, and restarting resets the session field.

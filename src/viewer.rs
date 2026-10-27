@@ -100,6 +100,31 @@ struct RenderWorld<'a> {
     world: &'a World,
     elevations: &'a [f32],
     eye_height: f32,
+    yaw_offset: f32,
+}
+
+// Authored quake power has no documented unit. Scale linearly up to a small
+// visual cap, using fixed-tick periodic motion rather than nondeterministic
+// randomness. This changes only presentation, never the simulation player.
+fn quake_camera(
+    player: crate::world::Player,
+    eye_height: f32,
+    power: u32,
+    tick: u64,
+) -> (CameraView, f32) {
+    let strength = (power.min(10_000) as f32) / 10_000.0;
+    let phase = (tick % 120) as f32;
+    let yaw_offset = strength * 0.012 * (phase * 1.7).sin();
+    let vertical_offset = strength * 0.012 * (phase * 2.3 + 0.7).sin();
+    let mut camera_player = player;
+    camera_player.angle += yaw_offset;
+    (
+        CameraView {
+            player: camera_player,
+            eye_height: (eye_height + vertical_offset).max(0.0),
+        },
+        yaw_offset,
+    )
 }
 
 fn render(
@@ -112,8 +137,10 @@ fn render(
     label: &str,
 ) {
     let world = scene.world;
+    let mut camera_player = world.player;
+    camera_player.angle += scene.yaw_offset;
     let camera = CameraView {
-        player: world.player,
+        player: camera_player,
         eye_height: scene.eye_height,
     };
     if let Some(planes) = planes {
@@ -124,7 +151,7 @@ fn render(
         }
     }
     depth.fill(f32::INFINITY);
-    let (sin, cos) = world.player.angle.sin_cos();
+    let (sin, cos) = camera.player.angle.sin_cos();
     let mut hits = Vec::new();
     for x in 0..WIDTH {
         // Direction is unnormalized, so hit distance is perpendicular to camera plane.
@@ -511,13 +538,25 @@ pub fn run(
             }
             accumulator -= STEP;
         }
+        let quake_power = session
+            .scripted_objects
+            .as_ref()
+            .and_then(|state| state.quake.sample(session.world.player.position))
+            .unwrap_or(0);
+        let (camera, yaw_offset) = quake_camera(
+            session.world.player,
+            session.vertical.eye(),
+            quake_power,
+            animation_tick,
+        );
         render(
             &mut frame,
             &mut depth,
             RenderWorld {
                 world: &session.world,
                 elevations: &session.wall_elevations,
-                eye_height: session.vertical.eye(),
+                eye_height: camera.eye_height,
+                yaw_offset,
             },
             &textures,
             Some(&planes),
@@ -540,10 +579,7 @@ pub fn run(
             &mut depth,
             WIDTH,
             HEIGHT,
-            CameraView {
-                player: session.world.player,
-                eye_height: session.vertical.eye(),
-            },
+            camera,
             &projectile_visuals,
         );
         let pose = if shoot_ticks > 0 {
@@ -694,6 +730,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 1.0,
+                yaw_offset: 0.0,
             },
             &textures,
             None,
@@ -735,6 +772,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 0.75,
+                yaw_offset: 0.0,
             },
             &[],
             None,
@@ -749,6 +787,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 1.15,
+                yaw_offset: 0.0,
             },
             &[],
             None,
@@ -787,6 +826,7 @@ mod tests {
                 world: &world,
                 elevations: &[80.0],
                 eye_height: 1.0,
+                yaw_offset: 0.0,
             },
             &textures,
             None,
@@ -827,6 +867,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 1.0,
+                yaw_offset: 0.0,
             },
             &textures,
             None,
@@ -836,5 +877,26 @@ mod tests {
         let center = frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
         assert!(center & 0xff0000 > 0);
         assert_eq!(center & 0x00ffff, 0);
+    }
+    #[test]
+    fn quake_camera_is_deterministic_bounded_and_does_not_change_player() {
+        let player = Player {
+            position: [3.0, 4.0],
+            angle: 1.0,
+        };
+        let (still, offset) = quake_camera(player, 0.75, 0, 13);
+        assert_eq!(offset, 0.0);
+        assert_eq!(still.player.angle, player.angle);
+        assert_eq!(still.eye_height, 0.75);
+        for tick in 0..240 {
+            let (camera, yaw) = quake_camera(player, 0.75, u32::MAX, tick);
+            let (same, same_yaw) = quake_camera(player, 0.75, 10_000, tick);
+            assert_eq!(yaw, same_yaw);
+            assert_eq!(camera.eye_height, same.eye_height);
+            assert!(yaw.abs() <= 0.012);
+            assert!((camera.eye_height - 0.75).abs() <= 0.01201);
+            assert_eq!(camera.player.position, player.position);
+        }
+        assert_eq!(player.angle, 1.0);
     }
 }

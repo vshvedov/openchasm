@@ -6,6 +6,7 @@
 //! behavior in the presence of blockers are placeholders, not verified
 //! against the original game.
 use crate::process::{Process, Script};
+use crate::wind::WindZone;
 use crate::world::World;
 use std::collections::BTreeMap;
 
@@ -243,6 +244,13 @@ pub enum ProcessEffect {
     },
     /// Remove the active hazards belonging to this process ID.
     HazardDeactivated { process_id: u16 },
+    /// Activate the validated signed wind rectangles for this process.
+    WindActivated {
+        process_id: u16,
+        zones: Vec<WindZone>,
+    },
+    /// Remove the wind rectangles owned by this process.
+    WindDeactivated { process_id: u16 },
 }
 /// A death field's authored values. Vertical bounds use 1/64 tile; negative
 /// lower bounds designate fields that do not damage the player in the manual.
@@ -289,8 +297,10 @@ struct RuntimeProcess {
     cell_changes: Vec<CellChange>,
     animations: Vec<u16>,
     death_zones: Vec<DeathZone>,
+    wind_zones: Vec<WindZone>,
     nonstop: bool,
     hazard_active: bool,
+    wind_active: bool,
     supported: bool,
     required_keys: [bool; 3],
     mission_effect: bool,
@@ -315,6 +325,7 @@ impl RuntimeProcess {
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
         objects: Option<&BTreeMap<[u8; 2], ProcessObject>>,
+        wind_enabled: bool,
     ) -> Self {
         let mut motions = Vec::new();
         let mut object_motions = Vec::new();
@@ -323,6 +334,7 @@ impl RuntimeProcess {
         let mut cell_changes = Vec::new();
         let mut animations = Vec::new();
         let mut death_zones = Vec::new();
+        let mut wind_zones = Vec::new();
         let mut nonstop = false;
         let mut waitout = Vec::new();
         let mut lock_changes = Vec::new();
@@ -343,8 +355,44 @@ impl RuntimeProcess {
         });
         for action in &process.actions {
             if action.name == "nonstop" {
-                if hazards_enabled && action.arguments.is_empty() && !nonstop {
+                if (hazards_enabled || wind_enabled) && action.arguments.is_empty() && !nonstop {
                     nonstop = true;
+                    continue;
+                }
+                supported = false;
+                break;
+            }
+            if action.name == "wind" {
+                let parsed = (|| {
+                    if !wind_enabled || action.arguments.len() != 6 {
+                        return None;
+                    }
+                    let values: Vec<i32> = action
+                        .arguments
+                        .iter()
+                        .map(|v| v.parse::<i32>().ok())
+                        .collect::<Option<_>>()?;
+                    let x1 = u8::try_from(values[0]).ok()?;
+                    let y1 = u8::try_from(values[1]).ok()?;
+                    let x2 = u8::try_from(values[2]).ok()?;
+                    let y2 = u8::try_from(values[3]).ok()?;
+                    if x1 > x2
+                        || y1 > y2
+                        || x2 >= 64
+                        || y2 >= 64
+                        || !(-128..=127).contains(&values[4])
+                        || !(-128..=127).contains(&values[5])
+                    {
+                        return None;
+                    }
+                    Some(WindZone {
+                        min_cell: [x1, y1],
+                        max_cell: [x2, y2],
+                        direction: [values[4] as i16, values[5] as i16],
+                    })
+                })();
+                if let Some(zone) = parsed {
+                    wind_zones.push(zone);
                     continue;
                 }
                 supported = false;
@@ -577,7 +625,7 @@ impl RuntimeProcess {
         }
         // `nonstop` modifies zone lifecycle. Without an understood persistent
         // effect it cannot safely make an otherwise unsupported script runnable.
-        if nonstop && death_zones.is_empty() {
+        if nonstop && death_zones.is_empty() && wind_zones.is_empty() {
             supported = false;
         }
         if !object_motions.is_empty()
@@ -597,6 +645,7 @@ impl RuntimeProcess {
             cell_changes.clear();
             animations.clear();
             death_zones.clear();
+            wind_zones.clear();
         }
         // The manual labels Speed but does not specify units. At speed 8 we use
         // one tile per second; each process completes when its longest move does.
@@ -616,7 +665,7 @@ impl RuntimeProcess {
         // The independent reconstruction advances procedure stages at
         // Speed/10 per second even for a hazard with no moving geometry.
         // Existing non-hazard movement timing is left unchanged.
-        let duration = if death_zones.is_empty() {
+        let duration = if death_zones.is_empty() && wind_zones.is_empty() {
             (max_distance / speed).max(0.001)
         } else {
             10.0 / property_float(process, "speed", 10.0).max(0.01)
@@ -640,8 +689,10 @@ impl RuntimeProcess {
             cell_changes,
             animations,
             death_zones,
+            wind_zones,
             nonstop,
             hazard_active: false,
+            wind_active: false,
             supported,
             required_keys,
             mission_effect: has_end_delay || has_message,
@@ -665,6 +716,7 @@ impl RuntimeProcess {
                 && self.cell_changes.is_empty()
                 && self.animations.is_empty()
                 && self.death_zones.is_empty()
+                && self.wind_zones.is_empty()
                 && !self.mission_effect)
         {
             return Err(ProcessOutcome::Unsupported);
@@ -676,6 +728,7 @@ impl RuntimeProcess {
                     || !self.empty_motion_cells.is_empty()
                     || !self.cell_changes.is_empty()
                     || !self.death_zones.is_empty()
+                    || !self.wind_zones.is_empty()
                 {
                     self.phase = if self.delay > 0.0 {
                         Phase::Delay(self.delay)
@@ -690,7 +743,8 @@ impl RuntimeProcess {
                     || !self.object_motions.is_empty()
                     || !self.empty_motion_cells.is_empty()
                     || !self.cell_changes.is_empty()
-                    || !self.death_zones.is_empty() =>
+                    || !self.death_zones.is_empty()
+                    || !self.wind_zones.is_empty() =>
             {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
@@ -709,11 +763,22 @@ impl RuntimeProcess {
                 zones: self.death_zones.clone(),
             });
         }
+        if !self.locked && !self.wind_active && !self.wind_zones.is_empty() {
+            self.wind_active = true;
+            effects.push(ProcessEffect::WindActivated {
+                process_id,
+                zones: self.wind_zones.clone(),
+            });
+        }
     }
     fn stop_hazard(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
         if self.hazard_active {
             self.hazard_active = false;
             effects.push(ProcessEffect::HazardDeactivated { process_id });
+        }
+        if self.wind_active {
+            self.wind_active = false;
+            effects.push(ProcessEffect::WindDeactivated { process_id });
         }
     }
     fn return_to_start(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
@@ -918,6 +983,7 @@ impl ProcessRuntime {
             capabilities.initial_cell_types,
             false,
             None,
+            false,
         )
     }
     /// Supply x-major map cell types for validating empty motion targets without
@@ -936,6 +1002,7 @@ impl ProcessRuntime {
             capabilities.initial_cell_types.or(Some(raw_cells)),
             false,
             None,
+            false,
         )
     }
     /// Enable death-zone effects only when the authoritative host consumes
@@ -953,6 +1020,7 @@ impl ProcessRuntime {
             capabilities.initial_cell_types.or(Some(raw_cells)),
             true,
             None,
+            false,
         )
     }
     /// Enable object poses and hazard events only when the host can apply
@@ -963,6 +1031,27 @@ impl ProcessRuntime {
         capabilities: ProcessCapabilities<'_>,
         raw_cells: &[u8; 4096],
         object_poses: &[ProcessObject],
+    ) -> Result<Self, ProcessObjectError> {
+        Self::with_object_capabilities(script, world, capabilities, raw_cells, object_poses, false)
+    }
+    /// Enable wind only when the authoritative host applies every emitted wind
+    /// lifecycle event and routes displacement through world collision.
+    pub fn with_wind(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+        object_poses: &[ProcessObject],
+    ) -> Result<Self, ProcessObjectError> {
+        Self::with_object_capabilities(script, world, capabilities, raw_cells, object_poses, true)
+    }
+    fn with_object_capabilities(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+        object_poses: &[ProcessObject],
+        wind_enabled: bool,
     ) -> Result<Self, ProcessObjectError> {
         let mut objects = BTreeMap::new();
         for &object in object_poses {
@@ -996,6 +1085,7 @@ impl ProcessRuntime {
             capabilities.initial_cell_types.or(Some(raw_cells)),
             true,
             Some(objects),
+            wind_enabled,
         ))
     }
     /// Mark a collected, destroyed or replaced object unavailable so later
@@ -1021,6 +1111,7 @@ impl ProcessRuntime {
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
         objects: Option<BTreeMap<[u8; 2], ProcessObject>>,
+        wind_enabled: bool,
     ) -> Self {
         let enabled = objects.is_some();
         let objects = objects.unwrap_or_default();
@@ -1038,6 +1129,7 @@ impl ProcessRuntime {
                             raw_cells,
                             hazards_enabled,
                             enabled.then_some(&objects),
+                            wind_enabled,
                         ),
                     )
                 })
@@ -2178,6 +2270,130 @@ mod tests {
                 "{action}"
             );
             assert!(runtime.take_effects().is_empty());
+        }
+    }
+    #[test]
+    fn nonstop_wind_obeys_delay_unlock_and_lock() {
+        let script = Script::parse("#proc1\nLock\nStartDelay 0.5\n#action\nnonstop\nwind 4 4 5 5 -21 0\n#end\n#proc2\n#action\nunlock 1\n#end\n#proc3\n#action\nlock 1\n#end\n#links\nfloor 0 0 1\nlink 1 0 2\nlink 2 0 3\n#end\n");
+        let mut world = world();
+        let cells = [0; 4096];
+        let mut default =
+            ProcessRuntime::with_hazards(&script, &world, ProcessCapabilities::default(), &cells);
+        default.activate_at("link", [1, 0]);
+        assert_eq!(
+            default.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        let mut runtime =
+            ProcessRuntime::with_wind(&script, &world, ProcessCapabilities::default(), &cells, &[])
+                .unwrap();
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        runtime.activate_at("link", [1, 0]);
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert!(runtime.take_effects().is_empty());
+        world.player.position = [-10.0, -10.0];
+        runtime.tick(&mut world, 0.25, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.tick(&mut world, 0.3, false);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::WindActivated {
+                process_id: 1,
+                zones: vec![WindZone {
+                    min_cell: [4, 4],
+                    max_cell: [5, 5],
+                    direction: [-21, 0]
+                }]
+            }]
+        );
+        runtime.tick(&mut world, 2.0, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.activate_at("link", [2, 0]);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::WindDeactivated { process_id: 1 }]
+        );
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+    }
+
+    #[test]
+    fn finite_wind_and_hazard_activate_and_stop_together() {
+        let script = Script::parse("#proc1\nSpeed 10\n#action\nwind 1 2 3 4 127 -128\ndeath 1 2 3 4 0 24 500\n#end\n#links\nlink 0 0 1\n#end\n");
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let mut runtime = ProcessRuntime::with_wind(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let effects = runtime.take_effects();
+        assert!(matches!(
+            &effects[..],
+            [
+                ProcessEffect::HazardActivated { .. },
+                ProcessEffect::WindActivated { .. }
+            ]
+        ));
+        runtime.tick(&mut world, 0.5, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.tick(&mut world, 0.5, false);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![
+                ProcessEffect::HazardDeactivated { process_id: 1 },
+                ProcessEffect::WindDeactivated { process_id: 1 }
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_wind_disables_whole_process() {
+        for action in [
+            "wind 0 0 1 1 1",
+            "wind 0 0 1 1 1 2 1",
+            "wind -1 0 1 1 1 2",
+            "wind 0 0 64 1 1 2",
+            "wind 2 0 1 1 1 2",
+            "wind 0 0 1 1 -129 2",
+            "wind 0 0 1 1 1 128",
+            "wind 0 0 1 1 bad 2",
+            "nonstop",
+            "wind 0 0 1 1 1 2\nquake 1 1 2 2 10",
+        ] {
+            let script = Script::parse(&format!(
+                "#proc1\n#action\n{action}\n#end\n#links\nlink 0 0 1\n#end\n"
+            ));
+            let world = world();
+            let mut runtime = ProcessRuntime::with_wind(
+                &script,
+                &world,
+                ProcessCapabilities::default(),
+                &[0; 4096],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                runtime.activate_at("link", [0, 0])[0].outcome,
+                ProcessOutcome::Unsupported,
+                "{action}"
+            );
+            assert!(runtime.take_effects().is_empty(), "{action}");
         }
     }
 }

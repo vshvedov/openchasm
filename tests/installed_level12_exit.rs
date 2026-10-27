@@ -134,4 +134,101 @@ fn exit_unlocker_accepts_fifth_move_argument_and_commits_replacement() {
         rt.tick(&mut world, 1.0 / 60.0, false);
     }
     assert!((world.walls[index].a[1] - before[1] + 510.0 / 256.0).abs() < 0.01);
+    // Exercise the actual authored source and object change separately from
+    // the exit sequence, with test-provided asset and collision preflight.
+    use openchasm::{
+        actors::{ActorDefinitions, ActorState},
+        combat::RocketDefinitions,
+        game::GameInventory,
+        inventory::WeaponDefinitions,
+        save_format::ContentDigest,
+        session::{LevelSetup, Session, SessionInput},
+    };
+    let mut source_runtime = ProcessRuntime::with_source_lights(
+        &script,
+        &world,
+        ProcessCapabilities::default(),
+        &cells,
+        &poses,
+    )
+    .unwrap();
+    for (cell, id) in [([39, 37], 30), ([39, 26], 31)] {
+        assert_eq!(
+            source_runtime
+                .prepare_at("link", cell, id)
+                .unwrap()
+                .commit()
+                .outcome,
+            ProcessOutcome::Accepted
+        );
+    }
+    let mut source_states = ObjectStates::new(&instances, &definitions).unwrap();
+    let mut source_combat =
+        ObjectCombat::new(&instances, &definitions, &script, Difficulty::Normal);
+    let mut source_quake = QuakeField::new();
+    let prepared = source_runtime.prepare_at("link", [44, 31], 32).unwrap();
+    assert!(ProcessTransaction::prepare(
+        prepared,
+        &mut source_states,
+        &mut source_combat,
+        &mut source_quake,
+        &definitions,
+        &PresentationManifest::default(),
+        |_, _, _| true
+    )
+    .is_err());
+    assert!(!source_runtime.has_active_source_lights());
+    assert!(source_runtime.take_effects().is_empty());
+    let mut source_manifest = PresentationManifest::default();
+    source_manifest.allow([40, 31], 216);
+    let prepared = source_runtime.prepare_at("link", [44, 31], 32).unwrap();
+    let transaction = ProcessTransaction::prepare(
+        prepared,
+        &mut source_states,
+        &mut source_combat,
+        &mut source_quake,
+        &definitions,
+        &source_manifest,
+        |_, _, _| true,
+    )
+    .unwrap();
+    assert_eq!(
+        transaction.commit().unwrap().outcome,
+        ProcessOutcome::Accepted
+    );
+    assert_eq!(source_states.get([40, 31]).unwrap().raw_type, 216);
+    let inf = archive.read("chasm.inf").unwrap();
+    let game = GameInventory::new(
+        WeaponDefinitions::parse(&inf).unwrap(),
+        &instances,
+        &definitions,
+        Difficulty::Normal,
+    );
+    let mut session = Session::new(LevelSetup {
+        world,
+        processes: source_runtime,
+        actors: ActorState {
+            player_spawns: vec![],
+            actors: vec![],
+            unresolved: vec![],
+        },
+        actor_definitions: ActorDefinitions::parse(&inf).unwrap(),
+        game,
+        rockets: RocketDefinitions::parse(&inf).unwrap(),
+        shot_blocking: [true; 128],
+        difficulty: Difficulty::Normal,
+    });
+    let events = session.step(SessionInput::default());
+    assert!(events.light_errors.is_empty());
+    let light = session
+        .light_sources
+        .as_ref()
+        .unwrap()
+        .active()
+        .find(|p| p.process_id == 32)
+        .unwrap();
+    assert_eq!(light.sources[0].position_raw, [10240, 8192]);
+    assert_eq!(light.sources[0].radius_raw, 576);
+    assert_eq!(light.sources[0].delay_ms, 10);
+    assert!(session.snapshot(ContentDigest([0; 32])).is_err());
 }

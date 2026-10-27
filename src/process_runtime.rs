@@ -6,6 +6,7 @@
 //! behavior in the presence of blockers are placeholders, not verified
 //! against the original game.
 use crate::ambient::AmbientRegion;
+use crate::light_sources::SourceLight;
 use crate::object_states::ObjectAction;
 use crate::process::{Process, Script};
 use crate::quake::QuakeZone;
@@ -286,9 +287,15 @@ pub struct ProcessCapabilities<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessEffect {
     /// Absolute offset in raw script units from the initial wall position.
-    WallElevation { wall_index: usize, offset_raw: f32 },
+    WallElevation {
+        wall_index: usize,
+        offset_raw: f32,
+    },
     /// New raw type for the grid cell; includes original type on reversal.
-    CellType { cell: [u8; 2], raw_type: u8 },
+    CellType {
+        cell: [u8; 2],
+        raw_type: u8,
+    },
     /// Absolute pose, keyed by the original stable map cell.
     ObjectPose {
         cell: [u8; 2],
@@ -297,7 +304,9 @@ pub enum ProcessEffect {
         elevation_raw: f32,
     },
     /// Presentation request; no object animation is simulated by the runtime.
-    PlayAnimation { object_id: u16 },
+    PlayAnimation {
+        object_id: u16,
+    },
     /// The host must activate all zones under this process ID. Zones use
     /// inclusive map cells and raw vertical/damage units.
     HazardActivated {
@@ -305,14 +314,25 @@ pub enum ProcessEffect {
         zones: Vec<DeathZone>,
     },
     /// Remove the active hazards belonging to this process ID.
-    HazardDeactivated { process_id: u16 },
+    HazardDeactivated {
+        process_id: u16,
+    },
     /// Activate the validated signed wind rectangles for this process.
     WindActivated {
         process_id: u16,
         zones: Vec<WindZone>,
     },
     /// Remove the wind rectangles owned by this process.
-    WindDeactivated { process_id: u16 },
+    WindDeactivated {
+        process_id: u16,
+    },
+    SourceLightsActivated {
+        process_id: u16,
+        sources: Vec<SourceLight>,
+    },
+    SourceLightsDeactivated {
+        process_id: u16,
+    },
 }
 /// A death field's authored values. Vertical bounds use 1/64 tile; negative
 /// lower bounds designate fields that do not damage the player in the manual.
@@ -368,10 +388,12 @@ struct RuntimeProcess {
     animations: Vec<u16>,
     death_zones: Vec<DeathZone>,
     wind_zones: Vec<WindZone>,
+    sources: Vec<SourceLight>,
     immediate_actions: Vec<ImmediateAction>,
     nonstop: bool,
     hazard_active: bool,
     wind_active: bool,
+    source_active: bool,
     supported: bool,
     required_keys: [bool; 3],
     mission_effect: bool,
@@ -396,9 +418,9 @@ impl RuntimeProcess {
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
         objects: Option<&BTreeMap<[u8; 2], ProcessObject>>,
-        modes: (bool, bool),
+        modes: (bool, bool, bool),
     ) -> Self {
-        let (wind_enabled, immediate_enabled) = modes;
+        let (wind_enabled, immediate_enabled, source_enabled) = modes;
         let mut motions = Vec::new();
         let mut object_motions = Vec::new();
         let mut empty_motion_cells = Vec::new();
@@ -408,6 +430,7 @@ impl RuntimeProcess {
         let mut animations = Vec::new();
         let mut death_zones = Vec::new();
         let mut wind_zones = Vec::new();
+        let mut sources = Vec::new();
         let mut immediate_actions = Vec::new();
         let mut nonstop = false;
         let mut waitout = Vec::new();
@@ -435,6 +458,20 @@ impl RuntimeProcess {
                 }
                 supported = false;
                 break;
+            }
+            if action.name == "source" {
+                if !source_enabled {
+                    supported = false;
+                    break;
+                }
+                match SourceLight::parse(&action.arguments) {
+                    Ok(source) => sources.push(source),
+                    Err(_) => {
+                        supported = false;
+                        break;
+                    }
+                }
+                continue;
             }
             if action.name == "wind" {
                 let parsed = (|| {
@@ -840,6 +877,7 @@ impl RuntimeProcess {
         if nonstop
             && death_zones.is_empty()
             && wind_zones.is_empty()
+            && sources.is_empty()
             && immediate_actions.is_empty()
         {
             supported = false;
@@ -862,6 +900,7 @@ impl RuntimeProcess {
             animations.clear();
             death_zones.clear();
             wind_zones.clear();
+            sources.clear();
             immediate_actions.clear();
         }
         // The manual labels Speed but does not specify units. At speed 8 we use
@@ -941,10 +980,12 @@ impl RuntimeProcess {
             animations,
             death_zones,
             wind_zones,
+            sources,
             immediate_actions,
             nonstop,
             hazard_active: false,
             wind_active: false,
+            source_active: false,
             supported,
             required_keys,
             mission_effect: has_end_delay || has_message,
@@ -969,6 +1010,7 @@ impl RuntimeProcess {
                 && self.animations.is_empty()
                 && self.death_zones.is_empty()
                 && self.wind_zones.is_empty()
+                && self.sources.is_empty()
                 && self.immediate_actions.is_empty()
                 && !self.mission_effect)
         {
@@ -982,6 +1024,7 @@ impl RuntimeProcess {
                     || !self.cell_changes.is_empty()
                     || !self.death_zones.is_empty()
                     || !self.wind_zones.is_empty()
+                    || !self.sources.is_empty()
                     || (self.delay > 0.0 && !self.immediate_actions.is_empty())
                 {
                     self.phase = if self.delay > 0.0 {
@@ -998,7 +1041,8 @@ impl RuntimeProcess {
                     || !self.empty_motion_cells.is_empty()
                     || !self.cell_changes.is_empty()
                     || !self.death_zones.is_empty()
-                    || !self.wind_zones.is_empty() =>
+                    || !self.wind_zones.is_empty()
+                    || !self.sources.is_empty() =>
             {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
@@ -1024,6 +1068,19 @@ impl RuntimeProcess {
                 zones: self.wind_zones.clone(),
             });
         }
+        if !self.locked && !self.source_active && !self.sources.is_empty() {
+            self.source_active = true;
+            effects.push(ProcessEffect::SourceLightsActivated {
+                process_id,
+                sources: self.sources.clone(),
+            });
+        }
+    }
+    fn stop_sources(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
+        if self.source_active {
+            self.source_active = false;
+            effects.push(ProcessEffect::SourceLightsDeactivated { process_id });
+        }
     }
     fn stop_hazard(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
         if self.hazard_active {
@@ -1047,6 +1104,7 @@ impl RuntimeProcess {
             Phase::Opening | Phase::Open => {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
+                self.stop_sources(process_id, effects);
                 if !self.nonstop {
                     self.stop_hazard(process_id, effects);
                 }
@@ -1100,6 +1158,7 @@ impl RuntimeProcess {
                 self.open_time += dt;
                 if self.open_time >= self.back_wait {
                     self.phase = Phase::Closing;
+                    self.stop_sources(process_id, effects);
                 }
             }
             Phase::Closing => self.progress = (self.progress - dt / self.duration).max(0.0),
@@ -1297,6 +1356,7 @@ pub struct ProcessRuntime {
     cell_types: Option<Vec<u8>>,
     effects: Vec<ProcessEffect>,
     staged_authorized: bool,
+    source_enabled: bool,
 }
 
 /// Durable process phase; delay is measured in seconds.
@@ -1333,6 +1393,7 @@ pub struct ProcessRuntimeSnapshot {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSnapshotError {
+    ActiveSourceLights,
     PendingEffects,
     WallIdentity,
     ProcessIdentity,
@@ -1379,6 +1440,13 @@ impl ProcessRuntime {
     pub fn snapshot(&self, world: &World) -> Result<ProcessRuntimeSnapshot, ProcessSnapshotError> {
         if !self.effects.is_empty() || self.staged_authorized {
             return Err(ProcessSnapshotError::PendingEffects);
+        }
+        if self
+            .processes
+            .values()
+            .any(|p| !p.sources.is_empty() && !matches!(p.phase, Phase::Closed | Phase::Delay(_)))
+        {
+            return Err(ProcessSnapshotError::ActiveSourceLights);
         }
         if world.walls.len() != self.elevations.len() {
             return Err(ProcessSnapshotError::WallIdentity);
@@ -1464,6 +1532,14 @@ impl ProcessRuntime {
                 .processes
                 .get_mut(&entry.id)
                 .ok_or(ProcessSnapshotError::ProcessIdentity)?;
+            if !p.sources.is_empty()
+                && !matches!(
+                    entry.phase,
+                    ProcessPhaseSnapshot::Closed | ProcessPhaseSnapshot::Delay(_)
+                )
+            {
+                return Err(ProcessSnapshotError::ActiveSourceLights);
+            }
             if entry.wall_progress.len() != p.motions.len()
                 || entry.object_progress.len() != p.object_motions.len()
                 || entry.previous_cell_types.len() != p.cell_changes.len()
@@ -1814,12 +1890,50 @@ impl ProcessRuntime {
                         cells,
                         true,
                         Some(&runtime.objects),
-                        (true, true),
+                        (true, true, false),
                     ),
                 )
             })
             .collect();
         Ok(runtime)
+    }
+    /// Opt into authored source-light lifecycle; the host must consume events.
+    pub fn with_source_lights(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+        object_poses: &[ProcessObject],
+    ) -> Result<Self, ProcessObjectError> {
+        let mut runtime =
+            Self::with_staged_actions(script, world, capabilities, raw_cells, object_poses)?;
+        let cells = capabilities.initial_cell_types.or(Some(raw_cells));
+        runtime.processes = script
+            .processes
+            .iter()
+            .map(|(&id, process)| {
+                (
+                    id,
+                    RuntimeProcess::new(
+                        process,
+                        world,
+                        capabilities,
+                        cells,
+                        true,
+                        Some(&runtime.objects),
+                        (true, true, true),
+                    ),
+                )
+            })
+            .collect();
+        runtime.source_enabled = true;
+        Ok(runtime)
+    }
+    pub fn source_lights_enabled(&self) -> bool {
+        self.source_enabled
+    }
+    pub fn has_active_source_lights(&self) -> bool {
+        self.processes.values().any(|p| p.source_active)
     }
     fn with_object_capabilities(
         script: &Script,
@@ -1905,7 +2019,7 @@ impl ProcessRuntime {
                             raw_cells,
                             hazards_enabled,
                             enabled.then_some(&objects),
-                            (wind_enabled, false),
+                            (wind_enabled, false, false),
                         ),
                     )
                 })
@@ -1919,6 +2033,7 @@ impl ProcessRuntime {
             cell_types: capabilities.initial_cell_types.map(|x| x.to_vec()),
             effects: Vec::new(),
             staged_authorized: false,
+            source_enabled: false,
         }
     }
     /// Drain effects accumulated since the last call, including direct activations.
@@ -1998,6 +2113,8 @@ impl ProcessRuntime {
                 if let Some(process) = self.processes.get_mut(&id) {
                     if process.phase == Phase::Opening {
                         process.start_hazard(id, &mut self.effects);
+                    } else if process.phase == Phase::Closing {
+                        process.stop_sources(id, &mut self.effects);
                     }
                 }
                 self.effects.extend(
@@ -2010,6 +2127,7 @@ impl ProcessRuntime {
                         process.locked = locked;
                         if locked {
                             process.stop_hazard(target, &mut self.effects);
+                            process.stop_sources(target, &mut self.effects);
                         }
                     }
                 }
@@ -2120,6 +2238,7 @@ impl ProcessRuntime {
                 p.locked = locked;
                 if locked {
                     p.stop_hazard(target, &mut staged.effects);
+                    p.stop_sources(target, &mut staged.effects);
                 }
             }
         }
@@ -2154,6 +2273,7 @@ impl ProcessRuntime {
             || !process.animations.is_empty()
             || !process.death_zones.is_empty()
             || !process.wind_zones.is_empty()
+            || !process.sources.is_empty()
             || !process.immediate_actions.is_empty()
         {
             return Err(ProcessOutcome::Unsupported);
@@ -2545,6 +2665,79 @@ mod tests {
         restored.tick(&mut world, 1.0, false);
         assert_eq!(restored.ready_delayed(), vec![1]);
         assert!(restored.prepare_due(1).is_ok());
+    }
+
+    #[test]
+    fn source_lights_are_opt_in_and_follow_delay_and_reverse() {
+        let script = Script::parse("#proc1\nStartDelay 0.5\nBackWait 0.5\n#action\nsource 29 29 5 28 160\n#end\n#links\nlink 0 0 1\n#end\n");
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let mut disabled = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        let mut runtime = ProcessRuntime::with_source_lights(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert!(runtime.take_effects().is_empty());
+        runtime.tick(&mut world, 0.25, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.tick(&mut world, 0.3, false);
+        assert!(
+            matches!(&runtime.take_effects()[..], [ProcessEffect::SourceLightsActivated { process_id:1, sources }] if sources[0].position_raw == [7552,7552])
+        );
+        assert!(matches!(
+            runtime.snapshot(&world),
+            Err(ProcessSnapshotError::ActiveSourceLights)
+        ));
+        runtime.tick(&mut world, 0.5, false);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::SourceLightsDeactivated { process_id: 1 }]
+        );
+    }
+
+    #[test]
+    fn source_nonstop_survives_open_and_lock_stops_it() {
+        let script = Script::parse("#proc1\n#action\nnonstop\nsource 1 1 5 28 160\n#end\n#proc2\n#action\nlock 1\n#end\n#links\nlink 0 0 1\nlink 1 0 2\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::with_source_lights(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        runtime.activate_at("link", [0, 0]);
+        assert!(matches!(
+            &runtime.take_effects()[..],
+            [ProcessEffect::SourceLightsActivated { process_id: 1, .. }]
+        ));
+        runtime.tick(&mut world, 2.0, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.activate_at("link", [1, 0]);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::SourceLightsDeactivated { process_id: 1 }]
+        );
     }
 
     #[test]

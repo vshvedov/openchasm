@@ -12,6 +12,7 @@ use crate::explosives::{
 };
 use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
+use crate::light_sources::{LightSourceError, LightSources};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
 use crate::object_combat::ObjectCombat;
 use crate::object_heights::ObjectHeightCatalog;
@@ -118,6 +119,7 @@ pub struct SessionEvents {
     pub teleport_failure: Option<TeleportFailure>,
     /// Invalid or duplicate wind activation, if emitted by a process.
     pub wind_errors: Vec<WindError>,
+    pub light_errors: Vec<LightSourceError>,
 }
 
 #[derive(Clone)]
@@ -280,6 +282,8 @@ pub struct Session {
     pub mission: Option<MissionState>,
     pub hazards: Hazards,
     pub wind: WindField,
+    pub light_sources: Option<LightSources>,
+    pending_light_errors: Vec<LightSourceError>,
     ambient: Option<AmbientGrid>,
     pending_wind_errors: Vec<WindError>,
     /// Absolute offsets in original script units, indexed by wall index.
@@ -335,6 +339,7 @@ pub struct SessionSnapshotCapabilities {
     pub ambient: bool,
     pub powerups: bool,
     pub quake_presentation: bool,
+    pub source_lights: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionSnapshotError {
@@ -359,6 +364,7 @@ impl Session {
             mission: self.mission.is_some(),
             ambient: self.ambient.is_some(),
             powerups: self.game.protective_powerups.enabled,
+            source_lights: self.light_sources.is_some(),
             quake_presentation: self
                 .scripted_objects
                 .as_ref()
@@ -371,8 +377,20 @@ impl Session {
         &self,
         content: crate::save_format::ContentDigest,
     ) -> Result<SessionSnapshot, SessionSnapshotError> {
-        if !self.pending_wind_errors.is_empty() {
+        if !self.pending_wind_errors.is_empty() || !self.pending_light_errors.is_empty() {
             return Err(SessionSnapshotError::PendingEffects);
+        }
+        if self.light_sources.is_some() != self.processes.source_lights_enabled() {
+            return Err(SessionSnapshotError::Inconsistent(
+                "source light capability",
+            ));
+        }
+        if self
+            .light_sources
+            .as_ref()
+            .is_some_and(|lights| lights.active().next().is_some())
+        {
+            return Err(SessionSnapshotError::Unverifiable("active source lights"));
         }
         let processes = self
             .processes
@@ -447,8 +465,16 @@ impl Session {
         if snapshot.capabilities != self.snapshot_capabilities() {
             return Err(SessionSnapshotError::Capabilities);
         }
-        if !self.pending_wind_errors.is_empty() {
+        if !self.pending_wind_errors.is_empty() || !self.pending_light_errors.is_empty() {
             return Err(SessionSnapshotError::PendingEffects);
+        }
+        if self.light_sources.is_some() != self.processes.source_lights_enabled()
+            || self
+                .light_sources
+                .as_ref()
+                .is_some_and(|lights| lights.active().next().is_some())
+        {
+            return Err(SessionSnapshotError::Unverifiable("source light baseline"));
         }
         let baseline = self
             .processes
@@ -796,6 +822,7 @@ impl Session {
                 actor.health = 0;
             }
         }
+        let source_lights_enabled = setup.processes.source_lights_enabled();
         let wall_elevations = vec![0.0; setup.world.walls.len()];
         let base_wall_blocking = setup
             .world
@@ -829,6 +856,8 @@ impl Session {
             mission: None,
             hazards: Hazards::default(),
             wind: WindField::new(),
+            light_sources: source_lights_enabled.then(LightSources::default),
+            pending_light_errors: Vec::new(),
             ambient: None,
             pending_wind_errors: Vec::new(),
             combat: Combat::new(),
@@ -1530,6 +1559,24 @@ impl Session {
                 ProcessEffect::WindDeactivated { process_id } => {
                     self.wind.deactivate(*process_id);
                 }
+                ProcessEffect::SourceLightsActivated {
+                    process_id,
+                    sources,
+                } => match self.light_sources.as_mut() {
+                    Some(lights) => {
+                        if let Err(error) = lights.activate(*process_id, sources) {
+                            self.pending_light_errors.push(error);
+                        }
+                    }
+                    None => self
+                        .pending_light_errors
+                        .push(LightSourceError::InvalidDefinition),
+                },
+                ProcessEffect::SourceLightsDeactivated { process_id } => {
+                    if let Some(lights) = &mut self.light_sources {
+                        lights.deactivate(*process_id);
+                    }
+                }
                 _ => {}
             }
             if let ProcessEffect::ObjectPose {
@@ -1598,6 +1645,9 @@ impl Session {
         }
         // Existing effects age once per live tick. Pickups collected below
         // begin at full duration and affect AI on this same tick.
+        if let Some(lights) = &mut self.light_sources {
+            lights.tick();
+        }
         self.game.inventory.tick_effects();
         self.game.protective_powerups.tick();
         if let Some(index) = input.select_weapon.filter(|&index| {
@@ -2447,6 +2497,7 @@ impl Session {
             }
         }
         events.wind_errors = std::mem::take(&mut self.pending_wind_errors);
+        events.light_errors = std::mem::take(&mut self.pending_light_errors);
         events
     }
 }

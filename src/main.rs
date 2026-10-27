@@ -1,6 +1,7 @@
 mod archive;
 mod content;
 mod map;
+mod model;
 mod planes;
 mod process;
 mod texture;
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use world::{Player, Wall, World};
 
 fn usage() {
-    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
+    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
 }
 fn resource_paths(resources: &ResourceSet) -> Vec<String> {
     resources
@@ -235,6 +236,32 @@ fn run() -> Result<(), Box<dyn Error>> {
             let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
             let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
             viewer::run(world, textures, planes, &format!("{id}: {name}"))?;
+        }
+        "model-info" => {
+            let name = args
+                .next()
+                .ok_or("model-info requires a model resource path")?;
+            let model = model::Model::parse(&resources.read(&name)?)?;
+            let triangles: usize = model.polygons.iter().map(|p| p.vertex_count() - 2).sum();
+            println!(
+                "{name}: {} vertices, {} polygons ({triangles} triangles), skin {}x{}",
+                model.vertices.len(),
+                model.polygons.len(),
+                model::SKIN_WIDTH,
+                model.skin_height
+            );
+            if let Some(animation_path) = args.next() {
+                let animation = model::Animation::parse(&resources.read(&animation_path)?)?;
+                println!(
+                    "{animation_path}: {} frames, {} vertices per frame, compatible: {}",
+                    animation.frames.len(),
+                    animation.vertex_count,
+                    animation.matches_model(&model)
+                );
+            }
+            if args.next().is_some() {
+                return Err("model-info accepts a model and optional animation".into());
+            }
         }
         "cat" => {
             let path = args.next().ok_or("cat requires a resource name")?;

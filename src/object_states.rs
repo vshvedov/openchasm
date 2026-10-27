@@ -145,6 +145,20 @@ impl ObjectStates {
         }
     }
 
+    /// Keep process-driven rotation and position aligned with authoritative pose.
+    pub fn set_pose(&mut self, cell: [usize; 2], position: [f32; 2], angle_radians: f32) -> bool {
+        if !position.iter().all(|v| v.is_finite()) || !angle_radians.is_finite() {
+            return false;
+        }
+        if let Some(state) = self.states.get_mut(&cell) {
+            state.placement.position = position;
+            state.placement.angle_radians = angle_radians;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Synchronize damage from the authoritative combat layer. A scripted
     /// explosion does not require positive health and does not call this method.
     pub fn set_health(&mut self, cell: [usize; 2], health: i32) -> bool {

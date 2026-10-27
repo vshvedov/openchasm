@@ -6,9 +6,16 @@ use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
 use crate::object_combat::ObjectCombat;
+use crate::object_states::{ObjectStates, ObjectTransition};
+use crate::objects::ObjectDefinitions;
 use crate::pickups::{Difficulty, PickupEvent};
-use crate::process_runtime::{ProcessEffect, ProcessOutcome, ProcessRuntime};
+use crate::process::Script;
+use crate::process_runtime::{
+    ImmediateAction, ProcessEffect, ProcessEvent, ProcessOutcome, ProcessRuntime,
+};
+use crate::process_transaction::{PresentationManifest, ProcessTransaction};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
+use crate::quake::{QuakeField, QuakeZone};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
 use crate::wind::{WindError, WindField};
 use crate::world::{CollisionCircle, Input, World};
@@ -45,6 +52,10 @@ pub struct SessionEvents {
     pub projectile_impacts: Vec<Impact>,
     /// Object cell and whether it was destroyed by this hit.
     pub object_hits: Vec<([usize; 2], bool)>,
+    /// Ordered committed model replacements; the host must apply before next tick.
+    pub object_transitions: Vec<ObjectTransition>,
+    /// Authored quake commands for an explicitly opted-in consumer.
+    pub quake_changes: Vec<QuakeZone>,
     /// Mission presentation/completion events produced during this step.
     pub mission: Vec<MissionEvent>,
     pub process_effects: Vec<ProcessEffect>,
@@ -52,6 +63,52 @@ pub struct SessionEvents {
     pub vertical: VerticalEvents,
     /// Invalid or duplicate wind activation, if emitted by a process.
     pub wind_errors: Vec<WindError>,
+}
+
+#[derive(Clone)]
+pub struct ScriptedObjects {
+    pub states: ObjectStates,
+    pub definitions: ObjectDefinitions,
+    pub manifest: PresentationManifest,
+    pub quake: QuakeField,
+    /// The host promises to consume and present quake changes.
+    pub quake_enabled: bool,
+    destroy_links: Vec<([u8; 2], u16)>,
+    required_objects: Vec<u16>,
+}
+impl ScriptedObjects {
+    pub fn new(
+        states: ObjectStates,
+        definitions: ObjectDefinitions,
+        manifest: PresentationManifest,
+        script: &Script,
+        quake_enabled: bool,
+    ) -> Self {
+        Self {
+            states,
+            definitions,
+            manifest,
+            quake: QuakeField::new(),
+            quake_enabled,
+            required_objects: script
+                .processes
+                .iter()
+                .filter_map(|(&id, process)| {
+                    process
+                        .actions
+                        .iter()
+                        .any(|a| matches!(a.name.as_str(), "explode" | "change"))
+                        .then_some(id)
+                })
+                .collect(),
+            destroy_links: script
+                .triggers
+                .iter()
+                .filter(|t| t.kind == "destroy")
+                .map(|t| ([t.x, t.y], t.process))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -66,6 +123,7 @@ pub struct Session {
     pub selected_weapon: usize,
     pub projectiles: ProjectileSystem,
     pub objects: Option<ObjectCombat>,
+    pub scripted_objects: Option<ScriptedObjects>,
     pub mission: Option<MissionState>,
     pub hazards: Hazards,
     pub wind: WindField,
@@ -108,6 +166,7 @@ impl Session {
             selected_weapon: 0,
             projectiles: ProjectileSystem::new(),
             objects: None,
+            scripted_objects: None,
             mission: None,
             hazards: Hazards::default(),
             wind: WindField::new(),
@@ -120,6 +179,148 @@ impl Session {
     /// Install shootable object state before taking the restart snapshot.
     pub fn set_objects(&mut self, objects: ObjectCombat) {
         self.objects = Some(objects);
+    }
+
+    /// Opt in to staged destroy links before taking the restart snapshot.
+    /// Requires a matching staged process runtime and represented object combat.
+    pub fn set_scripted_objects(&mut self, scripted: ScriptedObjects) {
+        self.scripted_objects = Some(scripted);
+    }
+    fn sync_object_damage(&mut self, cell: [usize; 2], damage: i32) {
+        if let Some(state) = self
+            .scripted_objects
+            .as_mut()
+            .and_then(|s| s.states.get(cell).map(|state| state.health))
+        {
+            if let Some(scripted) = self.scripted_objects.as_mut() {
+                scripted
+                    .states
+                    .set_health(cell, state.saturating_sub(damage.max(0)).max(0));
+            }
+        }
+    }
+    /// Activate destroy links in script order. A validation failure rolls back
+    /// the complete destroy-link group and tells the caller to restore the hit.
+    fn activate_destroy(
+        &mut self,
+        cell: [u8; 2],
+        events: &mut SessionEvents,
+    ) -> (Vec<ProcessEvent>, bool) {
+        let Some(scripted) = self.scripted_objects.as_ref() else {
+            return (self.processes.activate_at("destroy", cell), true);
+        };
+        let required_objects = scripted.required_objects.clone();
+        let ids: Vec<u16> = scripted
+            .destroy_links
+            .iter()
+            .filter_map(|(at, id)| (*at == cell).then_some(*id))
+            .collect();
+        let saved_processes = self.processes.clone();
+        let saved_scripted = self.scripted_objects.clone();
+        let saved_objects = self.objects.clone();
+        let replacement_start = events.object_transitions.len();
+        let quake_start = events.quake_changes.len();
+        let mut attempts = Vec::new();
+        let mut failed = false;
+        for id in ids {
+            let prepared = match self.processes.prepare_at("destroy", cell, id) {
+                Ok(value) => value,
+                Err(outcome) => {
+                    if required_objects.contains(&id) {
+                        failed = true;
+                        break;
+                    }
+                    attempts.push(ProcessEvent {
+                        process_id: id,
+                        outcome,
+                    });
+                    continue;
+                }
+            };
+            let quakes: Vec<_> = prepared
+                .actions()
+                .iter()
+                .filter_map(|action| match action {
+                    ImmediateAction::Quake(zone) => Some(*zone),
+                    _ => None,
+                })
+                .collect();
+            let scripted = self.scripted_objects.as_mut().expect("opted-in state");
+            if !quakes.is_empty() && !scripted.quake_enabled {
+                drop(prepared);
+                failed = true;
+                break;
+            }
+            let Some(combat) = self.objects.as_mut() else {
+                drop(prepared);
+                failed = true;
+                break;
+            };
+            let player = self.world.player.position;
+            let actor_circles: Vec<_> = self
+                .actors
+                .actors
+                .iter()
+                .filter_map(|actor| {
+                    if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive)
+                    {
+                        return None;
+                    }
+                    let radius = self
+                        .actor_definitions
+                        .entries
+                        .get(actor.definition_index)
+                        .map(|def| (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0))
+                        .unwrap_or(2.0);
+                    Some((actor.position, radius))
+                })
+                .collect();
+            let prepared = ProcessTransaction::prepare(
+                prepared,
+                &mut scripted.states,
+                combat,
+                &mut scripted.quake,
+                &scripted.definitions,
+                &scripted.manifest,
+                |_, position, radius| {
+                    let distance = |p: [f32; 2]| (p[0] - position[0]).hypot(p[1] - position[1]);
+                    player.iter().all(|v| v.is_finite())
+                        && distance(player) >= radius + 0.18
+                        && actor_circles.iter().all(|(p, r)| {
+                            p.iter().all(|v| v.is_finite()) && distance(*p) >= radius + r
+                        })
+                },
+            );
+            match prepared {
+                Ok(transaction) => {
+                    let transitions = transaction.transitions().to_vec();
+                    match transaction.commit() {
+                        Ok(event) => {
+                            attempts.push(event);
+                            events.object_transitions.extend(transitions);
+                            events.quake_changes.extend(quakes);
+                        }
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            self.processes = saved_processes;
+            self.scripted_objects = saved_scripted;
+            self.objects = saved_objects;
+            events.object_transitions.truncate(replacement_start);
+            events.quake_changes.truncate(quake_start);
+            return (Vec::new(), false);
+        }
+        (attempts, true)
     }
 
     /// Attach a freshly parsed mission before taking the session's restart snapshot.
@@ -195,9 +396,18 @@ impl Session {
                 }
                 _ => {}
             }
-            if let ProcessEffect::ObjectPose { cell, position, .. } = *effect {
+            if let ProcessEffect::ObjectPose {
+                cell,
+                position,
+                angle_radians,
+                ..
+            } = *effect
+            {
                 let cell = [usize::from(cell[0]), usize::from(cell[1])];
                 self.game.pickups.set_position(cell, position);
+                if let Some(scripted) = &mut self.scripted_objects {
+                    scripted.states.set_pose(cell, position, angle_radians);
+                }
                 if let Some(objects) = &mut self.objects {
                     objects.set_position(cell, position);
                 }
@@ -373,6 +583,13 @@ impl Session {
         events.process_effects.extend(self.apply_process_effects());
         self.combat.tick(DT);
         if input.fire {
+            let object_before_hit = self.scripted_objects.as_ref().and(self.objects.clone());
+            let scripted_before_hit = self.scripted_objects.clone();
+            let processes_before_hit = self
+                .scripted_objects
+                .as_ref()
+                .map(|_| self.processes.clone());
+            let attempts_before_hit = attempts.len();
             let mut shot = self.combat.fire(
                 self.selected_weapon,
                 ShotContext {
@@ -395,16 +612,39 @@ impl Session {
             );
             match shot {
                 FireResult::Fired(ShotImpact::Object {
-                    cell, destroyed, ..
+                    cell,
+                    damage,
+                    destroyed,
+                    distance,
                 }) => {
-                    if destroyed {
-                        self.invalidate_process_object(cell);
-                    }
+                    self.sync_object_damage(cell, damage);
+                    let mut destroyed = destroyed;
                     if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
                         attempts.extend(self.processes.activate_at("shoot", [x, y]));
                         if destroyed {
-                            attempts.extend(self.processes.activate_at("destroy", [x, y]));
+                            let (destroy_attempts, accepted) =
+                                self.activate_destroy([x, y], &mut events);
+                            if accepted {
+                                attempts.extend(destroy_attempts);
+                            } else {
+                                self.objects = object_before_hit;
+                                self.scripted_objects = scripted_before_hit;
+                                if let Some(processes) = processes_before_hit {
+                                    self.processes = processes;
+                                }
+                                attempts.truncate(attempts_before_hit);
+                                destroyed = false;
+                                shot = FireResult::Fired(ShotImpact::Object {
+                                    cell,
+                                    damage,
+                                    destroyed,
+                                    distance,
+                                });
+                            }
                         }
+                    }
+                    if destroyed && !events.object_transitions.iter().any(|t| t.cell == cell) {
+                        self.invalidate_process_object(cell);
                     }
                     events.object_hits.push((cell, destroyed));
                 }
@@ -482,7 +722,8 @@ impl Session {
             self.objects.as_ref(),
             |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
         );
-        for impact in &events.projectile_impacts {
+        for index in 0..events.projectile_impacts.len() {
+            let impact = events.projectile_impacts[index];
             match impact.target {
                 ImpactTarget::Player => {
                     events.damage = events.damage.saturating_add(
@@ -490,23 +731,45 @@ impl Session {
                     )
                 }
                 ImpactTarget::Object { cell } => {
+                    let object_before_hit =
+                        self.scripted_objects.as_ref().and(self.objects.clone());
+                    let scripted_before_hit = self.scripted_objects.clone();
+                    let processes_before_hit = self
+                        .scripted_objects
+                        .as_ref()
+                        .map(|_| self.processes.clone());
+                    let attempts_before_hit = attempts.len();
                     if let Some(hit) = self
                         .objects
                         .as_mut()
                         .and_then(|objects| objects.apply_hit(cell, impact.damage))
                     {
-                        events.object_hits.push((cell, hit.destroyed));
-                        if hit.destroyed {
-                            self.invalidate_process_object(cell);
-                        }
+                        self.sync_object_damage(cell, impact.damage);
+                        let mut destroyed = hit.destroyed;
                         if impact.owner == Owner::Player {
                             if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
                                 attempts.extend(self.processes.activate_at("shoot", [x, y]));
-                                if hit.destroyed {
-                                    attempts.extend(self.processes.activate_at("destroy", [x, y]));
+                                if destroyed {
+                                    let (destroy_attempts, accepted) =
+                                        self.activate_destroy([x, y], &mut events);
+                                    if accepted {
+                                        attempts.extend(destroy_attempts);
+                                    } else {
+                                        self.objects = object_before_hit;
+                                        self.scripted_objects = scripted_before_hit;
+                                        if let Some(processes) = processes_before_hit {
+                                            self.processes = processes;
+                                        }
+                                        attempts.truncate(attempts_before_hit);
+                                        destroyed = false;
+                                    }
                                 }
                             }
                         }
+                        if destroyed && !events.object_transitions.iter().any(|t| t.cell == cell) {
+                            self.invalidate_process_object(cell);
+                        }
+                        events.object_hits.push((cell, destroyed));
                     }
                 }
                 ImpactTarget::Wall { wall_index } if impact.owner == Owner::Player => {
@@ -1459,5 +1722,195 @@ mod tests {
             projectile_session.step(SessionInput::default());
         }
         assert_eq!(projectile_session.actors.actors[0].health, 18);
+    }
+    #[test]
+    fn staged_destroy_replaces_object_and_failed_preflight_restores_hit() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text = "#proc1\n#action\nexplode 3 0\nquake 2 0 3 1 10\n#end\n#proc2\n#action\nplayani 99\nunlock 3\n#end\n#proc3\nLock\nEndDelay 1\n#end\n#proc4\nLock\nEndDelay 1\n#end\n#links\nshoot 1 0 2\ndestroy 1 0 1\ndestroy 1 0 4\nlink 5 0 3\nlink 6 0 4\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "".into(),
+            power: 10,
+            raw_fields: vec![],
+        }]);
+        let def = |name: &str, health: i32| ObjectDefinition {
+            collision_radius: 32,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: health,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let definitions = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![def("heart.3o", 10), def("gate.3o", 0), def("dummy.3o", 0)],
+        };
+        let placement = |cell: [usize; 2], definition_index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index,
+            grid_cell: cell,
+            position: [cell[0] as f32 + 0.5, cell[1] as f32 + 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let objects = vec![placement([1, 0], 0), placement([3, 0], 1)];
+        let mut cells = [0; 4096];
+        cells[64] = 163;
+        cells[192] = 164;
+        let poses: Vec<_> = objects
+            .iter()
+            .map(|o| ProcessObject {
+                cell: [o.grid_cell[0] as u8, o.grid_cell[1] as u8],
+                position: o.position,
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 0.125,
+            })
+            .collect();
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &objects,
+            &definitions,
+            &script,
+            Difficulty::Normal,
+        ));
+        let states = ObjectStates::new(&objects, &definitions).unwrap();
+        session.set_scripted_objects(ScriptedObjects::new(
+            states,
+            definitions,
+            PresentationManifest::default(),
+            &script,
+            true,
+        ));
+        let mut projectile_retry = session.clone();
+        projectile_retry.game.inventory.weapons[3] = true;
+        projectile_retry.game.inventory.ammo[3] = 1;
+        projectile_retry.game.weapons.0[3].rocket_type = 1;
+        projectile_retry.rockets.0.push(RocketDefinition {
+            model_name: "disk.3o".into(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 20, 10],
+        });
+        projectile_retry.step(SessionInput {
+            fire: true,
+            select_weapon: Some(3),
+            ..Default::default()
+        });
+        let mut projectile_hit = false;
+        for _ in 0..30 {
+            let events = projectile_retry.step(SessionInput::default());
+            if events.object_hits.contains(&([1, 0], false)) {
+                projectile_hit = true;
+                assert!(!events
+                    .process_effects
+                    .iter()
+                    .any(|e| matches!(e, ProcessEffect::PlayAnimation { object_id: 99 })));
+            }
+        }
+        assert!(projectile_hit);
+        assert_eq!(
+            projectile_retry.processes.activate_at("link", [5, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        assert_eq!(
+            projectile_retry.objects.as_ref().unwrap().is_active([1, 0]),
+            Some(true)
+        );
+        let mut retry = session.clone();
+        let blocked = retry.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert_eq!(blocked.object_hits, vec![([1, 0], false)]);
+        assert!(blocked.object_transitions.is_empty());
+        assert!(!blocked
+            .process_effects
+            .iter()
+            .any(|e| matches!(e, ProcessEffect::PlayAnimation { object_id: 99 })));
+        assert_eq!(
+            retry.processes.activate_at("link", [5, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        assert_eq!(
+            retry.processes.activate_at("link", [6, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        assert_eq!(
+            retry
+                .scripted_objects
+                .as_ref()
+                .unwrap()
+                .states
+                .get([1, 0])
+                .unwrap()
+                .health,
+            10
+        );
+        assert_eq!(
+            retry.objects.as_ref().unwrap().is_active([1, 0]),
+            Some(true)
+        );
+        assert_eq!(retry.processes.cell_type([3, 0]), Some(164));
+        session
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([3, 0], 165);
+        let result = session.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert_eq!(result.object_hits, vec![([1, 0], true)]);
+        assert_eq!(result.object_transitions.len(), 1);
+        assert_eq!(result.object_transitions[0].new_type, 165);
+        assert_eq!(result.quake_changes.len(), 1);
+        assert!(result
+            .process_effects
+            .iter()
+            .any(|e| matches!(e, ProcessEffect::PlayAnimation { object_id: 99 })));
+        assert_eq!(
+            session.processes.activate_at("link", [5, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            session.processes.activate_at("link", [6, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(session.processes.cell_type([3, 0]), Some(165));
+        assert_eq!(
+            session
+                .processes
+                .object_pose([3, 0])
+                .unwrap()
+                .blocking_radius,
+            0.0
+        );
+        assert_eq!(
+            session
+                .scripted_objects
+                .as_ref()
+                .unwrap()
+                .quake
+                .cell([2, 0]),
+            Some(10)
+        );
     }
 }

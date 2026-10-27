@@ -4,7 +4,7 @@
 //! simulation state. It does not implement baked map lighting, occlusion,
 //! light height, original falloff, or startup blinking. Delay is intentionally
 //! ignored until the remaster's blink behavior is understood.
-use openchasm::light_sources::LightSourcesSnapshot;
+use crate::light_sources::LightSourcesSnapshot;
 
 /// Bound per-sample work for independently authored levels. Excess eligible
 /// sources are ignored in the snapshot's process/action iteration order.
@@ -83,7 +83,7 @@ impl DynamicLightSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openchasm::light_sources::{LightSourceProcessSnapshot, SourceLight};
+    use crate::light_sources::{LightSourceProcessSnapshot, SourceLight};
     fn source(position_raw: [u16; 2], radius_raw: u16, brightness: u8) -> SourceLight {
         SourceLight {
             position_raw,
@@ -131,7 +131,7 @@ mod tests {
     }
     #[test]
     fn snapshot_reconstruction_tracks_activated_and_removed_sources() {
-        use openchasm::light_sources::LightSources;
+        use crate::light_sources::LightSources;
         let mut sources = LightSources::default();
         sources
             .activate(7, &[source([128, 128], 256, 255)])

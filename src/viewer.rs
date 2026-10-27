@@ -1,4 +1,5 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
+use crate::object_render::ObjectScene;
 use crate::planes::PlaneRenderer;
 use crate::process_runtime::ProcessRuntime;
 use crate::texture::CelImage;
@@ -55,9 +56,11 @@ fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
 
 fn render(
     frame: &mut [u32],
+    depth: &mut [f32],
     world: &World,
     textures: &[Option<ViewerTexture>],
     planes: Option<&PlaneRenderer>,
+    objects: Option<&ObjectScene>,
     label: &str,
 ) {
     if let Some(planes) = planes {
@@ -73,6 +76,7 @@ fn render(
             row.fill(if y < HEIGHT / 2 { 0x303847 } else { 0x38312b });
         }
     }
+    depth.fill(f32::INFINITY);
     let (sin, cos) = world.player.angle.sin_cos();
     let mut hits = Vec::new();
     for x in 0..WIDTH {
@@ -112,8 +116,12 @@ fn render(
                     color
                 };
                 frame[y * WIDTH + x] = pixel;
+                depth[y * WIDTH + x] = distance;
             }
         }
+    }
+    if let Some(objects) = objects {
+        objects.render(frame, depth, WIDTH, HEIGHT, world.player);
     }
     text(frame, 8, 8, label);
     text(
@@ -130,6 +138,7 @@ pub fn run(
     textures: Vec<Option<CelImage>>,
     planes: PlaneRenderer,
     mut processes: ProcessRuntime,
+    objects: ObjectScene,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     let textures: Vec<Option<ViewerTexture>> = textures
@@ -148,6 +157,7 @@ pub fn run(
     )?;
     window.set_target_fps(60);
     let mut frame = vec![0; WIDTH * HEIGHT];
+    let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
     let mut last = Instant::now();
     let mut accumulator = 0.0f32;
     let mut pending_interact = false;
@@ -171,7 +181,15 @@ pub fn run(
             pending_interact = false;
             accumulator -= STEP;
         }
-        render(&mut frame, &world, &textures, Some(&planes), label);
+        render(
+            &mut frame,
+            &mut depth,
+            &world,
+            &textures,
+            Some(&planes),
+            Some(&objects),
+            label,
+        );
         window.update_with_buffer(&frame, WIDTH, HEIGHT)?;
     }
     Ok(())
@@ -210,7 +228,8 @@ mod tests {
             pixels: vec![0x00000000, 0xff0000ff],
         });
         let mut frame = vec![0; WIDTH * HEIGHT];
-        render(&mut frame, &world, &textures, None, "");
+        let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+        render(&mut frame, &mut depth, &world, &textures, None, None, "");
         let visible_behind = frame[(HEIGHT / 2 - 10) * WIDTH + WIDTH / 2];
         let visible_in_front = frame[(HEIGHT / 2 + 10) * WIDTH + WIDTH / 2];
         assert!(visible_behind & 0xff0000 > 0, "{visible_behind:06x}");
@@ -241,7 +260,8 @@ mod tests {
             }),
         ];
         let mut frame = vec![0; WIDTH * HEIGHT];
-        render(&mut frame, &world, &textures, None, "");
+        let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+        render(&mut frame, &mut depth, &world, &textures, None, None, "");
         let center = frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
         assert!(center & 0xff0000 > 0);
         assert_eq!(center & 0x00ffff, 0);

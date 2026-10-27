@@ -2,6 +2,7 @@ mod archive;
 mod content;
 mod map;
 mod model;
+mod object_render;
 mod objects;
 mod planes;
 mod process;
@@ -270,7 +271,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             let script_data = resources.read(&format!("map/process.{id}"))?;
             let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
             let processes = process_runtime::ProcessRuntime::new(&script, &world);
-            viewer::run(world, textures, planes, processes, &format!("{id}: {name}"))?;
+            let definitions =
+                objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
+            let object_scene =
+                object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
+            viewer::run(
+                world,
+                textures,
+                planes,
+                processes,
+                object_scene,
+                &format!("{id}: {name}"),
+            )?;
         }
         "objects" => {
             let id = args.next().unwrap_or_else(|| "01".to_owned());

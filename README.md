@@ -1,6 +1,6 @@
 # OpenChasm
 
-An experimental Rust reimplementation of **Chasm: The Rift**, with Linux, Windows and macOS as target platforms. The current build is a **geometry preview**, not a playable game. It loads the original map wall segments, CEL textures, and floor and ceiling textures, starts at the player spawn, and allows basic movement. Movement and collision are provisional. A limited subset of map processes can move walls; enemies, weapons, audio and multiplayer have not been implemented.
+An experimental Rust reimplementation of **Chasm: The Rift**, with Linux, Windows and macOS as target platforms. The current build is a **geometry preview**, not a playable game. It loads the original map wall segments, CEL textures, floor and ceiling textures, and static 3O objects, starts at the player spawn, and allows basic movement. Movement and collision are provisional. A limited subset of map processes can move walls; enemies, weapons, audio and multiplayer have not been implemented.
 
 The name OpenChasm is already used by another independent project; this repository is a separate Rust implementation. See [research notes](docs/research.md) and [map format notes](docs/map-format.md) for references.
 
@@ -37,4 +37,4 @@ The 2022 Steam release archive is an uncompressed tar file; the earlier DOS inst
 
 Resource containers, map/image decoders, the movement/geometry prototype, and the window/renderer live in separate modules. The movement update is driven by inputs on a fixed tick and does not depend on window APIs. This is a starting separation for a future authoritative server; there is **no networking protocol or multiplayer implementation yet**, and deterministic cross-platform simulation has not been established. Loose-directory loading gives future original content a development path, though it currently expects the same resource layout and formats.
 
-Next work includes validating floor and ceiling rendering, materials and transparency, original collision and movement, 3D objects, the remaining map scripts, enemies and combat, and audio. Cross-platform CI is configured for synthetic tests; game-data checks require a locally installed copy. Cross-platform behavior has not yet been tested on Windows or macOS.
+Next work includes validating floor and ceiling rendering, materials and transparency, original collision and movement, 3D objects, object animation and collision, the remaining map scripts, enemies and combat, and audio. Cross-platform CI is configured for synthetic tests; game-data checks require a locally installed copy. Cross-platform behavior has not yet been tested on Windows or macOS.

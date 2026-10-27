@@ -1,5 +1,22 @@
 //! Rendering-independent exploratory geometry and movement.
 //! Distances are in map tiles. Movement has not been matched to the original game.
+//!
+//! Optional authored-sided wall movement follows the side test in PanzerChasm's
+//! independently reconstructed server. The original game's exact sweep,
+//! endpoint and overlap behavior remain unverified. This policy does not alter
+//! shot rays, AI collision or scripted moving-wall obstruction; a host must
+//! opt in consistently across its physics systems before using it in gameplay.
+
+/// Horizontal wall collision policy. Authored sides follow an independent
+/// reconstruction and have not been verified against the original game.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallCollisionMode {
+    /// Existing conservative behavior: every blocking wall is two-sided.
+    #[default]
+    TwoSided,
+    /// Opaque wall IDs 1–86 block only their authored front side.
+    AuthoredSides,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Wall {
@@ -195,7 +212,14 @@ fn move_and_slide(
     walls: &[Wall],
     circles: &[CollisionCircle],
 ) -> [f32; 2] {
-    move_circle_and_slide(position, displacement, PLAYER_RADIUS, walls, circles)
+    move_circle_and_slide(
+        position,
+        displacement,
+        PLAYER_RADIUS,
+        walls,
+        circles,
+        WallCollisionMode::TwoSided,
+    )
 }
 
 fn move_circle_and_slide(
@@ -204,6 +228,7 @@ fn move_circle_and_slide(
     radius: f32,
     walls: &[Wall],
     circles: &[CollisionCircle],
+    mode: WallCollisionMode,
 ) -> [f32; 2] {
     // Multiple contacts let a disc slide along walls and stop at corners.
     for _ in 0..4 {
@@ -214,6 +239,11 @@ fn move_circle_and_slide(
         let hit = walls
             .iter()
             .filter(|wall| wall.blocks_movement)
+            .filter(|wall| {
+                mode != WallCollisionMode::AuthoredSides
+                    || !(1..=86).contains(&wall.texture)
+                    || cross(sub(position, wall.a), sub(wall.b, wall.a)) <= 0.0
+            })
             .filter_map(|wall| sweep_wall(position, displacement, wall, radius))
             .chain(
                 circles
@@ -263,6 +293,25 @@ impl World {
         radius: f32,
         circles: &[CollisionCircle],
     ) -> [f32; 2] {
+        self.move_circle_with_mode(
+            position,
+            displacement,
+            radius,
+            circles,
+            WallCollisionMode::TwoSided,
+        )
+    }
+
+    /// Move a disc with an explicitly selected wall-sidedness policy.
+    /// Shots, AI and moving-wall obstruction are independent of this policy.
+    pub fn move_circle_with_mode(
+        &self,
+        position: [f32; 2],
+        displacement: [f32; 2],
+        radius: f32,
+        circles: &[CollisionCircle],
+        mode: WallCollisionMode,
+    ) -> [f32; 2] {
         if !position
             .iter()
             .chain(displacement.iter())
@@ -272,7 +321,7 @@ impl World {
         {
             return position;
         }
-        move_circle_and_slide(position, displacement, radius, &self.walls, circles)
+        move_circle_and_slide(position, displacement, radius, &self.walls, circles, mode)
     }
 
     /// Advance a bounded time step using a swept circular player and wall sliding.
@@ -295,6 +344,19 @@ impl World {
         dt: f32,
         circles: &[CollisionCircle],
         external: [f32; 2],
+    ) {
+        self.step_with_external_mode(input, dt, circles, external, WallCollisionMode::TwoSided);
+    }
+
+    /// Apply player input and external displacement with explicit wall sidedness.
+    /// This only affects this move; callers must coordinate their other physics.
+    pub fn step_with_external_mode(
+        &mut self,
+        input: Input,
+        dt: f32,
+        circles: &[CollisionCircle],
+        external: [f32; 2],
+        mode: WallCollisionMode,
     ) {
         if !external.iter().all(|v| v.is_finite())
             || !self.player.angle.is_finite()
@@ -321,8 +383,18 @@ impl World {
             (cos * forward - sin * strafe) * 2.5 * dt + external[0],
             (sin * forward + cos * strafe) * 2.5 * dt + external[1],
         ];
-        self.player.position =
-            move_and_slide(self.player.position, displacement, &self.walls, circles);
+        self.player.position = if mode == WallCollisionMode::TwoSided {
+            move_and_slide(self.player.position, displacement, &self.walls, circles)
+        } else {
+            move_circle_and_slide(
+                self.player.position,
+                displacement,
+                PLAYER_RADIUS,
+                &self.walls,
+                circles,
+                mode,
+            )
+        };
     }
 }
 
@@ -344,6 +416,69 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn authored_sides_apply_only_to_opaque_walls_and_preserve_default() {
+        let mut world = test_world();
+        let mode = WallCollisionMode::AuthoredSides;
+        let move_disc = |w: &World, from, delta, policy| {
+            w.move_circle_with_mode(from, delta, 0.18, &[], policy)
+        };
+        // The authored segment points upward, so x < 1 is the solid side.
+        assert!(move_disc(&world, [0.0, 0.0], [2.0, 0.0], mode)[0] < 0.821);
+        assert_eq!(move_disc(&world, [2.0, 0.0], [-2.0, 0.0], mode), [0.0, 0.0]);
+        assert!(world.move_circle([2.0, 0.0], [-2.0, 0.0], 0.18, &[])[0] > 1.179);
+        for texture in [87, 119, 120] {
+            world.walls[0].texture = texture;
+            assert!(move_disc(&world, [0.0, 0.0], [2.0, 0.0], mode)[0] < 0.821);
+            assert!(move_disc(&world, [2.0, 0.0], [-2.0, 0.0], mode)[0] > 1.179);
+        }
+        world.walls[0].texture = 1;
+        world.walls[0].blocks_movement = false;
+        assert_eq!(move_disc(&world, [0.0, 0.0], [2.0, 0.0], mode), [2.0, 0.0]);
+        assert_eq!(move_disc(&world, [2.0, 0.0], [-2.0, 0.0], mode), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn authored_sides_support_overlap_escape_sliding_and_rotated_segments() {
+        let mut world = test_world();
+        let mode = WallCollisionMode::AuthoredSides;
+        let escape = world.move_circle_with_mode([0.9, 0.0], [-0.5, 0.0], 0.18, &[], mode);
+        assert!((escape[0] - 0.4).abs() < 1e-5);
+        let inward = world.move_circle_with_mode([0.9, 0.0], [0.5, 0.0], 0.18, &[], mode);
+        assert!((inward[0] - 0.9).abs() < 1e-5);
+        let slide = world.move_circle_with_mode([0.0, 0.0], [2.0, 0.5], 0.18, &[], mode);
+        assert!(slide[0] < 0.821 && slide[1] > 0.49);
+        // A horizontal segment points left, so y < 1 is its solid side.
+        world.walls[0].a = [1.0, 1.0];
+        world.walls[0].b = [-1.0, 1.0];
+        assert!(world.move_circle_with_mode([0.0, 0.0], [0.0, 2.0], 0.18, &[], mode)[1] < 0.821);
+        assert_eq!(
+            world.move_circle_with_mode([0.0, 2.0], [0.0, -2.0], 0.18, &[], mode),
+            [0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn player_mode_is_per_call_and_rays_remain_two_sided() {
+        let mut world = test_world();
+        world.player.position = [2.0, 0.0];
+        world.step_with_external_mode(
+            Input::default(),
+            1.0 / 60.0,
+            &[],
+            [-2.0, 0.0],
+            WallCollisionMode::AuthoredSides,
+        );
+        assert_eq!(world.player.position, [0.0, 0.0]);
+        world.player.position = [2.0, 0.0];
+        world.step_with_external(Input::default(), 1.0 / 60.0, &[], [-2.0, 0.0]);
+        assert!(world.player.position[0] > 1.179);
+        world.player.position = [2.0, 0.0];
+        let mut hits = Vec::new();
+        world.ray_hits([-1.0, 0.0], &mut hits);
+        assert_eq!(hits.len(), 1);
+    }
+
     #[test]
     fn ray_hits_segment_and_ignores_opposite_direction() {
         let w = test_world();

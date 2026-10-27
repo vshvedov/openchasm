@@ -69,7 +69,11 @@ fn sample_lut(table: &[f32], value: f32) -> f32 {
     table[lower] + (table[lower + 1] - table[lower]) * fraction
 }
 fn byte(value: f32) -> u32 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u32
+    let scaled = value.clamp(0.0, 1.0) * 255.0;
+    let whole = scaled as u32;
+    // Compare the fractional part instead of adding 0.5: f32 addition can
+    // round values just below a half-integer up to the boundary.
+    whole + u32::from(scaled - whole as f32 >= 0.5)
 }
 
 /// Nonnegative scene-linear RGB. Values above one are intentionally retained.
@@ -239,6 +243,28 @@ impl ColorPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn byte_conversion_matches_round_at_quantization_boundaries() {
+        let reference = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+        for n in 0..255 {
+            let boundary = (n as f32 + 0.5) / 255.0;
+            for bits in boundary.to_bits().saturating_sub(16)..=boundary.to_bits() + 16 {
+                let value = f32::from_bits(bits);
+                assert_eq!(byte(value), reference(value), "value {value:?}");
+            }
+        }
+        for value in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1.0,
+            0.0,
+            1.0,
+            2.0,
+        ] {
+            assert_eq!(byte(value), reference(value));
+        }
+    }
     #[test]
     fn srgb_decode_matches_standard_breakpoint_and_known_gray() {
         let gray = LinearRgb::from_srgb8(0x808080);

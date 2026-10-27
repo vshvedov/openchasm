@@ -321,6 +321,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                         shot_blocking,
                         difficulty: openchasm::pickups::Difficulty::Normal,
                     });
+                session.set_objects(openchasm::object_combat::ObjectCombat::new(
+                    &objects::instances(&map),
+                    &definitions,
+                    &script,
+                    openchasm::pickups::Difficulty::Normal,
+                ));
                 session.set_mission(openchasm::mission::MissionPlan::parse(
                     &script,
                     &String::from_utf8_lossy(&script_data),

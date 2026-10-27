@@ -6,6 +6,7 @@
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::inventory::{Inventory, WeaponDefinitions};
 use crate::map::UNITS_PER_TILE;
+use crate::object_combat::ObjectCombat;
 use crate::world::{Wall, World};
 use std::io::{self, ErrorKind};
 
@@ -115,6 +116,12 @@ pub enum ShotImpact {
         wall_index: usize,
         distance: f32,
     },
+    Object {
+        cell: [usize; 2],
+        damage: i32,
+        destroyed: bool,
+        distance: f32,
+    },
     Miss,
     /// Spawn a physical projectile with this rocket definition.
     Launch {
@@ -140,6 +147,7 @@ pub struct ShotContext<'a> {
     pub actors: &'a mut ActorState,
     pub definitions: &'a ActorDefinitions,
     pub world: &'a World,
+    pub objects: Option<&'a mut ObjectCombat>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -184,6 +192,7 @@ impl Combat {
             actors,
             definitions,
             world,
+            mut objects,
         } = context;
         let Some(spec) = weapons.0.get(weapon) else {
             return FireResult::InvalidWeapon;
@@ -233,6 +242,12 @@ impl Combat {
             .min_by(|a, b| a.0.total_cmp(&b.0));
         let mut nearest = wall_hit.map_or(MAX_RANGE, |(distance, _)| distance.min(MAX_RANGE));
         let mut selected = None;
+        let mut object_hit = objects
+            .as_deref()
+            .and_then(|objects| objects.raycast(player.position, direction, nearest, 0.0));
+        if let Some(hit) = object_hit {
+            nearest = hit.distance;
+        }
         for (index, actor) in actors.actors.iter().enumerate() {
             if actor.health <= 0 || !actor.position.iter().all(|x| x.is_finite()) {
                 continue;
@@ -264,6 +279,23 @@ impl Combat {
             if distance < nearest {
                 nearest = distance;
                 selected = Some(index);
+                object_hit = None;
+            }
+        }
+        if let Some(hit) = object_hit {
+            let damage = rocket
+                .power
+                .saturating_mul(i32::from(spec.projectile_count));
+            if let Some(event) = objects
+                .as_deref_mut()
+                .and_then(|objects| objects.apply_hit(hit.cell, damage))
+            {
+                return FireResult::Fired(ShotImpact::Object {
+                    cell: event.cell,
+                    damage,
+                    destroyed: event.destroyed,
+                    distance: hit.distance,
+                });
             }
         }
         if let Some(index) = selected {
@@ -372,6 +404,7 @@ mod tests {
                 actors,
                 definitions,
                 world,
+                objects: None,
             },
             |_| true,
         )
@@ -476,7 +509,8 @@ mod tests {
                     rockets: &rockets,
                     actors: &mut actors,
                     definitions: &defs,
-                    world: &world
+                    world: &world,
+                    objects: None,
                 },
                 |_| false
             ),
@@ -538,7 +572,8 @@ mod tests {
                     rockets: &rockets,
                     actors: &mut actors,
                     definitions: &defs,
-                    world: &world
+                    world: &world,
+                    objects: None,
                 },
                 |_| true
             ),
@@ -553,7 +588,8 @@ mod tests {
                     rockets: &rockets,
                     actors: &mut actors,
                     definitions: &defs,
-                    world: &world
+                    world: &world,
+                    objects: None,
                 },
                 |_| true
             ),

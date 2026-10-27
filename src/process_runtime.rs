@@ -480,16 +480,29 @@ impl ProcessRuntime {
             outcome,
         }
     }
-    /// Activate all ordinary links bound to a cell in script order. Used by
-    /// both interaction and collecting a key or other linked object.
-    pub fn activate_links_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
+    /// Activate links of a given kind for a cell in script order.
+    /// Destroy links first unlock the referenced process, as described in the
+    /// bundled modding manual.
+    pub fn activate_at(&mut self, kind: &str, cell: [u8; 2]) -> Vec<ProcessEvent> {
         let ids: Vec<u16> = self
             .links
             .iter()
-            .filter(|link| link.kind == "link" && [link.x, link.y] == cell)
+            .filter(|link| link.kind == kind && [link.x, link.y] == cell)
             .map(|link| link.process)
             .collect();
-        ids.into_iter().map(|id| self.trigger(id)).collect()
+        ids.into_iter()
+            .map(|id| {
+                if kind == "destroy" {
+                    if let Some(process) = self.processes.get_mut(&id) {
+                        process.locked = false;
+                    }
+                }
+                self.trigger(id)
+            })
+            .collect()
+    }
+    pub fn activate_links_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
+        self.activate_at("link", cell)
     }
     /// Call after movement once per simulation step. `interact_pressed` must be
     /// true on the press edge only, not every frame while the key is held.

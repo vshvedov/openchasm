@@ -4,6 +4,7 @@ use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpact};
 use crate::game::GameInventory;
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
+use crate::object_combat::ObjectCombat;
 use crate::pickups::{Difficulty, PickupEvent};
 use crate::process_runtime::{ProcessOutcome, ProcessRuntime};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
@@ -35,6 +36,8 @@ pub struct SessionEvents {
     pub damage: u16,
     pub enemy_attacks: Vec<EnemyAttack>,
     pub projectile_impacts: Vec<Impact>,
+    /// Object cell and whether it was destroyed by this hit.
+    pub object_hits: Vec<([usize; 2], bool)>,
     /// Mission presentation/completion events produced during this step.
     pub mission: Vec<MissionEvent>,
 }
@@ -49,6 +52,7 @@ pub struct Session {
     pub ai: EnemyAi,
     pub selected_weapon: usize,
     pub projectiles: ProjectileSystem,
+    pub objects: Option<ObjectCombat>,
     pub mission: Option<MissionState>,
     combat: Combat,
     rockets: RocketDefinitions,
@@ -72,12 +76,18 @@ impl Session {
             ai,
             selected_weapon: 0,
             projectiles: ProjectileSystem::new(),
+            objects: None,
             mission: None,
             combat: Combat::new(),
             rockets: setup.rockets,
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Install shootable object state before taking the restart snapshot.
+    pub fn set_objects(&mut self, objects: ObjectCombat) {
+        self.objects = Some(objects);
+    }
+
     /// Attach a freshly parsed mission before taking the session's restart snapshot.
     pub fn set_mission(&mut self, plan: MissionPlan) {
         self.mission = Some(MissionState::new(plan));
@@ -118,21 +128,6 @@ impl Session {
             }
         }
         attempts.extend(self.processes.tick(&mut self.world, DT, input.interact));
-        if let Some(mission) = &mut self.mission {
-            for attempt in attempts {
-                match attempt.outcome {
-                    ProcessOutcome::Accepted => events
-                        .mission
-                        .extend(mission.attempt(attempt.process_id, true)),
-                    ProcessOutcome::Locked => events
-                        .mission
-                        .extend(mission.attempt(attempt.process_id, false)),
-                    ProcessOutcome::Unsupported
-                    | ProcessOutcome::Busy
-                    | ProcessOutcome::Missing => {}
-                }
-            }
-        }
         self.combat.tick(DT);
         if input.fire {
             let mut shot = self.combat.fire(
@@ -144,6 +139,7 @@ impl Session {
                     actors: &mut self.actors,
                     definitions: &self.actor_definitions,
                     world: &self.world,
+                    objects: self.objects.as_mut(),
                 },
                 |wall| {
                     self.shot_blocking
@@ -152,6 +148,26 @@ impl Session {
                         .unwrap_or(true)
                 },
             );
+            match shot {
+                FireResult::Fired(ShotImpact::Object {
+                    cell, destroyed, ..
+                }) => {
+                    if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
+                        attempts.extend(self.processes.activate_at("shoot", [x, y]));
+                        if destroyed {
+                            attempts.extend(self.processes.activate_at("destroy", [x, y]));
+                        }
+                    }
+                    events.object_hits.push((cell, destroyed));
+                }
+                FireResult::Fired(ShotImpact::Wall { wall_index, .. }) => {
+                    if let Some(cell) = self.world.walls.get(wall_index).and_then(|wall| wall.cell)
+                    {
+                        attempts.extend(self.processes.activate_at("shoot", cell));
+                    }
+                }
+                _ => {}
+            }
             if let FireResult::Fired(ShotImpact::Launch { rocket_id }) = shot {
                 let (sin, cos) = self.world.player.angle.sin_cos();
                 let launch = Launch {
@@ -176,6 +192,21 @@ impl Session {
                 self.ai.alert(source_index, self.world.player.position);
             }
             events.shot = Some(shot);
+        }
+        if let Some(mission) = &mut self.mission {
+            for attempt in attempts {
+                match attempt.outcome {
+                    ProcessOutcome::Accepted => events
+                        .mission
+                        .extend(mission.attempt(attempt.process_id, true)),
+                    ProcessOutcome::Locked => events
+                        .mission
+                        .extend(mission.attempt(attempt.process_id, false)),
+                    ProcessOutcome::Unsupported
+                    | ProcessOutcome::Busy
+                    | ProcessOutcome::Missing => {}
+                }
+            }
         }
         events.enemy_attacks = self.ai.tick_with_collision(
             &mut self.actors,
@@ -410,6 +441,70 @@ mod tests {
         assert_eq!(events.pickups.len(), 1);
         assert!(session.game.inventory.keys[1]);
         assert_eq!(events.mission, vec![MissionEvent::ShowMessage(1)]);
+    }
+    #[test]
+    fn destroying_a_linked_lock_unlocks_its_process_and_ends_level() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        let text = "#proc1\nLock\nEndDelay 0.05\n#end\n#links\ndestroy 1 0 1\n#end\n";
+        let mut session = mission_session(text);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "".into(),
+            power: 10,
+            raw_fields: vec![],
+        }]);
+        let definition = ObjectDefinition {
+            collision_radius: 32,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: 10,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "lock.3o".into(),
+            animation_name: None,
+        };
+        let placement = ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index: 0,
+            grid_cell: [1, 0],
+            position: [1.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        session.set_objects(ObjectCombat::new(
+            &[placement],
+            &ObjectDefinitions {
+                items: vec![],
+                level_objects: vec![definition],
+            },
+            &Script::parse(text),
+            Difficulty::Normal,
+        ));
+        let events = session.step(SessionInput {
+            fire: true,
+            ..SessionInput::default()
+        });
+        assert_eq!(events.object_hits, vec![([1, 0], true)]);
+        assert!(matches!(
+            events.shot,
+            Some(FireResult::Fired(ShotImpact::Object {
+                destroyed: true,
+                ..
+            }))
+        ));
+        let mut completed = false;
+        for _ in 0..10 {
+            completed |= session
+                .step(SessionInput::default())
+                .mission
+                .contains(&MissionEvent::LevelComplete);
+        }
+        assert!(completed);
     }
     #[test]
     fn session_fires_damages_enemies_and_consumes_ammunition() {

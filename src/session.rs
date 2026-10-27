@@ -314,6 +314,17 @@ fn object_blocks_height(
         .overlaps(raw, object.elevation_raw / 64.0, bottom, top)
 }
 
+/// Bounded committed process effects used to validate history-dependent grids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridJournalEntry {
+    Immediate { process_id: u16 },
+    WindActivate { process_id: u16 },
+    WindDeactivate { process_id: u16 },
+}
+const MAX_GRID_JOURNAL: usize = 4096;
+// Each rectangle is conservatively charged one full map regardless of area.
+const MAX_GRID_REPLAY_WORK: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Session {
     pub world: World,
@@ -342,6 +353,8 @@ pub struct Session {
     pending_light_errors: Vec<LightSourceError>,
     ambient: Option<AmbientGrid>,
     pending_wind_errors: Vec<WindError>,
+    grid_journal: Vec<GridJournalEntry>,
+    grid_journal_overflow: bool,
     /// Absolute offsets in original script units, indexed by wall index.
     pub wall_elevations: Vec<f32>,
     base_wall_blocking: Vec<bool>,
@@ -376,6 +389,7 @@ pub struct SessionSnapshot {
     pub mission: Option<crate::mission::MissionSnapshot>,
     pub hazards: crate::hazards::HazardsSnapshot,
     pub wind: crate::wind::WindSnapshot,
+    pub grid_journal: Vec<GridJournalEntry>,
     pub ambient: Option<crate::ambient::AmbientSnapshot>,
     pub teleport: Option<crate::teleport::TeleportSnapshot>,
     pub wall_elevations: Vec<f32>,
@@ -435,6 +449,9 @@ impl Session {
     ) -> Result<SessionSnapshot, SessionSnapshotError> {
         if !self.pending_wind_errors.is_empty() || !self.pending_light_errors.is_empty() {
             return Err(SessionSnapshotError::PendingEffects);
+        }
+        if self.grid_journal_overflow || !self.grid_journal_within_work_limit() {
+            return Err(SessionSnapshotError::Unverifiable("grid journal overflow"));
         }
         if self.light_sources.is_some() != self.processes.source_lights_enabled() {
             return Err(SessionSnapshotError::Inconsistent(
@@ -498,6 +515,7 @@ impl Session {
             mission: self.mission.as_ref().map(|m| m.snapshot()),
             hazards: self.hazards.snapshot(),
             wind: self.wind.snapshot(),
+            grid_journal: self.grid_journal.clone(),
             ambient: self.ambient.as_ref().map(|a| a.snapshot()),
             teleport: self.teleports.as_ref().map(|(_, state)| state.snapshot()),
             wall_elevations: self.wall_elevations.clone(),
@@ -584,29 +602,7 @@ impl Session {
         {
             return Err(SessionSnapshotError::Inconsistent("powerup state"));
         }
-        // Grids are history-dependent and current component snapshots cannot
-        // prove that arbitrary stored cells were authored by fired processes.
-        if snapshot
-            .wind
-            .cells
-            .iter()
-            .chain(&snapshot.wind.actor_cells)
-            .any(|v| *v != [0, 0])
-        {
-            return Err(SessionSnapshotError::Unverifiable("wind grid history"));
-        }
-        if snapshot.quake.as_ref()
-            != self
-                .scripted_objects
-                .as_ref()
-                .map(|s| s.quake.snapshot())
-                .as_ref()
-        {
-            return Err(SessionSnapshotError::Unverifiable("quake grid history"));
-        }
-        if snapshot.ambient.as_ref() != self.ambient.as_ref().map(|grid| grid.snapshot()).as_ref() {
-            return Err(SessionSnapshotError::Unverifiable("ambient grid history"));
-        }
+        self.validate_grid_journal(snapshot)?;
         if snapshot.selected_weapon as usize >= snapshot.inventory.weapons.len()
             || !snapshot.inventory.weapons[snapshot.selected_weapon as usize]
         {
@@ -738,6 +734,8 @@ impl Session {
             .hazards
             .restore(&snapshot.hazards)
             .map_err(|_| SessionSnapshotError::Component("hazards"))?;
+        candidate.grid_journal.clone_from(&snapshot.grid_journal);
+        candidate.grid_journal_overflow = false;
         candidate
             .wind
             .restore(&snapshot.wind)
@@ -916,6 +914,8 @@ impl Session {
             pending_light_errors: Vec::new(),
             ambient: None,
             pending_wind_errors: Vec::new(),
+            grid_journal: Vec::new(),
+            grid_journal_overflow: false,
             combat: Combat::new(),
             rockets: setup.rockets,
             shot_blocking: setup.shot_blocking,
@@ -1031,6 +1031,146 @@ impl Session {
             }
         }
     }
+    fn grid_journal_within_work_limit(&self) -> bool {
+        let mut rectangles = 0usize;
+        for entry in &self.grid_journal {
+            let count = match *entry {
+                GridJournalEntry::Immediate { process_id } => {
+                    match self.processes.journal_actions(process_id) {
+                        Some(actions) => actions
+                            .iter()
+                            .filter(|a| {
+                                matches!(a, ImmediateAction::Ambient(_) | ImmediateAction::Quake(_))
+                            })
+                            .count(),
+                        None => return false,
+                    }
+                }
+                GridJournalEntry::WindActivate { process_id }
+                | GridJournalEntry::WindDeactivate { process_id } => {
+                    match self.processes.journal_wind(process_id) {
+                        Some(zones) => zones.len(),
+                        None => return false,
+                    }
+                }
+            };
+            let Some(next) = rectangles.checked_add(count) else {
+                return false;
+            };
+            rectangles = next;
+            if rectangles > MAX_GRID_REPLAY_WORK / 4096 {
+                return false;
+            }
+        }
+        true
+    }
+    fn journal_checkpoint(&self) -> (usize, bool) {
+        (self.grid_journal.len(), self.grid_journal_overflow)
+    }
+    fn journal_rollback(&mut self, checkpoint: (usize, bool)) {
+        self.grid_journal.truncate(checkpoint.0);
+        self.grid_journal_overflow = checkpoint.1;
+    }
+    fn journal_push(&mut self, entry: GridJournalEntry) {
+        if self.grid_journal.len() < MAX_GRID_JOURNAL {
+            self.grid_journal.push(entry);
+        } else {
+            self.grid_journal_overflow = true;
+        }
+    }
+    /// Verify grid values and wind membership from authored operations, not
+    /// untrusted snapshot rectangles. This does not establish gameplay reachability.
+    fn validate_grid_journal(
+        &self,
+        snapshot: &SessionSnapshot,
+    ) -> Result<(), SessionSnapshotError> {
+        let invalid = || SessionSnapshotError::Unverifiable("grid journal");
+        if !self.grid_journal.is_empty()
+            || self.grid_journal_overflow
+            || snapshot.grid_journal.len() > MAX_GRID_JOURNAL
+        {
+            return Err(invalid());
+        }
+        let mut wind = self.wind.clone();
+        let mut ambient = self.ambient.clone();
+        let mut quake = self.scripted_objects.as_ref().map(|s| s.quake.clone());
+        let mut work = 0usize;
+        for entry in &snapshot.grid_journal {
+            match *entry {
+                GridJournalEntry::Immediate { process_id } => {
+                    let actions = self
+                        .processes
+                        .journal_actions(process_id)
+                        .ok_or_else(invalid)?;
+                    let mut found = false;
+                    for action in actions {
+                        match action {
+                            ImmediateAction::Quake(zone) => {
+                                work = work.checked_add(4096).ok_or_else(invalid)?;
+                                if work > MAX_GRID_REPLAY_WORK {
+                                    return Err(invalid());
+                                }
+                                quake
+                                    .as_mut()
+                                    .ok_or_else(invalid)?
+                                    .apply_batch(&[*zone])
+                                    .map_err(|_| invalid())?;
+                                found = true;
+                            }
+                            ImmediateAction::Ambient(region) => {
+                                work = work.checked_add(4096).ok_or_else(invalid)?;
+                                if work > MAX_GRID_REPLAY_WORK {
+                                    return Err(invalid());
+                                }
+                                ambient
+                                    .as_mut()
+                                    .ok_or_else(invalid)?
+                                    .apply(&[*region])
+                                    .map_err(|_| invalid())?;
+                                found = true;
+                            }
+                            ImmediateAction::Object(_) => {}
+                        }
+                    }
+                    if !found {
+                        return Err(invalid());
+                    }
+                }
+                GridJournalEntry::WindActivate { process_id } => {
+                    let zones = self
+                        .processes
+                        .journal_wind(process_id)
+                        .ok_or_else(invalid)?;
+                    work = work
+                        .checked_add(zones.len().checked_mul(4096).ok_or_else(invalid)?)
+                        .ok_or_else(invalid)?;
+                    if work > MAX_GRID_REPLAY_WORK {
+                        return Err(invalid());
+                    }
+                    wind.activate(process_id, zones).map_err(|_| invalid())?;
+                }
+                GridJournalEntry::WindDeactivate { process_id } => {
+                    let zones = self
+                        .processes
+                        .journal_wind(process_id)
+                        .ok_or_else(invalid)?;
+                    work = work
+                        .checked_add(zones.len().checked_mul(4096).ok_or_else(invalid)?)
+                        .ok_or_else(invalid)?;
+                    if work > MAX_GRID_REPLAY_WORK || !wind.deactivate(process_id) {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        if wind.snapshot() != snapshot.wind
+            || ambient.as_ref().map(AmbientGrid::snapshot) != snapshot.ambient
+            || quake.as_ref().map(QuakeField::snapshot) != snapshot.quake
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     /// Execute one prepared process. The bool in an error indicates a failure
     /// during external validation, rather than a denied runtime activation.
     fn try_staged_process(
@@ -1047,6 +1187,10 @@ impl Session {
         }
         .map_err(|outcome| (outcome, false))?;
         let delayed = prepared.is_delayed();
+        let grid_immediate = prepared
+            .actions()
+            .iter()
+            .any(|a| matches!(a, ImmediateAction::Ambient(_) | ImmediateAction::Quake(_)));
         let quakes: Vec<_> = prepared
             .actions()
             .iter()
@@ -1137,6 +1281,9 @@ impl Session {
         }
         events.object_transitions.extend(transitions);
         events.quake_changes.extend(quakes);
+        if grid_immediate {
+            self.journal_push(GridJournalEntry::Immediate { process_id: id });
+        }
         Ok(event)
     }
     /// Destroy-link group failure rolls back its already committed processes.
@@ -1158,6 +1305,7 @@ impl Session {
         let saved_scripted = self.scripted_objects.clone();
         let saved_objects = self.objects.clone();
         let saved_ambient = self.ambient.clone();
+        let saved_journal = self.journal_checkpoint();
         let replacement_start = events.object_transitions.len();
         let destruction_start = events.object_destructions.len();
         let quake_start = events.quake_changes.len();
@@ -1178,6 +1326,7 @@ impl Session {
                     self.scripted_objects = saved_scripted;
                     self.objects = saved_objects;
                     self.ambient = saved_ambient;
+                    self.journal_rollback(saved_journal);
                     events.object_transitions.truncate(replacement_start);
                     events.object_destructions.truncate(destruction_start);
                     events.quake_changes.truncate(quake_start);
@@ -1676,12 +1825,19 @@ impl Session {
             self.hazards.apply_effect(effect);
             match effect {
                 ProcessEffect::WindActivated { process_id, zones } => {
-                    if let Err(error) = self.wind.activate(*process_id, zones) {
-                        self.pending_wind_errors.push(error);
+                    match self.wind.activate(*process_id, zones) {
+                        Ok(()) => self.journal_push(GridJournalEntry::WindActivate {
+                            process_id: *process_id,
+                        }),
+                        Err(error) => self.pending_wind_errors.push(error),
                     }
                 }
                 ProcessEffect::WindDeactivated { process_id } => {
-                    self.wind.deactivate(*process_id);
+                    if self.wind.deactivate(*process_id) {
+                        self.journal_push(GridJournalEntry::WindDeactivate {
+                            process_id: *process_id,
+                        });
+                    }
                 }
                 ProcessEffect::SourceLightsActivated {
                     process_id,
@@ -2010,6 +2166,7 @@ impl Session {
                     self.objects.clone(),
                     self.scripted_objects.clone(),
                     self.ambient.clone(),
+                    self.journal_checkpoint(),
                 ))
             }
         } else {
@@ -2056,12 +2213,13 @@ impl Session {
             }
         }
         if pickup_failed {
-            if let Some((game, processes, objects, scripted, ambient)) = pickup_backup {
+            if let Some((game, processes, objects, scripted, ambient, journal)) = pickup_backup {
                 self.game = game;
                 self.processes = processes;
                 self.objects = objects;
                 self.scripted_objects = scripted;
                 self.ambient = ambient;
+                self.journal_rollback(journal);
             }
             events.pickups.clear();
             events.object_transitions.clear();
@@ -2113,6 +2271,7 @@ impl Session {
             let object_before_hit = self.scripted_objects.as_ref().and(self.objects.clone());
             let scripted_before_hit = self.scripted_objects.clone();
             let ambient_before_hit = self.ambient.clone();
+            let journal_before_hit = self.journal_checkpoint();
             let processes_before_hit = self
                 .scripted_objects
                 .as_ref()
@@ -2211,6 +2370,7 @@ impl Session {
                                 self.objects = object_before_hit;
                                 self.scripted_objects = scripted_before_hit;
                                 self.ambient = ambient_before_hit;
+                                self.journal_rollback(journal_before_hit);
                                 if let Some(processes) = processes_before_hit {
                                     self.processes = processes;
                                 }
@@ -2534,6 +2694,7 @@ impl Session {
                         self.scripted_objects.as_ref().and(self.objects.clone());
                     let scripted_before_hit = self.scripted_objects.clone();
                     let ambient_before_hit = self.ambient.clone();
+                    let journal_before_hit = self.journal_checkpoint();
                     let processes_before_hit = self
                         .scripted_objects
                         .as_ref()
@@ -2579,6 +2740,7 @@ impl Session {
                                         self.objects = object_before_hit;
                                         self.scripted_objects = scripted_before_hit;
                                         self.ambient = ambient_before_hit;
+                                        self.journal_rollback(journal_before_hit);
                                         if let Some(processes) = processes_before_hit {
                                             self.processes = processes;
                                         }
@@ -2787,7 +2949,7 @@ mod tests {
         invalid.wind.cells[0] = [1, 0];
         assert_eq!(
             baseline.restore_from_baseline(&invalid, digest).err(),
-            Some(SessionSnapshotError::Unverifiable("wind grid history"))
+            Some(SessionSnapshotError::Unverifiable("grid journal"))
         );
         invalid = snapshot.clone();
         invalid.capabilities.explosions = !invalid.capabilities.explosions;
@@ -2864,6 +3026,63 @@ mod tests {
             assert_eq!(source.ambient_grid(), restored.ambient_grid());
         }
         assert_eq!(restored.ambient_grid().unwrap().cell([0, 0]), Some(5));
+        let committed = restored.snapshot(digest).unwrap();
+        assert_eq!(
+            baseline
+                .restore_from_baseline(&committed, digest)
+                .unwrap()
+                .snapshot(digest)
+                .unwrap(),
+            committed
+        );
+    }
+
+    #[test]
+    fn grid_journal_restores_ordered_overlapping_authored_effects_and_rejects_forgery() {
+        let text = "#proc1\n#action\nambient 0 0 2 2 5\nambient 1 1 3 3 7\nquake 0 0 2 2 30\nquake 1 1 2 2 70\n#end\n#proc2\n#action\nnonstop\nwind 0 0 3 3 20 0\n#end\n#proc3\n#action\nnonstop\nwind 1 1 4 4 0 30 1\n#end\n#proc4\n#action\nlock 2\n#end\n#links\nlink 0 0 1\nlink 0 0 2\nlink 0 0 3\nlink 0 0 4\n#end\n";
+        let mut baseline = ambient_session(text);
+        baseline.scripted_objects.as_mut().unwrap().quake_enabled = true;
+        let mut source = baseline.clone();
+        let digest = crate::save_format::ContentDigest([21; 32]);
+        for id in [1, 2, 3, 4] {
+            source
+                .try_staged_process("link", [0, 0], id, &mut SessionEvents::default())
+                .unwrap();
+            source.apply_process_effects();
+        }
+        assert_eq!(source.wind.cell([1, 1]), Some([0, 0]));
+        assert_eq!(source.ambient_grid().unwrap().cell([1, 1]), Some(7));
+        assert_eq!(
+            source.scripted_objects.as_ref().unwrap().quake.cell([1, 1]),
+            Some(70)
+        );
+        let snapshot = source.snapshot(digest).unwrap();
+        let restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
+        assert!(snapshot.grid_journal.len() >= 4);
+        let mut forged = snapshot.clone();
+        forged.wind.cells[0] = [100, 0];
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.grid_journal[0] = GridJournalEntry::Immediate { process_id: 999 };
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged
+            .grid_journal
+            .push(GridJournalEntry::WindActivate { process_id: 3 });
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.ambient.as_mut().unwrap().cells[0] = 42;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.quake.as_mut().unwrap().cells[0] = 999;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.grid_journal.resize(
+            MAX_GRID_JOURNAL + 1,
+            GridJournalEntry::Immediate { process_id: 1 },
+        );
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
     }
 
     #[test]
@@ -2981,6 +3200,7 @@ mod tests {
             .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
             .is_ok());
         assert_eq!(session.ambient.as_ref().unwrap(), &before);
+        assert!(session.grid_journal.is_empty());
         assert_eq!(
             session.processes.activate_at("link", [3, 0])[0].outcome,
             ProcessOutcome::Locked
@@ -2996,6 +3216,7 @@ mod tests {
                 .any(|event| event.process_id == 1 && event.outcome == ProcessOutcome::Unsupported);
         }
         assert!(blocked);
+        assert!(session.grid_journal.is_empty());
         assert_eq!(session.processes.ready_delayed(), vec![1]);
         assert_eq!(
             session.processes.activate_at("link", [3, 0])[0].outcome,
@@ -3007,6 +3228,10 @@ mod tests {
         session.step(SessionInput::default());
         restored.step(SessionInput::default());
         assert_eq!(session.ambient_grid().unwrap().cell([0, 0]), Some(5));
+        assert_eq!(
+            session.grid_journal,
+            vec![GridJournalEntry::Immediate { process_id: 1 }]
+        );
         assert_eq!(session.ambient, restored.ambient);
         assert!(session.processes.ready_delayed().is_empty());
         assert_ne!(
@@ -3024,6 +3249,7 @@ mod tests {
         let before = session.ambient_grid().unwrap().clone();
         let (_, accepted) = session.activate_destroy([1, 1], &mut SessionEvents::default());
         assert!(!accepted);
+        assert!(session.grid_journal.is_empty());
         assert_eq!(session.ambient_grid().unwrap(), &before);
         assert_eq!(
             session.processes.activate_at("link", [0, 0])[0].outcome,

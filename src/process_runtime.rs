@@ -1549,6 +1549,19 @@ impl ProcessRuntime {
         }
         Ok(())
     }
+    /// Trusted commands compiled from the fingerprint-verified level script.
+    pub(crate) fn journal_actions(&self, id: u16) -> Option<&[ImmediateAction]> {
+        self.processes
+            .get(&id)
+            .filter(|p| p.supported)
+            .map(|p| p.immediate_actions.as_slice())
+    }
+    pub(crate) fn journal_wind(&self, id: u16) -> Option<&[WindZone]> {
+        self.processes
+            .get(&id)
+            .filter(|p| p.supported && !p.wind_zones.is_empty())
+            .map(|p| p.wind_zones.as_slice())
+    }
     /// Validate host hazard/wind memberships and zones against compiled script
     /// state. This does not reconstruct the history-dependent wind grids.
     pub fn snapshot_effects_match(

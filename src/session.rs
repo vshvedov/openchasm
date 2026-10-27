@@ -3419,7 +3419,7 @@ mod tests {
         )
         .unwrap();
         let definition = ObjectDefinition {
-            collision_radius: 0,
+            collision_radius: 32,
             shadow: 0,
             bmp_object: -1,
             bmp_z: 0,

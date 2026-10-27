@@ -135,6 +135,98 @@ fn clear_held_controls(
     *accumulator = 0.0;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PauseAction {
+    Resume,
+    Save,
+    Load,
+    Restart,
+    Exit,
+}
+
+#[derive(Default)]
+struct PauseMenu {
+    open: bool,
+    selected: usize,
+    confirm: Option<PauseAction>,
+}
+impl PauseMenu {
+    fn show(&mut self, confirm: Option<PauseAction>) {
+        self.open = true;
+        self.confirm = confirm;
+        self.selected = 0;
+    }
+    fn key(&mut self, code: Scancode) -> Option<PauseAction> {
+        if let Some(action) = self.confirm {
+            match code {
+                Scancode::Escape => self.confirm = None,
+                Scancode::Return => {
+                    self.confirm = None;
+                    return Some(action);
+                }
+                _ => {}
+            }
+            return None;
+        }
+        match code {
+            Scancode::Escape => return Some(PauseAction::Resume),
+            Scancode::Up => self.selected = (self.selected + 4) % 5,
+            Scancode::Down => self.selected = (self.selected + 1) % 5,
+            Scancode::F5 => return Some(PauseAction::Save),
+            Scancode::F9 => return Some(PauseAction::Load),
+            Scancode::Return => match self.selected {
+                0 => return Some(PauseAction::Resume),
+                1 => return Some(PauseAction::Save),
+                2 => return Some(PauseAction::Load),
+                3 => self.confirm = Some(PauseAction::Restart),
+                _ => self.confirm = Some(PauseAction::Exit),
+            },
+            _ => {}
+        }
+        None
+    }
+}
+
+fn draw_pause_menu(frame: &mut [u32], menu: &PauseMenu) {
+    for y in 85..315 {
+        for x in 125..515 {
+            frame[y * WIDTH + x] = 0x101820;
+        }
+    }
+    text(frame, 155, 100, "PAUSED");
+    if let Some(action) = menu.confirm {
+        let question = if action == PauseAction::Restart {
+            "RESTART LEVEL?"
+        } else {
+            "EXIT LEVEL?"
+        };
+        text(frame, 155, 145, question);
+        text(frame, 155, 165, "UNSAVED PROGRESS MAY BE LOST");
+        text(frame, 155, 185, "ENTER CONFIRMS   ESC CANCELS");
+    } else {
+        for (index, label) in [
+            "RESUME",
+            "MEMORY QUICK SAVE",
+            "MEMORY QUICK LOAD",
+            "RESTART LEVEL",
+            "EXIT LEVEL",
+        ]
+        .iter()
+        .enumerate()
+        {
+            text(
+                frame,
+                155,
+                130 + index * 25,
+                if menu.selected == index { ">" } else { " " },
+            );
+            text(frame, 175, 130 + index * 25, label);
+        }
+        text(frame, 155, 280, "CHECKPOINT IS MEMORY ONLY");
+        text(frame, 155, 295, "UP/DOWN  ENTER  ESC TO RESUME");
+    }
+}
+
 fn fire_feedback(result: Option<FireResult>) -> Option<&'static str> {
     match result {
         Some(FireResult::OutOfAmmo) => Some("OUT OF AMMO"),
@@ -430,7 +522,7 @@ fn draw_header(frame: &mut [u32], label: &str) {
         frame,
         8,
         32,
-        "PREVIEW: F5 QUICKSAVE  F9 QUICKLOAD  R RESTART  ESC QUIT",
+        "PREVIEW: F5 QUICKSAVE  F9 QUICKLOAD  R RESTART  ESC PAUSE",
     );
 }
 
@@ -627,6 +719,7 @@ pub fn run(
     let mut quicksave: Option<QuickSave> = None;
     let mut checkpoint_notice: Option<(&'static str, f32)> = None;
     let mut completed = false;
+    let mut pause = PauseMenu::default();
     let number_keys = [
         Scancode::Num1,
         Scancode::Num2,
@@ -643,30 +736,103 @@ pub fn run(
         let mut restart_requested = false;
         let mut advance_requested = false;
         let mut checkpoint_command = None;
+        let mut suppress_gameplay = false;
         for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. } => running = false,
-                Event::Window {
-                    win_event: WindowEvent::Close,
-                    ..
-                } => running = false,
-                Event::Window {
-                    win_event: WindowEvent::FocusGained,
-                    ..
-                } => look.set_focus(true),
+            if matches!(
+                event,
+                Event::Quit { .. }
+                    | Event::Window {
+                        win_event: WindowEvent::Close,
+                        ..
+                    }
+            ) {
+                pause.show(Some(PauseAction::Exit));
+                sdl.mouse().set_relative_mouse_mode(false);
+                look.captured = false;
+                clear_held_controls(&mut held, &mut mouse_fire, &mut look, &mut accumulator);
+                pending_interact = false;
+                pending_jump = false;
+                pending_weapon = None;
+                advance_requested = false;
+                frame_clock.rebase(Instant::now());
+                suppress_gameplay = true;
+                continue;
+            }
+            if matches!(
+                event,
                 Event::Window {
                     win_event: WindowEvent::FocusLost,
                     ..
-                } => {
-                    look.set_focus(false);
-                    sdl.mouse().set_relative_mouse_mode(false);
-                    held.clear();
-                    mouse_fire = false;
-                    pending_interact = false;
-                    pending_jump = false;
-                    pending_weapon = None;
-                    accumulator = 0.0;
                 }
+            ) {
+                look.set_focus(false);
+                if !pause.open {
+                    pause.show(None);
+                }
+                sdl.mouse().set_relative_mouse_mode(false);
+                clear_held_controls(&mut held, &mut mouse_fire, &mut look, &mut accumulator);
+                pending_interact = false;
+                pending_jump = false;
+                pending_weapon = None;
+                advance_requested = false;
+                frame_clock.rebase(Instant::now());
+                suppress_gameplay = true;
+                continue;
+            }
+            if matches!(
+                event,
+                Event::Window {
+                    win_event: WindowEvent::FocusGained,
+                    ..
+                }
+            ) {
+                look.set_focus(true);
+                continue;
+            }
+            if pause.open {
+                if suppress_gameplay {
+                    continue;
+                }
+                if let Event::KeyDown {
+                    scancode: Some(code),
+                    repeat: false,
+                    ..
+                } = event
+                {
+                    if look.focused {
+                        match pause.key(code) {
+                            Some(PauseAction::Resume) => {
+                                pause.open = false;
+                                clear_held_controls(
+                                    &mut held,
+                                    &mut mouse_fire,
+                                    &mut look,
+                                    &mut accumulator,
+                                );
+                                pending_interact = false;
+                                pending_jump = false;
+                                pending_weapon = None;
+                                frame_clock.rebase(Instant::now());
+                                suppress_gameplay = true;
+                            }
+                            Some(PauseAction::Save) => {
+                                checkpoint_command = Some(CheckpointCommand::Save)
+                            }
+                            Some(PauseAction::Load) => {
+                                checkpoint_command = Some(CheckpointCommand::Load)
+                            }
+                            Some(PauseAction::Restart) => restart_requested = true,
+                            Some(PauseAction::Exit) => running = false,
+                            None => {}
+                        }
+                    }
+                }
+                continue;
+            }
+            if suppress_gameplay {
+                continue;
+            }
+            match event {
                 Event::KeyDown {
                     scancode: Some(code),
                     repeat,
@@ -674,10 +840,22 @@ pub fn run(
                 } if look.focused => {
                     if !repeat {
                         held.insert(code);
-                        if code == Scancode::Escape {
-                            running = false;
-                        } else if code == Scancode::R {
-                            restart_requested = true;
+                        if matches!(code, Scancode::Escape | Scancode::R) {
+                            pause.show((code == Scancode::R).then_some(PauseAction::Restart));
+                            sdl.mouse().set_relative_mouse_mode(false);
+                            look.captured = false;
+                            clear_held_controls(
+                                &mut held,
+                                &mut mouse_fire,
+                                &mut look,
+                                &mut accumulator,
+                            );
+                            pending_interact = false;
+                            pending_jump = false;
+                            pending_weapon = None;
+                            advance_requested = false;
+                            frame_clock.rebase(Instant::now());
+                            suppress_gameplay = true;
                         } else if code == Scancode::Return {
                             advance_requested = true;
                         } else if code == Scancode::F5 {
@@ -745,8 +923,11 @@ pub fn run(
         if !running {
             break;
         }
-        let elapsed = frame_clock.sample(Instant::now(), look.focused);
-        if look.focused {
+        let elapsed = frame_clock.sample(
+            Instant::now(),
+            look.focused && !pause.open && !suppress_gameplay,
+        );
+        if look.focused && !pause.open && !suppress_gameplay {
             accumulator += elapsed;
         } else {
             accumulator = 0.0;
@@ -837,7 +1018,7 @@ pub fn run(
                 }
             }
         }
-        if completed && advance_requested {
+        if completed && advance_requested && !pause.open {
             sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
         }
@@ -1142,7 +1323,9 @@ pub fn run(
                 "YOU DIED - R TO RESTART",
             );
         }
-        if !look.focused {
+        if pause.open {
+            draw_pause_menu(&mut frame, &pause);
+        } else if !look.focused {
             text(&mut frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
         } else if !look.captured {
             text(&mut frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
@@ -1168,6 +1351,25 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pause_menu_navigation_confirm_and_checkpoint_shortcuts() {
+        let mut menu = PauseMenu::default();
+        menu.show(None);
+        assert_eq!(menu.key(Scancode::F5), Some(PauseAction::Save));
+        assert_eq!(menu.key(Scancode::F9), Some(PauseAction::Load));
+        assert_eq!(menu.key(Scancode::W), None);
+        menu.key(Scancode::Up);
+        assert_eq!(menu.selected, 4);
+        assert_eq!(menu.key(Scancode::Return), None);
+        assert_eq!(menu.confirm, Some(PauseAction::Exit));
+        assert_eq!(menu.key(Scancode::F5), None);
+        assert_eq!(menu.key(Scancode::Escape), None);
+        assert_eq!(menu.confirm, None);
+        menu.selected = 3;
+        menu.key(Scancode::Return);
+        assert_eq!(menu.key(Scancode::Return), Some(PauseAction::Restart));
+        assert_eq!(menu.key(Scancode::Escape), Some(PauseAction::Resume));
+    }
     use crate::world::{Player, Wall};
 
     #[test]

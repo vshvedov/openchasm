@@ -50,6 +50,7 @@ impl RocketMesh {
 pub struct ProjectileRenderer {
     /// Indexed by RocketDefinitions entry; empty instant shots have no model.
     rocket_models: Vec<Option<usize>>,
+    fullbright: Vec<bool>,
     models: Vec<RocketMesh>,
     palette: [u32; 256],
 }
@@ -140,6 +141,11 @@ impl ProjectileRenderer {
         });
         Self {
             rocket_models,
+            fullbright: rockets
+                .0
+                .iter()
+                .map(|r| r.raw_fields.get(6).copied().unwrap_or(0) != 0)
+                .collect(),
             models,
             palette,
         }
@@ -231,6 +237,10 @@ impl ProjectileRenderer {
                         ],
                         &mesh.model,
                         polygon.flags,
+                        self.fullbright
+                            .get(projectile.rocket_type)
+                            .copied()
+                            .unwrap_or(false),
                     );
                 }
             }
@@ -305,7 +315,7 @@ struct Raster<'a> {
     palette: &'a [u32; 256],
 }
 impl Raster<'_> {
-    fn triangle(&mut self, triangle: [Projected; 3], model: &Model, flags: u8) {
+    fn triangle(&mut self, triangle: [Projected; 3], model: &Model, flags: u8, fullbright: bool) {
         let [a, b, c] = triangle;
         let area = edge(a, b, c.x, c.y);
         if area.abs() < 0.00001 || model.skin_height == 0 {
@@ -342,7 +352,11 @@ impl Raster<'_> {
                     continue;
                 }
                 let rgb = self.palette[index as usize];
-                let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
+                let attenuation = if fullbright {
+                    1.0
+                } else {
+                    (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0)
+                };
                 let channel = |c: u32| (c as f32 * attenuation) as u32;
                 self.frame[pixel] = (channel((rgb >> 16) & 255) << 16)
                     | (channel((rgb >> 8) & 255) << 8)
@@ -473,8 +487,12 @@ mod tests {
         let rockets = RocketDefinitions::parse(&resources.read("chasm.inf").unwrap()).unwrap();
         assert_eq!(rockets.0[0].animation_name, "disk.ani");
         assert_eq!(rockets.0[6].animation_name, "3arow_.ani");
+        assert_eq!(rockets.0[4].raw_fields[6], 1);
+        assert_eq!(rockets.0[0].raw_fields[6], 0);
         let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
         let renderer = ProjectileRenderer::load(&mut resources, &rockets, &palette);
+        assert!(renderer.fullbright[4]);
+        assert!(!renderer.fullbright[0]);
         let mesh = &renderer.models[renderer.rocket_models[0].unwrap()];
         assert!(mesh.animation.as_ref().unwrap().frames.len() > 1);
         assert_ne!(mesh.vertices(0.0), mesh.vertices(1.0 / 18.0));
@@ -502,12 +520,48 @@ mod tests {
         palette[1] = 0xff0000;
         ProjectileRenderer {
             rocket_models: vec![Some(0), None],
+            fullbright: vec![false, false],
             models: vec![RocketMesh {
                 model,
                 animation: None,
             }],
             palette,
         }
+    }
+    #[test]
+    fn fullbright_projectile_keeps_color_and_obeys_depth() {
+        let mut renderer = renderer();
+        renderer.rocket_models.push(Some(0));
+        renderer.fullbright.push(true);
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [3.0, 0.0, 1.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        let mut frame = vec![0; 64 * 64];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        let pixel = frame.iter().position(|&color| color != 0).unwrap();
+        assert!(frame[pixel] < 0xff0000);
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        shot.rocket_type = 2;
+        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        assert_eq!(frame[pixel], 0xff0000);
+        frame.fill(0);
+        depth.fill(1.0);
+        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        assert!(frame.iter().all(|&color| color == 0));
     }
     #[test]
     fn projectile_uses_world_depth_and_ignores_instant_or_invalid_types() {

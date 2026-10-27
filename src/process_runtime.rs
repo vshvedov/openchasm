@@ -3347,7 +3347,7 @@ mod tests {
         due.stage_wall_transitions(&[t]).unwrap();
         assert_eq!(due.commit().outcome, ProcessOutcome::Accepted);
         assert_eq!(runtime.cell_type([1, 0]), Some(5));
-        world.walls.push(world.walls[0].clone());
+        world.walls.push(world.walls[0]);
         let mut ambiguous = ProcessRuntime::with_wall_changes(
             &script,
             &world,

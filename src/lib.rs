@@ -5,6 +5,7 @@ pub mod light_sources;
 pub mod map;
 pub mod model;
 pub mod monster;
+pub mod movement;
 pub mod objects;
 pub mod process;
 pub mod process_runtime;

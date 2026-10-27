@@ -335,12 +335,24 @@ fn move_and_slide(
 }
 
 fn move_circle_and_slide(
+    position: [f32; 2],
+    displacement: [f32; 2],
+    radius: f32,
+    walls: &[Wall],
+    circles: &[CollisionCircle],
+    policy: WallSidePolicy<'_>,
+) -> [f32; 2] {
+    move_circle_and_slide_tracked(position, displacement, radius, walls, circles, policy, None)
+}
+
+fn move_circle_and_slide_tracked(
     mut position: [f32; 2],
     mut displacement: [f32; 2],
     radius: f32,
     walls: &[Wall],
     circles: &[CollisionCircle],
     policy: WallSidePolicy<'_>,
+    mut velocity: Option<&mut [f32; 2]>,
 ) -> [f32; 2] {
     // Multiple contacts let a disc slide along walls and stop at corners.
     for _ in 0..4 {
@@ -376,6 +388,9 @@ fn move_circle_and_slide(
         let remaining = scale(displacement, 1.0 - time);
         // Remove only the component directed into the contact surface.
         displacement = sub(remaining, scale(normal, dot(remaining, normal).min(0.0)));
+        if let Some(velocity) = velocity.as_deref_mut() {
+            *velocity = sub(*velocity, scale(normal, dot(*velocity, normal).min(0.0)));
+        }
     }
     position
 }
@@ -520,6 +535,49 @@ impl World {
             },
         )
     }
+    /// Sweep a kinematic move and clip persistent velocity at the same contacts.
+    /// External displacement (wind/platform motion) is supplied separately from
+    /// player velocity, so it does not become momentum after the move.
+    /// Some(mask) applies authored sidedness only to proven static walls.
+    pub fn move_circle_with_velocity(
+        &self,
+        position: [f32; 2],
+        displacement: [f32; 2],
+        mut velocity: [f32; 2],
+        radius: f32,
+        circles: &[CollisionCircle],
+        static_wall_mask: Option<&[bool]>,
+    ) -> ([f32; 2], [f32; 2]) {
+        if !position
+            .iter()
+            .chain(displacement.iter())
+            .chain(velocity.iter())
+            .all(|value| value.is_finite())
+            || !radius.is_finite()
+            || radius <= 0.0
+        {
+            return (position, [0.0; 2]);
+        }
+        let policy = WallSidePolicy {
+            mode: if static_wall_mask.is_some() {
+                WallCollisionMode::AuthoredSides
+            } else {
+                WallCollisionMode::TwoSided
+            },
+            static_walls: static_wall_mask,
+        };
+        let position = move_circle_and_slide_tracked(
+            position,
+            displacement,
+            radius,
+            &self.walls,
+            circles,
+            policy,
+            Some(&mut velocity),
+        );
+        (position, velocity)
+    }
+
     fn move_circle_with_policy(
         &self,
         position: [f32; 2],
@@ -657,6 +715,37 @@ impl World {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn swept_contacts_clip_momentum_without_using_traveled_distance() {
+        let world = super::World {
+            player: super::Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            walls: vec![super::Wall {
+                a: [1.0, -5.0],
+                b: [1.0, 5.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: None,
+            }],
+        };
+        let (position, velocity) =
+            world.move_circle_with_velocity([0.0, 0.0], [1.0, 0.25], [5.0, 1.25], 0.18, &[], None);
+        assert!((position[0] - 0.82).abs() < 0.001);
+        assert!((position[1] - 0.25).abs() < 0.001);
+        assert!(
+            velocity[0].abs() < 1e-6,
+            "late wall contact must cancel inward velocity"
+        );
+        assert!(
+            (velocity[1] - 1.25).abs() < 1e-6,
+            "tangential velocity is retained"
+        );
+        let expected = world.move_circle([0.0, 0.0], [1.0, 0.25], 0.18, &[]);
+        assert_eq!(position, expected);
+    }
+
     use super::*;
     #[test]
     fn snapshot_restores_dynamic_geometry_and_rejects_bad_identity_atomically() {

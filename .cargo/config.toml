@@ -2,3 +2,7 @@
 # Audio is handled separately by rodio; avoid the unused SDL backend.
 [env]
 SDL2_TOOLCHAIN = { value = "build/sdl2-toolchain.cmake", relative = true }
+# Bundled SDL2 declares a pre-3.5 policy version. CMake 4 removed those
+# compatibility policies; initialize its supported third-party override before
+# SDL's top-level cmake_minimum_required (which runs before the toolchain).
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

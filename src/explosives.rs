@@ -4,7 +4,8 @@
 //! applies returned damage once. No wall occlusion, scoring or chained object
 //! destruction is inferred here. Mine constants follow an uncalibrated local
 //! reconstruction and should be validated against the original game.
-use crate::projectiles::Owner;
+use crate::actors::ActorState;
+use crate::projectiles::{Owner, OwnerSnapshot};
 use std::collections::BTreeSet;
 
 const MAX_COORD: f32 = 4096.0;
@@ -162,7 +163,91 @@ pub struct MineSystem {
     mines: Vec<Mine>,
     next_id: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MineSnapshot {
+    pub id: u64,
+    pub owner: OwnerSnapshot,
+    pub position: [f32; 3],
+    pub age_ticks: u32,
+    pub armed: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct MineSystemSnapshot {
+    pub next_id: u64,
+    pub mines: Vec<MineSnapshot>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MineSnapshotError {
+    Capacity,
+    IdOutOfRange,
+    DuplicateId,
+    InvalidOwner,
+    InvalidPosition,
+    InvalidLifecycle,
+}
 impl MineSystem {
+    pub fn snapshot(&self) -> Result<MineSystemSnapshot, MineSnapshotError> {
+        let mut mines = Vec::with_capacity(self.mines.len());
+        for mine in &self.mines {
+            mines.push(MineSnapshot {
+                id: mine.id,
+                owner: OwnerSnapshot::from_owner(mine.owner)
+                    .ok_or(MineSnapshotError::InvalidOwner)?,
+                position: mine.position,
+                age_ticks: mine.age_ticks,
+                armed: mine.armed,
+            });
+        }
+        Ok(MineSystemSnapshot {
+            next_id: self.next_id,
+            mines,
+        })
+    }
+    /// Validate IDs, actors, positions and lifecycle before publishing state.
+    pub fn restore(
+        &mut self,
+        value: &MineSystemSnapshot,
+        actors: &ActorState,
+    ) -> Result<(), MineSnapshotError> {
+        if value.mines.len() > MAX_MINES {
+            return Err(MineSnapshotError::Capacity);
+        }
+        let mut ids = BTreeSet::new();
+        let mut mines = Vec::with_capacity(value.mines.len());
+        for mine in &value.mines {
+            if mine.id >= value.next_id {
+                return Err(MineSnapshotError::IdOutOfRange);
+            }
+            if !ids.insert(mine.id) {
+                return Err(MineSnapshotError::DuplicateId);
+            }
+            let owner = mine
+                .owner
+                .resolve(actors)
+                .ok_or(MineSnapshotError::InvalidOwner)?;
+            if !mine.position.into_iter().all(valid_scalar)
+                || !(0.0..64.0).contains(&mine.position[0])
+                || !(0.0..64.0).contains(&mine.position[1])
+            {
+                return Err(MineSnapshotError::InvalidPosition);
+            }
+            if mine.age_ticks > MINE_EXPIRE_TICKS
+                || mine.armed != (mine.age_ticks >= MINE_ARM_TICKS)
+            {
+                return Err(MineSnapshotError::InvalidLifecycle);
+            }
+            mines.push(Mine {
+                id: mine.id,
+                owner,
+                position: mine.position,
+                age_ticks: mine.age_ticks,
+                armed: mine.armed,
+            });
+        }
+        self.mines = mines;
+        self.next_id = value.next_id;
+        Ok(())
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -254,6 +339,78 @@ impl MineSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mine_snapshot_preserves_lifecycle_ids_and_validates_atomically() {
+        let actors = ActorState {
+            player_spawns: vec![],
+            actors: vec![],
+            unresolved: vec![],
+        };
+        let mut source = MineSystem::new();
+        source.plant(Owner::Player, [3.0, 4.0, 0.0]).unwrap();
+        for _ in 0..MINE_ARM_TICKS {
+            source.tick(&[]).unwrap();
+        }
+        source.plant(Owner::Player, [4.0, 4.0, 0.0]).unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let mut restored = MineSystem::new();
+        restored.restore(&snapshot, &actors).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        let mut invalid = snapshot.clone();
+        invalid.mines[1].id = invalid.mines[0].id;
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::DuplicateId)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        invalid = snapshot.clone();
+        invalid.mines[0].armed = false;
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::InvalidLifecycle)
+        );
+        invalid = snapshot.clone();
+        invalid.mines[0].position[0] = f32::NAN;
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::InvalidPosition)
+        );
+        invalid = snapshot.clone();
+        invalid.mines[0].owner = OwnerSnapshot::Enemy { source_index: 99 };
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::InvalidOwner)
+        );
+        invalid = snapshot.clone();
+        invalid.next_id = 1;
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::IdOutOfRange)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        invalid = snapshot.clone();
+        invalid.mines[0].age_ticks = MINE_EXPIRE_TICKS + 1;
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::InvalidLifecycle)
+        );
+        invalid = snapshot.clone();
+        invalid.mines.resize(MAX_MINES + 1, invalid.mines[0]);
+        assert_eq!(
+            restored.restore(&invalid, &actors),
+            Err(MineSnapshotError::Capacity)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        assert!(matches!(
+            restored.plant(Owner::Player, [5.0, 4.0, 0.0]).unwrap(),
+            MineEvent::Placed(Mine { id: 2, .. })
+        ));
+        assert_eq!(source.tick(&[]).unwrap(), {
+            let mut same = MineSystem::new();
+            same.restore(&snapshot, &actors).unwrap();
+            same.tick(&[]).unwrap()
+        });
+    }
     fn cylinder(x: f32, radius: f32, bottom: f32, top: f32) -> Cylinder {
         Cylinder {
             center: [x, 0.0],

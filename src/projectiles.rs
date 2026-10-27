@@ -25,6 +25,35 @@ pub enum Owner {
     },
 }
 
+/// Portable owner identity; enemy IDs refer to authored actor placements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerSnapshot {
+    Player,
+    Enemy { source_index: u32 },
+}
+impl OwnerSnapshot {
+    pub(crate) fn from_owner(owner: Owner) -> Option<Self> {
+        match owner {
+            Owner::Player => Some(Self::Player),
+            Owner::Enemy { source_index } => Some(Self::Enemy {
+                source_index: u32::try_from(source_index).ok()?,
+            }),
+        }
+    }
+    pub(crate) fn resolve(self, actors: &ActorState) -> Option<Owner> {
+        match self {
+            Self::Player => Some(Owner::Player),
+            Self::Enemy { source_index } => actors
+                .actors
+                .iter()
+                .any(|a| a.source_index == source_index as usize)
+                .then_some(Owner::Enemy {
+                    source_index: source_index as usize,
+                }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Launch {
     pub owner: Owner,
@@ -90,6 +119,33 @@ pub struct TraceContext<'a> {
 pub struct ProjectileSystem {
     next_id: u64,
     projectiles: Vec<Projectile>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectileSnapshot {
+    pub id: u64,
+    pub owner: OwnerSnapshot,
+    pub reflected_from: Option<OwnerSnapshot>,
+    pub rocket_id: u32,
+    pub position: [f32; 2],
+    pub velocity: [f32; 2],
+    pub radius: f32,
+    pub damage: i32,
+    pub remaining: f32,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectileSystemSnapshot {
+    pub next_id: u64,
+    pub projectiles: Vec<ProjectileSnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectileSnapshotError {
+    Capacity,
+    IdOutOfRange,
+    DuplicateId,
+    InvalidOwner,
+    InvalidRocket,
+    InvalidValue,
 }
 
 fn dot(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -165,6 +221,115 @@ fn sweep_wall(origin: [f32; 2], delta: [f32; 2], radius: f32, wall: &Wall) -> Op
 }
 
 impl ProjectileSystem {
+    pub fn snapshot(&self) -> Result<ProjectileSystemSnapshot, ProjectileSnapshotError> {
+        let mut projectiles = Vec::with_capacity(self.projectiles.len());
+        for p in &self.projectiles {
+            projectiles.push(ProjectileSnapshot {
+                id: p.id,
+                owner: OwnerSnapshot::from_owner(p.owner)
+                    .ok_or(ProjectileSnapshotError::InvalidOwner)?,
+                reflected_from: p
+                    .reflected_from
+                    .map(|owner| {
+                        OwnerSnapshot::from_owner(owner)
+                            .ok_or(ProjectileSnapshotError::InvalidOwner)
+                    })
+                    .transpose()?,
+                rocket_id: u32::try_from(p.rocket_id)
+                    .map_err(|_| ProjectileSnapshotError::InvalidRocket)?,
+                position: p.position,
+                velocity: p.velocity,
+                radius: p.radius,
+                damage: p.damage,
+                remaining: p.remaining,
+            });
+        }
+        Ok(ProjectileSystemSnapshot {
+            next_id: self.next_id,
+            projectiles,
+        })
+    }
+    /// Restore only after validating every ID, owner and rocket against content.
+    pub fn restore(
+        &mut self,
+        value: &ProjectileSystemSnapshot,
+        rockets: &RocketDefinitions,
+        actors: &ActorState,
+    ) -> Result<(), ProjectileSnapshotError> {
+        if value.projectiles.len() > MAX_PROJECTILES {
+            return Err(ProjectileSnapshotError::Capacity);
+        }
+        let mut ids = BTreeSet::new();
+        let mut projectiles = Vec::with_capacity(value.projectiles.len());
+        for p in &value.projectiles {
+            if p.id >= value.next_id {
+                return Err(ProjectileSnapshotError::IdOutOfRange);
+            }
+            if !ids.insert(p.id) {
+                return Err(ProjectileSnapshotError::DuplicateId);
+            }
+            let owner = p
+                .owner
+                .resolve(actors)
+                .ok_or(ProjectileSnapshotError::InvalidOwner)?;
+            let reflected_from = p
+                .reflected_from
+                .map(|owner| {
+                    owner
+                        .resolve(actors)
+                        .ok_or(ProjectileSnapshotError::InvalidOwner)
+                })
+                .transpose()?;
+            if reflected_from.is_some() && owner != Owner::Player {
+                return Err(ProjectileSnapshotError::InvalidOwner);
+            }
+            let rocket = rockets
+                .0
+                .get(p.rocket_id as usize)
+                .ok_or(ProjectileSnapshotError::InvalidRocket)?;
+            let raw_radius = *rocket
+                .raw_fields
+                .get(3)
+                .ok_or(ProjectileSnapshotError::InvalidRocket)?;
+            if rocket.model_name.is_empty() || rocket.power <= 0 || raw_radius < 0 {
+                return Err(ProjectileSnapshotError::InvalidRocket);
+            }
+            let radius = (raw_radius as f32 / UNITS_PER_TILE).clamp(0.0, 2.0);
+            let speed = if rocket.raw_fields.get(10).copied().unwrap_or(0) != 0 {
+                FAST_SPEED
+            } else {
+                DEFAULT_SPEED
+            };
+            if !p
+                .position
+                .iter()
+                .all(|v| v.is_finite() && v.abs() <= 4096.0)
+                || !p.velocity.iter().all(|v| v.is_finite())
+                || (p.velocity[0].hypot(p.velocity[1]) - speed).abs() > 0.001
+                || !p.radius.is_finite()
+                || p.radius != radius
+                || p.damage != rocket.power
+                || !p.remaining.is_finite()
+                || !(0.0..=DEFAULT_LIFETIME).contains(&p.remaining)
+            {
+                return Err(ProjectileSnapshotError::InvalidValue);
+            }
+            projectiles.push(Projectile {
+                id: p.id,
+                owner,
+                reflected_from,
+                rocket_id: p.rocket_id as usize,
+                position: p.position,
+                velocity: p.velocity,
+                radius: p.radius,
+                damage: p.damage,
+                remaining: p.remaining,
+            });
+        }
+        self.projectiles = projectiles;
+        self.next_id = value.next_id;
+        Ok(())
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -523,6 +688,85 @@ mod tests {
     use super::*;
     use crate::map::Monster as MapActor;
     use crate::world::Player;
+
+    #[test]
+    fn snapshot_restores_reflection_and_rejects_invalid_records_atomically() {
+        let (rockets, _, actors, _) = setup();
+        let mut source = ProjectileSystem::new();
+        let id = source
+            .spawn(
+                launch(Owner::Enemy { source_index: 0 }, [1.0, 0.0], [-1.0, 0.0]),
+                &rockets,
+            )
+            .unwrap();
+        let shot = source.take(id).unwrap();
+        assert!(source.reflect_from_player(shot, [0.0, 0.0]));
+        source
+            .spawn(launch(Owner::Player, [2.0, 1.0], [0.0, 1.0]), &rockets)
+            .unwrap();
+        let snapshot = source.snapshot().unwrap();
+        assert_eq!(
+            snapshot.projectiles[0].reflected_from,
+            Some(OwnerSnapshot::Enemy { source_index: 0 })
+        );
+        let mut restored = ProjectileSystem::new();
+        restored.restore(&snapshot, &rockets, &actors).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        let mut invalid = snapshot.clone();
+        invalid.projectiles[1].id = invalid.projectiles[0].id;
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::DuplicateId)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        invalid = snapshot.clone();
+        invalid.projectiles[0].position[0] = f32::NAN;
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::InvalidValue)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        invalid = snapshot.clone();
+        invalid.next_id = 1;
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::IdOutOfRange)
+        );
+        invalid = snapshot.clone();
+        invalid.projectiles[0].reflected_from = Some(OwnerSnapshot::Enemy { source_index: 99 });
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::InvalidOwner)
+        );
+        invalid = snapshot.clone();
+        invalid.projectiles[0].damage += 1;
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::InvalidValue)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        invalid = snapshot.clone();
+        invalid.projectiles[0].remaining = -0.1;
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::InvalidValue)
+        );
+        invalid = snapshot.clone();
+        invalid
+            .projectiles
+            .resize(MAX_PROJECTILES + 1, invalid.projectiles[0].clone());
+        assert_eq!(
+            restored.restore(&invalid, &rockets, &actors),
+            Err(ProjectileSnapshotError::Capacity)
+        );
+        assert_eq!(restored.snapshot().unwrap(), snapshot);
+        assert_eq!(
+            restored
+                .spawn(launch(Owner::Player, [0.0, 1.0], [1.0, 0.0]), &rockets)
+                .unwrap(),
+            2
+        );
+    }
 
     fn setup() -> (RocketDefinitions, ActorDefinitions, ActorState, World) {
         let rockets = RocketDefinitions::parse(b"[ROCKETS]\n2\n3d_MODEL=arrow.3o\nANIMATION=a.ani\n1 0 120 42 40 0\n3d_MODEL=\nANIMATION=\n1 0 50 42 25 0\n").unwrap();

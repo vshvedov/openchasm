@@ -154,6 +154,29 @@ fn apply_damage_tint(frame: &mut [u32], alpha: u8) {
     }
 }
 
+/// Text timers derive directly from authoritative fixed-tick state.
+fn powerup_status(invisibility: u32, reflector: u32, chojin: u32) -> String {
+    let mut parts = Vec::new();
+    for (label, ticks) in [
+        ("INVISIBILITY", invisibility),
+        ("REFLECTOR", reflector),
+        ("CHOJIN", chojin),
+    ] {
+        if ticks > 0 {
+            parts.push(format!("{label} {}S", ticks.div_ceil(60)));
+        }
+    }
+    parts.join("  ")
+}
+
+fn advance_reflection_indicator(ticks: u8, reflection_count: usize) -> u8 {
+    if reflection_count > 0 {
+        30
+    } else {
+        ticks.saturating_sub(1)
+    }
+}
+
 struct FrameClock {
     last: Instant,
 }
@@ -387,6 +410,7 @@ struct QuickSave {
     animation_tick: u64,
     weapon_clock: WeaponAnimationClock,
     damage_feedback: DamageFeedback,
+    reflection_ticks: u8,
     current_message: Option<(Vec<String>, f32)>,
     completed: bool,
     shot_feedback: Option<(&'static str, f32)>,
@@ -518,6 +542,7 @@ pub fn run(
     let mut pending_weapon = None;
     let mut weapon_clock = WeaponAnimationClock::default();
     let mut damage_feedback = DamageFeedback::default();
+    let mut reflection_ticks = 0_u8;
     let mut current_message: Option<(Vec<String>, f32)> = None;
     let mut shot_feedback: Option<(&'static str, f32)> = None;
     let mut quicksave: Option<QuickSave> = None;
@@ -665,6 +690,7 @@ pub fn run(
             pending_weapon = None;
             weapon_clock = WeaponAnimationClock::default();
             damage_feedback = DamageFeedback::default();
+            reflection_ticks = 0;
             animation_tick = 0;
             current_message = None;
             shot_feedback = None;
@@ -680,6 +706,7 @@ pub fn run(
                         animation_tick,
                         weapon_clock,
                         damage_feedback,
+                        reflection_ticks,
                         current_message: current_message.clone(),
                         completed,
                         shot_feedback,
@@ -694,6 +721,7 @@ pub fn run(
                             animation_tick = saved.animation_tick;
                             weapon_clock = saved.weapon_clock;
                             damage_feedback = saved.damage_feedback;
+                            reflection_ticks = saved.reflection_ticks;
                             current_message = saved.current_message.clone();
                             completed = saved.completed;
                             shot_feedback = saved.shot_feedback;
@@ -751,6 +779,8 @@ pub fn run(
             {
                 audio.play_player_sound(sound);
             }
+            reflection_ticks =
+                advance_reflection_indicator(reflection_ticks, events.projectile_reflections.len());
             let fired = matches!(events.shot, Some(FireResult::Fired(_)));
             weapon_clock.tick(
                 session.selected_weapon != old_weapon,
@@ -969,14 +999,17 @@ pub fn run(
                 if inventory.keys[2] { "B" } else { "-" }
             ),
         );
-        if inventory.invisibility_ticks_remaining > 0 {
-            let seconds = inventory.invisibility_ticks_remaining.div_ceil(60);
-            text(
-                &mut frame,
-                8,
-                HEIGHT - 30,
-                &format!("INVISIBILITY {seconds}S"),
-            );
+        let effects = &session.game.protective_powerups;
+        let status = powerup_status(
+            inventory.invisibility_ticks_remaining,
+            effects.reflector_ticks_remaining,
+            effects.chojin_ticks_remaining,
+        );
+        if !status.is_empty() {
+            text(&mut frame, 8, HEIGHT - 30, &status);
+        }
+        if reflection_ticks > 0 {
+            text(&mut frame, WIDTH / 2, HEIGHT - 42, "PROJECTILE REFLECTED");
         }
         if let Some((lines, _)) = &current_message {
             for (row, line) in lines.iter().enumerate().take(6) {
@@ -1345,5 +1378,19 @@ mod tests {
         assert_eq!(pixels[0], 0x800000);
         assert_eq!(pixels[1], 0xff7f7f);
         assert!(pixels[2] >> 16 > (before[2] >> 16));
+    }
+    #[test]
+    fn powerup_timers_round_up_and_hide_expired_effects() {
+        assert_eq!(powerup_status(0, 0, 0), "");
+        assert_eq!(
+            powerup_status(61, 2400, 1),
+            "INVISIBILITY 2S  REFLECTOR 40S  CHOJIN 1S"
+        );
+        assert_eq!(powerup_status(0, 60, 0), "REFLECTOR 1S");
+        let active = advance_reflection_indicator(0, 1);
+        assert_eq!(active, 30);
+        assert_eq!(advance_reflection_indicator(active, 0), 29);
+        assert_eq!(advance_reflection_indicator(1, 2), 30);
+        assert_eq!(advance_reflection_indicator(0, 0), 0);
     }
 }

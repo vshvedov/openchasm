@@ -461,6 +461,7 @@ impl Combat {
             |wall, _| blocks_shots(wall),
             explosions,
             None,
+            |_, _| true,
             |cell, raw, near, _| accepts_object(cell, raw).then_some(near),
         )
     }
@@ -474,6 +475,29 @@ impl Combat {
         aim: ShotAim,
         blocks_shots: impl Fn(&Wall, f32) -> bool,
         object_bounds: impl Fn([usize; 2], u8) -> Option<(f32, f32)>,
+    ) -> FireResult {
+        self.fire_with_aim_and_planes(
+            weapon,
+            context,
+            explosions,
+            aim,
+            blocks_shots,
+            object_bounds,
+            |_, _| true,
+        )
+    }
+
+    /// As `fire_with_aim`, with a cell-aware filter at the plane contact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fire_with_aim_and_planes(
+        &mut self,
+        weapon: usize,
+        context: ShotContext<'_>,
+        explosions: bool,
+        aim: ShotAim,
+        blocks_shots: impl Fn(&Wall, f32) -> bool,
+        object_bounds: impl Fn([usize; 2], u8) -> Option<(f32, f32)>,
+        plane_present: impl Fn(ShotPlane, [f32; 2]) -> bool,
     ) -> FireResult {
         if !aim.eye.is_finite()
             || !aim.pitch.is_finite()
@@ -491,6 +515,7 @@ impl Combat {
             blocks_shots,
             explosions,
             Some(aim),
+            plane_present,
             |cell, raw, near, far| {
                 clip_aim_interval(near, far, aim.eye, slope, object_bounds(cell, raw))
             },
@@ -505,6 +530,7 @@ impl Combat {
         blocks_shots: impl Fn(&Wall, f32) -> bool,
         explosions: bool,
         aim: Option<ShotAim>,
+        plane_present: impl Fn(ShotPlane, [f32; 2]) -> bool,
         contact_object: impl Fn([usize; 2], u8, f32, f32) -> Option<f32>,
     ) -> FireResult {
         let ShotContext {
@@ -579,19 +605,16 @@ impl Combat {
             } else {
                 return None;
             };
-            (distance.is_finite() && (0.0..=MAX_RANGE).contains(&distance))
-                .then_some((plane, distance))
+            let point = [
+                player.position[0] + direction[0] * distance,
+                player.position[1] + direction[1] * distance,
+            ];
+            (distance.is_finite()
+                && (0.0..=MAX_RANGE).contains(&distance)
+                && plane_present(plane, point))
+            .then_some((plane, distance))
         });
-        let room_limit = aim.map_or(MAX_RANGE, |a| {
-            let slope = a.pitch.tan();
-            if slope > 1e-7 {
-                ((a.ceiling - a.eye) / slope).clamp(0.0, MAX_RANGE)
-            } else if slope < -1e-7 {
-                ((a.floor - a.eye) / slope).clamp(0.0, MAX_RANGE)
-            } else {
-                MAX_RANGE
-            }
-        });
+        let room_limit = plane_hit.map_or(MAX_RANGE, |(_, distance)| distance);
         let mut nearest = wall_hit.map_or(room_limit, |(distance, _)| distance.min(room_limit));
         let mut selected = None;
         let mut object_hit = objects.as_deref().and_then(|objects| {

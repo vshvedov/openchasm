@@ -384,12 +384,35 @@ const MAX_GRID_JOURNAL: usize = 4096;
 // Each rectangle is conservatively charged one full map regardless of area.
 const MAX_GRID_REPLAY_WORK: usize = 16 * 1024 * 1024;
 
+/// Immutable authored plane occupancy used by projectile and hitscan traces.
+#[derive(Clone)]
+struct ShotPlanes {
+    floor: Vec<bool>,
+    ceiling: Vec<bool>,
+}
+impl ShotPlanes {
+    fn present(&self, plane: combat::ShotPlane, position: [f32; 2]) -> bool {
+        if !position
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0 && *v < 64.0)
+        {
+            return true; // Unknown outside-map geometry remains conservative.
+        }
+        let index = position[0].floor() as usize * 64 + position[1].floor() as usize;
+        match plane {
+            combat::ShotPlane::Floor => self.floor[index],
+            combat::ShotPlane::Ceiling => self.ceiling[index],
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Session {
     pub world: World,
     wall_collision_mode: WallCollisionMode,
     prepared_motion: bool,
     object_sight: bool,
+    shot_planes: Option<ShotPlanes>,
     difficulty: Difficulty,
     teleports: Option<(Vec<Teleport>, TeleportState)>,
     object_heights: Option<SessionObjectHeights>,
@@ -491,6 +514,8 @@ pub struct SessionSnapshotCapabilities {
     pub prepared_motion: bool,
     #[serde(default)]
     pub object_sight: bool,
+    #[serde(default)]
+    pub authored_shot_planes: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionSnapshotError {
@@ -507,6 +532,7 @@ impl Session {
             wall_collision_mode: self.wall_collision_mode,
             prepared_motion: self.prepared_motion,
             object_sight: self.object_sight,
+            authored_shot_planes: self.shot_planes.is_some(),
             wall_materials: self.wall_materials.is_some(),
             teleports: self.teleports.is_some(),
             object_heights: self.object_heights.is_some(),
@@ -1047,6 +1073,7 @@ impl Session {
             wall_collision_mode: WallCollisionMode::TwoSided,
             prepared_motion: false,
             object_sight: false,
+            shot_planes: None,
             difficulty: setup.difficulty,
             teleports: None,
             object_heights: None,
@@ -1082,6 +1109,22 @@ impl Session {
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Use authored map tiles for projectile and hitscan plane contacts.
+    /// Tiles 62/63 and invalid texture indices are open, matching the renderer.
+    /// Call before creating the restart/save baseline; content fingerprints must
+    /// include the source map bytes. Player collision remains independently flat.
+    pub fn set_authored_shot_planes(&mut self, map: &crate::map::Map) {
+        let mut floor = Vec::with_capacity(64 * 64);
+        let mut ceiling = Vec::with_capacity(64 * 64);
+        for x in 0..64 {
+            for y in 0..64 {
+                floor.push(map.floor(x, y).is_some_and(|id| id < 62));
+                ceiling.push(map.ceiling(x, y).is_some_and(|id| id < 62));
+            }
+        }
+        self.shot_planes = Some(ShotPlanes { floor, ceiling });
+    }
+
     /// Enable the provisional collision-checked process translation path.
     /// Configure before making a restart or durable snapshot.
     pub fn set_prepared_motion(&mut self, enabled: bool) {
@@ -3098,8 +3141,7 @@ impl Session {
                     self.world.player.position,
                 )
             } else {
-                let room = self.player_bounds();
-                self.combat.fire_with_aim(
+                self.combat.fire_with_aim_and_planes(
                     self.selected_weapon,
                     ShotContext {
                         inventory: &mut self.game.inventory,
@@ -3114,8 +3156,8 @@ impl Session {
                     combat::ShotAim {
                         eye: self.vertical.eye(),
                         pitch: self.pitch,
-                        floor: room.floor,
-                        ceiling: room.ceiling.unwrap_or(2.0),
+                        floor: 0.0,
+                        ceiling: 2.0,
                     },
                     |wall, height| {
                         let offset = wall
@@ -3141,6 +3183,11 @@ impl Session {
                             cell,
                             raw,
                         )
+                    },
+                    |plane, point| {
+                        self.shot_planes
+                            .as_ref()
+                            .is_none_or(|planes| planes.present(plane, point))
                     },
                 )
             };
@@ -3467,7 +3514,7 @@ impl Session {
                     .filter(|p| !self.projectile_vertical_speeds.contains_key(&p.id))
                     .map(|p| p.id),
             );
-            let aimed = self.projectiles.trace_next_3d(
+            let aimed = self.projectiles.trace_next_3d_with_planes(
                 remaining,
                 crate::projectiles::TraceContext {
                     world: &self.world,
@@ -3509,6 +3556,11 @@ impl Session {
                     object_combat_bounds(self.object_heights.as_ref(), &self.processes, cell, raw)
                 },
                 (self.vertical.feet(), self.vertical.head()),
+                |plane, point| {
+                    self.shot_planes
+                        .as_ref()
+                        .is_none_or(|planes| planes.present(plane, point))
+                },
             );
             let candidate = match (legacy, aimed) {
                 (Some(a), Some(b)) => Some(
@@ -5210,6 +5262,173 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    fn authored_plane_map(ceiling: u8, floor: u8, roof_cell: Option<usize>) -> crate::map::Map {
+        let mut bytes = vec![0; 0x27005];
+        bytes[0x23001..0x24001].fill(ceiling);
+        bytes[0x24001..0x25001].fill(floor);
+        if let Some(x) = roof_cell {
+            bytes[0x23001 + x * 64] = 1;
+        }
+        crate::map::Map::parse(&bytes).unwrap()
+    }
+
+    fn empty_fire_session(physical: bool) -> Session {
+        let mut session = mission_session("");
+        let slot = if physical { 3 } else { 0 };
+        session.selected_weapon = slot;
+        session.game.inventory.weapons[slot] = true;
+        session.game.inventory.ammo[slot] = 10;
+        session.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
+            model_name: if physical { "rocket.3o" } else { "" }.into(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 0, 10],
+        });
+        session
+    }
+
+    #[test]
+    fn authored_shot_planes_test_contact_cell_and_capability() {
+        let sky = authored_plane_map(62, 63, None);
+        let mut open = empty_fire_session(false);
+        open.set_authored_shot_planes(&sky);
+        let shot = open.step(SessionInput {
+            pitch_delta: 0.6,
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            shot.shot,
+            Some(FireResult::Fired(ShotImpact::Miss))
+        ));
+        let saved = open
+            .snapshot(crate::save_format::ContentDigest([3; 32]))
+            .unwrap();
+        let legacy = empty_fire_session(false);
+        assert!(matches!(
+            legacy.restore_from_baseline(&saved, crate::save_format::ContentDigest([3; 32])),
+            Err(SessionSnapshotError::Capabilities)
+        ));
+
+        let mut roof = empty_fire_session(false);
+        // Eye 0.75 and pitch 0.6 meet z=2 in cell x=2, despite starting under sky.
+        roof.set_authored_shot_planes(&authored_plane_map(62, 0, Some(2)));
+        let shot = roof.step(SessionInput {
+            pitch_delta: 0.6,
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            shot.shot,
+            Some(FireResult::Fired(ShotImpact::Plane {
+                plane: combat::ShotPlane::Ceiling,
+                ..
+            }))
+        ));
+
+        let mut floor = empty_fire_session(false);
+        floor.set_authored_shot_planes(&authored_plane_map(63, 0, None));
+        let shot = floor.step(SessionInput {
+            pitch_delta: -0.6,
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            shot.shot,
+            Some(FireResult::Fired(ShotImpact::Plane {
+                plane: combat::ShotPlane::Floor,
+                ..
+            }))
+        ));
+        let mut void = empty_fire_session(false);
+        void.set_authored_shot_planes(&sky);
+        let shot = void.step(SessionInput {
+            pitch_delta: -0.6,
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            shot.shot,
+            Some(FireResult::Fired(ShotImpact::Miss))
+        ));
+    }
+
+    #[test]
+    fn authored_projectile_plane_contact_uses_destination_cell() {
+        for (roof, expect_plane) in [(None, false), (Some(2), true)] {
+            let mut session = empty_fire_session(true);
+            session.set_authored_shot_planes(&authored_plane_map(62, 0, roof));
+            let mut found = false;
+            for tick in 0..45 {
+                let events = session.step(SessionInput {
+                    pitch_delta: if tick == 0 { 0.6 } else { 0.0 },
+                    fire: tick == 0,
+                    ..Default::default()
+                });
+                found |= events
+                    .projectile_impacts
+                    .iter()
+                    .any(|event| event.target == ImpactTarget::Plane);
+            }
+            assert_eq!(found, expect_plane, "roof={roof:?}");
+        }
+    }
+
+    #[test]
+    fn downward_shot_uses_map_floor_not_platform_support_height() {
+        let mut session = platform_session(false);
+        session.world.player.position = [1.0, 1.0];
+        session.vertical = VerticalState::new(0.7).unwrap();
+        assert!(session.player_bounds().floor > 0.6);
+        // The platform's collision support must not act as an infinite plane.
+        session.objects = None;
+        session.game.inventory.weapons[0] = true;
+        session.game.inventory.ammo[0] = 1;
+        session.rockets.0.push(RocketDefinition {
+            model_name: String::new(),
+            animation_name: String::new(),
+            power: 10,
+            raw_fields: vec![],
+        });
+        let event = session.step(SessionInput {
+            pitch_delta: -0.6,
+            fire: true,
+            ..Default::default()
+        });
+        let Some(FireResult::Fired(ShotImpact::Plane {
+            plane: combat::ShotPlane::Floor,
+            distance,
+        })) = event.shot
+        else {
+            panic!("expected map floor")
+        };
+        assert!(
+            distance > 1.5,
+            "platform height incorrectly clipped the shot: {distance}"
+        );
+    }
+
+    #[test]
+    fn downward_projectiles_respect_authored_floor_openings() {
+        for (floor, expect_plane) in [(0, true), (63, false)] {
+            let mut session = empty_fire_session(true);
+            session.set_authored_shot_planes(&authored_plane_map(63, floor, None));
+            let mut found = false;
+            for tick in 0..45 {
+                let events = session.step(SessionInput {
+                    pitch_delta: if tick == 0 { -0.6 } else { 0.0 },
+                    fire: tick == 0,
+                    ..Default::default()
+                });
+                found |= events
+                    .projectile_impacts
+                    .iter()
+                    .any(|event| event.target == ImpactTarget::Plane);
+            }
+            assert_eq!(found, expect_plane, "floor={floor}");
+        }
     }
 
     #[test]

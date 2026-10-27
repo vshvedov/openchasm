@@ -416,6 +416,31 @@ impl ProjectileSystem {
         object_bounds: impl Fn([usize; 2], u8) -> Option<(f32, f32)>,
         player_bounds: (f32, f32),
     ) -> Option<Impact> {
+        self.trace_next_3d_with_planes(
+            horizon,
+            context,
+            frozen,
+            vertical,
+            wall_bounds,
+            object_bounds,
+            player_bounds,
+            |_, _| true,
+        )
+    }
+
+    /// Trace with a cell-aware filter for the flat floor and ceiling contacts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_next_3d_with_planes(
+        &self,
+        horizon: f32,
+        context: TraceContext<'_>,
+        frozen: &BTreeSet<u64>,
+        vertical: impl Fn(u64) -> (f32, f32),
+        wall_bounds: impl Fn(&Wall) -> Option<(f32, f32)>,
+        object_bounds: impl Fn([usize; 2], u8) -> Option<(f32, f32)>,
+        player_bounds: (f32, f32),
+        plane_present: impl Fn(crate::combat::ShotPlane, [f32; 2]) -> bool,
+    ) -> Option<Impact> {
         if !horizon.is_finite() || horizon < 0.0 {
             return None;
         }
@@ -517,10 +542,18 @@ impl ProjectileSystem {
             }
             // The current maps use a provisional flat room. Plane hits are
             // centered on the projectile rather than introducing unknown bounce.
-            if dz > 1e-8 {
-                consider((2.0 - height) / dz, ImpactTarget::Plane);
+            let plane = if dz > 1e-8 {
+                Some((crate::combat::ShotPlane::Ceiling, (2.0 - height) / dz))
             } else if dz < -1e-8 {
-                consider(-height / dz, ImpactTarget::Plane);
+                Some((crate::combat::ShotPlane::Floor, -height / dz))
+            } else {
+                None
+            };
+            if let Some((kind, t)) = plane {
+                if (0.0..=1.0).contains(&t) && plane_present(kind, add_scaled(p.position, delta, t))
+                {
+                    consider(t, ImpactTarget::Plane);
+                }
             }
             if let Some((t, target)) = chosen {
                 let hit = Impact {

@@ -348,7 +348,7 @@ fn parse_options(
 }
 
 /// Increment whenever simulation rules or startup interpretation changes.
-const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v5";
+const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v6";
 
 fn finish_level_fingerprint(
     mut trace: content::ResourceTrace,
@@ -628,6 +628,7 @@ fn play(
             shot_blocking,
             difficulty,
         });
+        session.set_authored_shot_planes(&map);
         let wall_materials = wall_material_catalog(&graphics, &textures);
         if !session.set_wall_material_catalog(wall_materials.clone()) {
             eprintln!("wall material catalog rejected; scripted wall changes disabled");

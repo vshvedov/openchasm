@@ -165,3 +165,47 @@ fn fence_switches_raise_all_three_real_walls() {
         );
     }
 }
+
+#[test]
+fn real_empty_cell_exit_actions_complete_levels_05_and_17() {
+    use openchasm::mission::{MissionEvent, MissionPlan, MissionState};
+    let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+    let path = explicit
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("assets/csm.bin"));
+    if !path.exists() && explicit.is_none() {
+        return;
+    }
+    let mut archive = archive::Archive::open(&path).unwrap();
+    for (id, exit, cell) in [("05", 14, [53, 31]), ("17", 7, [16, 30])] {
+        let map = Map::parse(&archive.read(&format!("map/map.{id}")).unwrap()).unwrap();
+        let text = String::from_utf8(archive.read(&format!("map/process.{id}")).unwrap()).unwrap();
+        let script = Script::parse(&text);
+        let cells: [u8; 4096] = std::array::from_fn(|index| {
+            map.wall(index / MAP_SIDE, index % MAP_SIDE)
+                .unwrap()
+                .texture_id
+        });
+        assert_eq!(cells[0], 0);
+        let world = World {
+            walls: vec![],
+            player: Player {
+                position: [-100.0, -100.0],
+                angle: 0.0,
+            },
+        };
+        let mut runtime =
+            ProcessRuntime::with_cell_data(&script, &world, ProcessCapabilities::default(), &cells);
+        let attempts = runtime.activate_at("floor", cell);
+        assert!(
+            attempts
+                .iter()
+                .any(|event| event.process_id == exit && event.outcome == ProcessOutcome::Accepted),
+            "{id}: {attempts:?}"
+        );
+        let mut mission = MissionState::new(MissionPlan::parse(&script, &text));
+        mission.attempt(exit, true);
+        assert_eq!(mission.advance(2.0), vec![MissionEvent::LevelComplete]);
+    }
+}

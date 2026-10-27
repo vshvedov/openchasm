@@ -150,6 +150,8 @@ type Activation = (Vec<(u16, bool)>, Vec<u16>);
 #[derive(Debug, Clone)]
 struct RuntimeProcess {
     motions: Vec<Motion>,
+    // Verified empty-cell commands still occupy a process movement stage.
+    empty_motion_cells: Vec<[u8; 2]>,
     phase: Phase,
     progress: f32,
     duration: f32,
@@ -178,8 +180,15 @@ fn property_float(process: &Process, name: &str, default: f32) -> f32 {
 }
 
 impl RuntimeProcess {
-    fn new(process: &Process, world: &World, capabilities: ProcessCapabilities<'_>) -> Self {
+    fn new(
+        process: &Process,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: Option<&[u8; 4096]>,
+    ) -> Self {
         let mut motions = Vec::new();
+        let mut empty_motion_cells = Vec::new();
+        let mut empty_motion_distance = 0.0_f32;
         let mut cell_changes = Vec::new();
         let mut animations = Vec::new();
         let mut waitout = Vec::new();
@@ -357,12 +366,24 @@ impl RuntimeProcess {
             // Missing walls could be models or malformed references. Never
             // perform only the subset of a process that happened to resolve.
             if motions.len() == before {
-                supported = false;
-                break;
+                let index = usize::from(cell.0) * 64 + usize::from(cell.1);
+                if raw_cells.is_some_and(|cells| cells[index] == 0) {
+                    empty_motion_cells.push([cell.0, cell.1]);
+                    let distance = match kind {
+                        MotionKind::Translate(d) => d[0].hypot(d[1]),
+                        MotionKind::Vertical(raw) => raw.unsigned_abs() as f32 / MAP_UNITS_PER_TILE,
+                        MotionKind::Rotate { .. } => 0.0,
+                    };
+                    empty_motion_distance = empty_motion_distance.max(distance);
+                } else {
+                    supported = false;
+                    break;
+                }
             }
         }
         if !supported {
             motions.clear();
+            empty_motion_cells.clear();
             lock_changes.clear();
             cell_changes.clear();
             animations.clear();
@@ -373,12 +394,13 @@ impl RuntimeProcess {
         let max_distance = motions
             .iter()
             .map(|m| m.travel_bound(&world.walls[m.wall]))
-            .fold(0.0f32, f32::max);
+            .fold(empty_motion_distance, f32::max);
         let locked = process.properties.iter().any(|cmd| cmd.name == "lock");
         let required_keys = ["redkey", "greenkey", "bluekey"]
             .map(|name| process.properties.iter().any(|cmd| cmd.name == name));
         Self {
             motions,
+            empty_motion_cells,
             phase: Phase::Closed,
             progress: 0.0,
             duration: (max_distance / speed).max(0.001),
@@ -407,6 +429,7 @@ impl RuntimeProcess {
         }
         if !self.supported
             || (self.motions.is_empty()
+                && self.empty_motion_cells.is_empty()
                 && self.lock_changes.is_empty()
                 && self.cell_changes.is_empty()
                 && self.animations.is_empty()
@@ -416,7 +439,10 @@ impl RuntimeProcess {
         }
         match self.phase {
             Phase::Closed => {
-                if !self.motions.is_empty() || !self.cell_changes.is_empty() {
+                if !self.motions.is_empty()
+                    || !self.empty_motion_cells.is_empty()
+                    || !self.cell_changes.is_empty()
+                {
                     self.phase = if self.delay > 0.0 {
                         Phase::Delay(self.delay)
                     } else {
@@ -425,12 +451,34 @@ impl RuntimeProcess {
                 }
                 Ok((self.lock_changes.clone(), self.animations.clone()))
             }
-            Phase::Open if !self.motions.is_empty() || !self.cell_changes.is_empty() => {
+            Phase::Open
+                if !self.motions.is_empty()
+                    || !self.empty_motion_cells.is_empty()
+                    || !self.cell_changes.is_empty() =>
+            {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
                 Ok((Vec::new(), Vec::new()))
             }
             _ => Err(ProcessOutcome::Busy),
+        }
+    }
+    /// Reverse an active process without re-triggering it or firing its
+    /// activation side effects. An already closed or closing process is inert.
+    fn return_to_start(&mut self) {
+        if self.locked || !self.supported {
+            return;
+        }
+        match self.phase {
+            Phase::Delay(_) => {
+                self.phase = Phase::Closed;
+                self.progress = 0.0;
+            }
+            Phase::Opening | Phase::Open => {
+                self.phase = Phase::Closing;
+                self.open_time = 0.0;
+            }
+            Phase::Closed | Phase::Closing => {}
         }
     }
     fn tick(
@@ -574,11 +622,40 @@ impl ProcessRuntime {
         world: &World,
         capabilities: ProcessCapabilities<'_>,
     ) -> Self {
+        Self::build(script, world, capabilities, capabilities.initial_cell_types)
+    }
+    /// Supply x-major map cell types for validating empty motion targets without
+    /// opting into applying `change` effects. Non-empty cells without supported
+    /// wall geometry still reject the entire process.
+    pub fn with_cell_data(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+    ) -> Self {
+        Self::build(
+            script,
+            world,
+            capabilities,
+            capabilities.initial_cell_types.or(Some(raw_cells)),
+        )
+    }
+    fn build(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: Option<&[u8; 4096]>,
+    ) -> Self {
         Self {
             processes: script
                 .processes
                 .iter()
-                .map(|(&id, process)| (id, RuntimeProcess::new(process, world, capabilities)))
+                .map(|(&id, process)| {
+                    (
+                        id,
+                        RuntimeProcess::new(process, world, capabilities, raw_cells),
+                    )
+                })
                 .collect(),
             links: script.triggers.clone(),
             previous_floor: None,
@@ -620,6 +697,16 @@ impl ProcessRuntime {
 
     fn trigger(&mut self, id: u16) -> ProcessEvent {
         let result = match self.processes.get_mut(&id) {
+            Some(process)
+                if self.cell_types.as_ref().is_some_and(|types| {
+                    process
+                        .empty_motion_cells
+                        .iter()
+                        .any(|cell| types[usize::from(cell[0]) * 64 + usize::from(cell[1])] != 0)
+                }) =>
+            {
+                Err(ProcessOutcome::Unsupported)
+            }
             Some(process) => process.trigger(self.keys),
             None => Err(ProcessOutcome::Missing),
         };
@@ -654,6 +741,14 @@ impl ProcessRuntime {
             .filter(|link| link.kind == kind && [link.x, link.y] == cell)
             .map(|link| link.process)
             .collect();
+        if matches!(kind, "return" | "returnf") {
+            for id in ids {
+                if let Some(process) = self.processes.get_mut(&id) {
+                    process.return_to_start();
+                }
+            }
+            return Vec::new();
+        }
         ids.into_iter()
             .map(|id| {
                 if kind == "destroy" {
@@ -667,6 +762,29 @@ impl ProcessRuntime {
     }
     pub fn activate_links_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
         self.activate_at("link", cell)
+    }
+    /// Apply use and reverse links at one cell in source order. Reverse links
+    /// do not emit activation events or schedule mission completion.
+    fn use_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
+        let links: Vec<(String, u16)> = self
+            .links
+            .iter()
+            .filter(|link| {
+                matches!(link.kind.as_str(), "link" | "return") && [link.x, link.y] == cell
+            })
+            .map(|link| (link.kind.clone(), link.process))
+            .collect();
+        let mut events = Vec::new();
+        for (kind, id) in links {
+            if kind == "return" {
+                if let Some(process) = self.processes.get_mut(&id) {
+                    process.return_to_start();
+                }
+            } else {
+                events.push(self.trigger(id));
+            }
+        }
+        events
     }
     /// Call after movement once per simulation step. `interact_pressed` must be
     /// true on the press edge only, not every frame while the key is held.
@@ -694,14 +812,23 @@ impl ProcessRuntime {
         };
         if floor != self.previous_floor {
             if let Some(cell) = floor {
-                let processes: Vec<u16> = self
+                let links: Vec<(String, u16)> = self
                     .links
                     .iter()
-                    .filter(|trigger| trigger.kind == "floor" && [trigger.x, trigger.y] == cell)
-                    .map(|trigger| trigger.process)
+                    .filter(|trigger| {
+                        matches!(trigger.kind.as_str(), "floor" | "returnf")
+                            && [trigger.x, trigger.y] == cell
+                    })
+                    .map(|trigger| (trigger.kind.clone(), trigger.process))
                     .collect();
-                for id in processes {
-                    events.push(self.trigger(id));
+                for (kind, id) in links {
+                    if kind == "returnf" {
+                        if let Some(process) = self.processes.get_mut(&id) {
+                            process.return_to_start();
+                        }
+                    } else {
+                        events.push(self.trigger(id));
+                    }
                 }
             }
             self.previous_floor = floor;
@@ -712,7 +839,7 @@ impl ProcessRuntime {
             let nearest = self
                 .links
                 .iter()
-                .filter(|link| link.kind == "link")
+                .filter(|link| matches!(link.kind.as_str(), "link" | "return"))
                 .map(|link| {
                     let dx = f32::from(link.x) + 0.5 - p[0];
                     let dy = f32::from(link.y) + 0.5 - p[1];
@@ -721,7 +848,7 @@ impl ProcessRuntime {
                 .filter(|(_, distance)| *distance <= USE_RANGE * USE_RANGE)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((cell, _)) = nearest {
-                events.extend(self.activate_links_at(cell));
+                events.extend(self.use_at(cell));
             }
         }
         for process in self.processes.values_mut() {
@@ -1152,5 +1279,133 @@ mod tests {
         assert_eq!(world.walls[0].a[0], 1.0);
         tick_for(&mut runtime, &mut world, 1.6);
         assert!((world.walls[0].a[0] - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn empty_motion_targets_require_raw_cell_data_and_preserve_stage() {
+        let script = Script::parse("#proc1\nSpeed 8\n#action\nmove 0 0 256 0\n#end\n#proc2\n#action\nchange 0 0 5\n#end\n#links\nlink 0 0 1\nlink 2 0 2\n#end\n");
+        let mut world = world();
+        let mut old = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            old.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        let cells = [0; 4096];
+        let mut runtime =
+            ProcessRuntime::with_cell_data(&script, &world, ProcessCapabilities::default(), &cells);
+        assert_eq!(
+            runtime.activate_at("link", [2, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Busy
+        );
+        world.player.position = [-10.0, -10.0];
+        tick_for(&mut runtime, &mut world, 1.1);
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let mut object_cells = cells;
+        object_cells[0] = 163;
+        let mut object_target = ProcessRuntime::with_cell_data(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &object_cells,
+        );
+        assert_eq!(
+            object_target.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+    }
+
+    #[test]
+    fn changing_an_empty_target_prevents_a_stale_noop() {
+        let script = Script::parse("#proc1\n#action\nmove 0 0 256 0\n#end\n#proc2\n#action\nchange 0 0 163\n#end\n#links\nlink 0 0 1\nlink 2 0 2\n#end\n");
+        let mut world = world();
+        let cells = [0; 4096];
+        let mut runtime = ProcessRuntime::with_capabilities(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: false,
+                initial_cell_types: Some(&cells),
+            },
+        );
+        assert_eq!(
+            runtime.activate_at("link", [2, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        world.player.position = [-10.0, -10.0];
+        tick_for(&mut runtime, &mut world, 0.1);
+        assert_eq!(runtime.cell_type([0, 0]), Some(163));
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+    }
+
+    #[test]
+    fn return_floor_reverses_in_progress_without_activation_event() {
+        let script = Script::parse(
+            "#proc1\n#action\nmove 1 0 256 0\n#end\n#links\nfloor 0 0 1\nreturnf 2 0 1\n#end\n",
+        );
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        tick_for(&mut runtime, &mut world, 0.3);
+        let opening = world.walls[0].a[0];
+        assert!(opening > 1.2 && opening < 1.4);
+        world.player.position = [2.5, 0.5];
+        assert!(runtime.tick(&mut world, 1.0 / 60.0, false).is_empty());
+        assert!(world.walls[0].a[0] < opening);
+        tick_for(&mut runtime, &mut world, 0.4);
+        assert!((world.walls[0].a[0] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn return_use_does_not_open_closed_process_and_cancels_start_delay() {
+        let script = Script::parse("#proc1\nStartDelay 1\n#action\nmove 1 0 256 0\n#end\n#links\nlink 0 0 1\nreturn 2 0 1\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        assert!(runtime.activate_at("return", [2, 0]).is_empty());
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        world.player.position = [2.5, 0.5];
+        assert!(runtime.tick(&mut world, 1.0 / 60.0, true).is_empty());
+        tick_for(&mut runtime, &mut world, 1.2);
+        assert_eq!(world.walls[0].a[0], 1.0);
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn locked_process_ignores_return_request() {
+        let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\n#end\n#proc2\n#action\nlock 1\n#end\n#links\nlink 0 0 1\nlink 3 0 2\nreturn 2 0 1\n#end\n");
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        tick_for(&mut runtime, &mut world, 0.2);
+        assert_eq!(
+            runtime.activate_at("link", [3, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let before = world.walls[0].a[0];
+        assert!(runtime.activate_at("return", [2, 0]).is_empty());
+        tick_for(&mut runtime, &mut world, 0.1);
+        assert!(world.walls[0].a[0] > before);
     }
 }

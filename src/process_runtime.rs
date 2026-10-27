@@ -1299,6 +1299,210 @@ pub struct ProcessRuntime {
     staged_authorized: bool,
 }
 
+/// Durable process phase; delay is measured in seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProcessPhaseSnapshot {
+    Closed,
+    Delay(f32),
+    Opening,
+    Open,
+    Closing,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessEntrySnapshot {
+    pub id: u16,
+    pub phase: ProcessPhaseSnapshot,
+    pub progress: f32,
+    pub open_time: f32,
+    pub locked: bool,
+    pub hazard_active: bool,
+    pub wind_active: bool,
+    pub wall_progress: Vec<f32>,
+    pub object_progress: Vec<f32>,
+    pub previous_cell_types: Vec<Option<u8>>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessRuntimeSnapshot {
+    pub processes: Vec<ProcessEntrySnapshot>,
+    pub previous_floor: Option<[u8; 2]>,
+    pub keys: [bool; 3],
+    pub wall_identity: Vec<(Option<[u8; 2]>, u8)>,
+    pub elevations: Vec<f32>,
+    pub objects: Vec<ProcessObject>,
+    pub cell_types: Option<Vec<u8>>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessSnapshotError {
+    PendingEffects,
+    WallIdentity,
+    ProcessIdentity,
+    ObjectIdentity,
+    CellTypes,
+    InvalidValue,
+}
+
+impl ProcessRuntime {
+    /// Capture only after the host has consumed all process effects.
+    pub fn snapshot(&self, world: &World) -> Result<ProcessRuntimeSnapshot, ProcessSnapshotError> {
+        if !self.effects.is_empty() || self.staged_authorized {
+            return Err(ProcessSnapshotError::PendingEffects);
+        }
+        if world.walls.len() != self.elevations.len() {
+            return Err(ProcessSnapshotError::WallIdentity);
+        }
+        Ok(ProcessRuntimeSnapshot {
+            processes: self
+                .processes
+                .iter()
+                .map(|(&id, p)| ProcessEntrySnapshot {
+                    id,
+                    phase: match p.phase {
+                        Phase::Closed => ProcessPhaseSnapshot::Closed,
+                        Phase::Delay(t) => ProcessPhaseSnapshot::Delay(t),
+                        Phase::Opening => ProcessPhaseSnapshot::Opening,
+                        Phase::Open => ProcessPhaseSnapshot::Open,
+                        Phase::Closing => ProcessPhaseSnapshot::Closing,
+                    },
+                    progress: p.progress,
+                    open_time: p.open_time,
+                    locked: p.locked,
+                    hazard_active: p.hazard_active,
+                    wind_active: p.wind_active,
+                    wall_progress: p.motions.iter().map(|m| m.progress).collect(),
+                    object_progress: p.object_motions.iter().map(|m| m.progress).collect(),
+                    previous_cell_types: p.cell_changes.iter().map(|c| c.previous).collect(),
+                })
+                .collect(),
+            previous_floor: self.previous_floor,
+            keys: self.keys,
+            wall_identity: world.walls.iter().map(|w| (w.cell, w.texture)).collect(),
+            elevations: self.elevations.clone(),
+            objects: self.objects.values().copied().collect(),
+            cell_types: self.cell_types.clone(),
+        })
+    }
+
+    /// Restore into a freshly constructed runtime for the same level and script.
+    /// World geometry, hazard/wind fields and object/combat state are separate
+    /// components and must be restored atomically by the owning simulation.
+    pub fn restore(
+        &mut self,
+        snapshot: &ProcessRuntimeSnapshot,
+        world: &World,
+    ) -> Result<(), ProcessSnapshotError> {
+        if !self.effects.is_empty() || self.staged_authorized {
+            return Err(ProcessSnapshotError::PendingEffects);
+        }
+        if snapshot.wall_identity.len() != world.walls.len()
+            || snapshot.elevations.len() != world.walls.len()
+            || self.elevations.len() != world.walls.len()
+            || snapshot
+                .wall_identity
+                .iter()
+                .zip(&world.walls)
+                .any(|(id, w)| *id != (w.cell, w.texture))
+        {
+            return Err(ProcessSnapshotError::WallIdentity);
+        }
+        if snapshot.processes.len() != self.processes.len() {
+            return Err(ProcessSnapshotError::ProcessIdentity);
+        }
+        if snapshot.cell_types.as_ref().map(Vec::len) != self.cell_types.as_ref().map(Vec::len) {
+            return Err(ProcessSnapshotError::CellTypes);
+        }
+        let valid_progress = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+        if snapshot
+            .previous_floor
+            .is_some_and(|c| c[0] >= 64 || c[1] >= 64)
+            || snapshot
+                .elevations
+                .iter()
+                .any(|v| !v.is_finite() || v.abs() > 65536.0)
+        {
+            return Err(ProcessSnapshotError::InvalidValue);
+        }
+        let mut staged = self.clone();
+        let mut seen = BTreeSet::new();
+        for entry in &snapshot.processes {
+            if !seen.insert(entry.id) {
+                return Err(ProcessSnapshotError::ProcessIdentity);
+            }
+            let p = staged
+                .processes
+                .get_mut(&entry.id)
+                .ok_or(ProcessSnapshotError::ProcessIdentity)?;
+            if entry.wall_progress.len() != p.motions.len()
+                || entry.object_progress.len() != p.object_motions.len()
+                || entry.previous_cell_types.len() != p.cell_changes.len()
+            {
+                return Err(ProcessSnapshotError::ProcessIdentity);
+            }
+            if !valid_progress(entry.progress)
+                || !entry.open_time.is_finite()
+                || entry.open_time < 0.0
+                || entry
+                    .wall_progress
+                    .iter()
+                    .chain(entry.object_progress.iter())
+                    .any(|&v| !valid_progress(v))
+                || matches!(entry.phase, ProcessPhaseSnapshot::Delay(t) if !t.is_finite() || t < 0.0 || t > p.delay)
+                || (entry.hazard_active && p.death_zones.is_empty())
+                || (entry.wind_active && p.wind_zones.is_empty())
+            {
+                return Err(ProcessSnapshotError::InvalidValue);
+            }
+            p.phase = match entry.phase {
+                ProcessPhaseSnapshot::Closed => Phase::Closed,
+                ProcessPhaseSnapshot::Delay(t) => Phase::Delay(t),
+                ProcessPhaseSnapshot::Opening => Phase::Opening,
+                ProcessPhaseSnapshot::Open => Phase::Open,
+                ProcessPhaseSnapshot::Closing => Phase::Closing,
+            };
+            p.progress = entry.progress;
+            p.open_time = entry.open_time;
+            p.locked = entry.locked;
+            p.hazard_active = entry.hazard_active;
+            p.wind_active = entry.wind_active;
+            for (m, &v) in p.motions.iter_mut().zip(&entry.wall_progress) {
+                m.progress = v;
+            }
+            for (m, &v) in p.object_motions.iter_mut().zip(&entry.object_progress) {
+                m.progress = v;
+            }
+            for (c, &v) in p.cell_changes.iter_mut().zip(&entry.previous_cell_types) {
+                c.previous = v;
+            }
+        }
+        let mut objects = BTreeMap::new();
+        for object in &snapshot.objects {
+            if !self.objects.contains_key(&object.cell)
+                || objects.insert(object.cell, *object).is_some()
+            {
+                return Err(ProcessSnapshotError::ObjectIdentity);
+            }
+            if object.cell.iter().any(|&v| v >= 64)
+                || object
+                    .position
+                    .iter()
+                    .any(|v| !v.is_finite() || v.abs() > 4096.0)
+                || !object.angle_radians.is_finite()
+                || !object.elevation_raw.is_finite()
+                || !object.blocking_radius.is_finite()
+                || !(0.0..=64.0).contains(&object.blocking_radius)
+            {
+                return Err(ProcessSnapshotError::InvalidValue);
+            }
+        }
+        staged.previous_floor = snapshot.previous_floor;
+        staged.keys = snapshot.keys;
+        staged.elevations.clone_from(&snapshot.elevations);
+        staged.objects = objects;
+        staged.cell_types.clone_from(&snapshot.cell_types);
+        *self = staged;
+        Ok(())
+    }
+}
+
 /// One validated replacement of a stable source map cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RuntimeObjectTransition {
@@ -2229,6 +2433,90 @@ mod tests {
             tick_for(&mut runtime, &mut world, 1.0);
             assert_eq!(world.walls[0].a, original);
         }
+    }
+
+    #[test]
+    fn durable_snapshot_restores_delayed_stage_and_rejects_corruption() {
+        let script = Script::parse("#proc1\nStartDelay 2\n#action\nquake 1 1 2 2 5\nmove 1 0 256 0\n#end\n#links\nlink 0 0 1\n#end\n");
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let mut runtime = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        let baseline = runtime.clone();
+        assert_eq!(
+            runtime
+                .prepare_at("link", [0, 0], 1)
+                .unwrap()
+                .commit_schedule()
+                .outcome,
+            ProcessOutcome::Accepted
+        );
+        runtime.tick(&mut world, 1.0, false);
+        let snap = runtime.snapshot(&world).unwrap();
+        let mut restored = baseline;
+        restored.restore(&snap, &world).unwrap();
+        assert_eq!(restored.snapshot(&world).unwrap(), snap);
+        let mut bad = snap.clone();
+        bad.processes[0].progress = f32::NAN;
+        assert_eq!(
+            restored.restore(&bad, &world),
+            Err(ProcessSnapshotError::InvalidValue)
+        );
+        assert_eq!(restored.snapshot(&world).unwrap(), snap);
+        bad = snap.clone();
+        bad.wall_identity[0].1 ^= 1;
+        assert_eq!(
+            restored.restore(&bad, &world),
+            Err(ProcessSnapshotError::WallIdentity)
+        );
+        restored.tick(&mut world, 1.0, false);
+        assert_eq!(restored.ready_delayed(), vec![1]);
+        assert!(restored.prepare_due(1).is_ok());
+    }
+
+    #[test]
+    fn durable_snapshot_preserves_inflight_motion_and_rejects_pending_effects() {
+        let script = Script::parse(
+            "#proc1\nSpeed 2\n#action\nmove 1 0 256 0\nup 2 0 80\n#end\n#links\nlink 0 0 1\n#end\n",
+        );
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        world.walls.push(Wall {
+            a: [2.0, 0.0],
+            b: [2.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([2, 0]),
+        });
+        let mut source = ProcessRuntime::with_capabilities(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: None,
+            },
+        );
+        let mut target = source.clone();
+        source.activate_at("link", [0, 0]);
+        source.tick(&mut world, 0.1, false);
+        assert!(matches!(
+            source.snapshot(&world),
+            Err(ProcessSnapshotError::PendingEffects)
+        ));
+        source.take_effects();
+        let snapshot = source.snapshot(&world).unwrap();
+        let mut restored_world = world.clone();
+        target.restore(&snapshot, &restored_world).unwrap();
+        source.tick(&mut world, 0.1, false);
+        target.tick(&mut restored_world, 0.1, false);
+        assert_eq!(world.walls[0].a, restored_world.walls[0].a);
+        assert_eq!(source.wall_elevation(1), target.wall_elevation(1));
     }
 
     #[test]

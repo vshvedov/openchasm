@@ -81,6 +81,26 @@ pub struct ObjectStates {
     definitions: Vec<ObjectDefinition>,
     states: BTreeMap<[usize; 2], ObjectState>,
 }
+/// Durable mutable state keyed by the authored map cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectStateSnapshot {
+    pub cell: [usize; 2],
+    pub raw_type: u8,
+    pub health: i32,
+    pub position: [f32; 2],
+    pub angle_radians: f32,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectStatesSnapshot {
+    pub entries: Vec<ObjectStateSnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStatesSnapshotError {
+    CountMismatch,
+    CellMismatch,
+    InvalidValue,
+}
+
 impl ObjectStates {
     pub fn new(
         instances: &[ObjectInstance],
@@ -119,6 +139,69 @@ impl ObjectStates {
             definitions: definitions.level_objects.clone(),
             states,
         })
+    }
+
+    pub fn snapshot(&self) -> ObjectStatesSnapshot {
+        ObjectStatesSnapshot {
+            entries: self
+                .states
+                .iter()
+                .map(|(&cell, state)| ObjectStateSnapshot {
+                    cell,
+                    raw_type: state.raw_type,
+                    health: state.health,
+                    position: state.placement.position,
+                    angle_radians: state.placement.angle_radians,
+                })
+                .collect(),
+        }
+    }
+
+    /// Restore into the same loaded content, validating the complete batch first.
+    pub fn restore(
+        &mut self,
+        snapshot: &ObjectStatesSnapshot,
+    ) -> Result<(), ObjectStatesSnapshotError> {
+        if snapshot.entries.len() != self.states.len() {
+            return Err(ObjectStatesSnapshotError::CountMismatch);
+        }
+        let mut staged = self.states.clone();
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &snapshot.entries {
+            if !seen.insert(entry.cell) {
+                return Err(ObjectStatesSnapshotError::CellMismatch);
+            }
+            let state = staged
+                .get_mut(&entry.cell)
+                .ok_or(ObjectStatesSnapshotError::CellMismatch)?;
+            let index = entry
+                .raw_type
+                .checked_sub(FIRST_OBJECT)
+                .map(usize::from)
+                .filter(|&i| i < 64)
+                .ok_or(ObjectStatesSnapshotError::InvalidValue)?;
+            let def = self
+                .definitions
+                .get(index)
+                .ok_or(ObjectStatesSnapshotError::InvalidValue)?;
+            if entry.health < 0
+                || entry.health > def.break_limit.max(0)
+                || !entry.angle_radians.is_finite()
+                || !entry
+                    .position
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= 4096.0)
+            {
+                return Err(ObjectStatesSnapshotError::InvalidValue);
+            }
+            state.raw_type = entry.raw_type;
+            state.health = entry.health;
+            state.placement.definition_index = index;
+            state.placement.position = entry.position;
+            state.placement.angle_radians = entry.angle_radians;
+        }
+        self.states = staged;
+        Ok(())
     }
 
     pub fn get(&self, cell: [usize; 2]) -> Option<&ObjectState> {
@@ -268,6 +351,33 @@ mod tests {
             extra: 0,
             size: 0,
         }
+    }
+    #[test]
+    fn snapshot_restores_replacement_pose_and_rejects_invalid_atomically() {
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![def("a.3o", 5), def("b.3o", 10)],
+        };
+        let mut source = ObjectStates::new(&[obj(0, [1, 2])], &defs).unwrap();
+        source
+            .apply_batch(&[ObjectAction::Change {
+                cell: [1, 2],
+                raw_type: 164,
+            }])
+            .unwrap();
+        assert!(source.set_pose([1, 2], [3.0, 4.0], 1.0));
+        assert!(source.set_health([1, 2], 7));
+        let snapshot = source.snapshot();
+        let mut target = ObjectStates::new(&[obj(0, [1, 2])], &defs).unwrap();
+        target.restore(&snapshot).unwrap();
+        assert_eq!(target.snapshot(), snapshot);
+        let mut invalid = snapshot.clone();
+        invalid.entries[0].health = 11;
+        assert_eq!(
+            target.restore(&invalid),
+            Err(ObjectStatesSnapshotError::InvalidValue)
+        );
+        assert_eq!(target.snapshot(), snapshot);
     }
     #[test]
     fn scripted_explode_advances_even_indestructible_object() {

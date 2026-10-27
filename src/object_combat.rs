@@ -67,7 +67,105 @@ pub struct ObjectCombat {
     targets: Vec<Target>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectCombatEntrySnapshot {
+    pub cell: [usize; 2],
+    pub raw_type: u8,
+    pub position: [f32; 2],
+    pub health: Option<i32>,
+    pub enabled: bool,
+    pub destroyed: bool,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectCombatSnapshot {
+    pub entries: Vec<ObjectCombatEntrySnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectCombatSnapshotError {
+    CountMismatch,
+    CellMismatch,
+    InvalidValue,
+}
+
 impl ObjectCombat {
+    pub fn snapshot(&self) -> ObjectCombatSnapshot {
+        ObjectCombatSnapshot {
+            entries: self
+                .targets
+                .iter()
+                .map(|target| ObjectCombatEntrySnapshot {
+                    cell: target.cell,
+                    raw_type: target.raw_type,
+                    position: target.position,
+                    health: target.health,
+                    enabled: target.enabled,
+                    destroyed: target.destroyed,
+                })
+                .collect(),
+        }
+    }
+
+    /// Validate and restore mutable state, recomputing derived values from the
+    /// loaded definitions and retaining linked/difficulty identity.
+    pub fn restore(
+        &mut self,
+        snapshot: &ObjectCombatSnapshot,
+        definitions: &ObjectDefinitions,
+    ) -> Result<(), ObjectCombatSnapshotError> {
+        if snapshot.entries.len() != self.targets.len() {
+            return Err(ObjectCombatSnapshotError::CountMismatch);
+        }
+        let mut staged = self.targets.clone();
+        let mut seen = BTreeSet::new();
+        for entry in &snapshot.entries {
+            if !seen.insert(entry.cell) {
+                return Err(ObjectCombatSnapshotError::CellMismatch);
+            }
+            let target = staged
+                .iter_mut()
+                .find(|t| t.cell == entry.cell)
+                .ok_or(ObjectCombatSnapshotError::CellMismatch)?;
+            let index = entry
+                .raw_type
+                .checked_sub(163)
+                .map(usize::from)
+                .filter(|&i| i < 64)
+                .ok_or(ObjectCombatSnapshotError::InvalidValue)?;
+            let def = definitions
+                .level_objects
+                .get(index)
+                .ok_or(ObjectCombatSnapshotError::InvalidValue)?;
+            let valid_health = match entry.health {
+                Some(h) => {
+                    def.break_limit > 0
+                        && h >= 0
+                        && h <= def.break_limit
+                        && entry.destroyed == (h == 0)
+                }
+                None => def.break_limit <= 0 && !entry.destroyed,
+            };
+            if !valid_health
+                || !entry
+                    .position
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= 4096.0)
+            {
+                return Err(ObjectCombatSnapshotError::InvalidValue);
+            }
+            target.raw_type = entry.raw_type;
+            target.position = entry.position;
+            target.health = entry.health;
+            target.enabled = entry.enabled;
+            target.destroyed = entry.destroyed;
+            target.radius = target_radius(def);
+            target.shootable = is_shootable(def, target.linked);
+            target.blow_up = def.blow_up;
+            target.blastable = def.collision_radius > 0 && def.blow_up != 0 && def.break_limit > 0;
+        }
+        self.targets = staged;
+        Ok(())
+    }
+
     /// Retain level objects; only positive break limit or shoot/destroy links
     /// make a non-dummy object shootable.
     /// Map item pickups and unrelated decorative objects are not yet shot
@@ -395,6 +493,29 @@ mod tests {
             extra: 0,
             size: 0,
         }
+    }
+    #[test]
+    fn snapshot_restores_damage_pose_and_rejects_invalid_atomically() {
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition(64, 10)],
+        };
+        let objects = [instance(0, [1, 1], [1.0, 0.0], 7)];
+        let script = Script::default();
+        let mut source = ObjectCombat::new(&objects, &defs, &script, Difficulty::Normal);
+        source.apply_hit([1, 1], 4).unwrap();
+        source.set_position([1, 1], [2.0, 0.0]);
+        let snapshot = source.snapshot();
+        let mut target = ObjectCombat::new(&objects, &defs, &script, Difficulty::Normal);
+        target.restore(&snapshot, &defs).unwrap();
+        assert_eq!(target.snapshot(), snapshot);
+        let mut invalid = snapshot.clone();
+        invalid.entries[0].health = Some(11);
+        assert_eq!(
+            target.restore(&invalid, &defs),
+            Err(ObjectCombatSnapshotError::InvalidValue)
+        );
+        assert_eq!(target.snapshot(), snapshot);
     }
     #[test]
     fn shoot_link_tracks_immortal_object_and_damage_events_are_repeatable() {

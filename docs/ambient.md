@@ -1,0 +1,7 @@
+# Ambient sound map
+
+`AmbientGrid::from_map` copies the map's initial x-major ambient sound IDs. A process can apply an ordered batch of `AmbientRegion` rectangle updates; each rectangle has inclusive signed tile coordinates and an ambient sound ID from 0 to 31. The entire batch is validated before writing, later rectangles overwrite earlier ones, and cloning the grid preserves state for snapshots. An update clips to the map; inverted or fully outside rectangles leave the grid unchanged. Map-provided IDs are copied verbatim.
+
+The bundled 2022 modding manual describes `ambient x1 y1 x2 y2 ambient_id` as a single irreversible change to sound IDs, and identifies level-local ambient IDs 0–31. In the remaster executable, opcode 14 writes a byte to the inclusive, bounded x-major rectangle in the process's one-time opening action routine. The manual's documented ID range is enforced instead of the executable's low-byte truncation. Process delay, activation, and transaction ordering belong to the host runtime; reversal or process locking does not restore previous cells.
+
+This module stores IDs only. It does not load sound definitions, select loops, reproduce original ambient transitions, or play audio. `cell` lets a client select the ID at its current map location when a sound presentation implementation is available.

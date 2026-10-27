@@ -1227,12 +1227,24 @@ impl Session {
             events.shot = Some(shot);
         }
         events.process_effects.extend(self.apply_process_effects());
-        events.enemy_attacks = self.ai.tick_with_collision(
+        // Enemy height is not yet modeled; one tile is a provisional body
+        // height, so overhead raised objects are excluded from the sweep.
+        let enemy_objects: Vec<_> = self
+            .processes
+            .objects()
+            .filter(|object| object.blocking_radius > 0.0 && object.elevation_raw < 64.0)
+            .map(|object| CollisionCircle {
+                center: object.position,
+                radius: object.blocking_radius,
+            })
+            .collect();
+        events.enemy_attacks = self.ai.tick_with_actor_collision(
             &mut self.actors,
             &self.actor_definitions,
             &self.rockets,
             &self.world,
             &|wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
+            &enemy_objects,
         );
         for index in 0..events.enemy_attacks.len() {
             let attack = events.enemy_attacks[index];
@@ -3841,5 +3853,75 @@ mod tests {
             .all(|a| a.outcome == ProcessOutcome::Accepted));
         assert_eq!(session.processes.cell_type([3, 0]), Some(165));
         assert_eq!(session.game.inventory.health, 100);
+    }
+    #[test]
+    fn chase_obeys_represented_object_pose_and_elevation() {
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let mut session = mission_session("");
+        session.world.player.position = [3.0, 0.5];
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 52,
+            actor_radius: 52,
+            speed: 10,
+            rotation_speed: 5,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        let placement = Monster {
+            position: [128, 128],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [0.5, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        let mut cells = [0; 4096];
+        cells[64] = 163;
+        let pose = ProcessObject {
+            cell: [1, 0],
+            position: [1.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.2,
+        };
+        let script = Script::default();
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        let mut overhead = session.clone();
+        overhead.processes = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &overhead.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[ProcessObject {
+                elevation_raw: 64.0,
+                ..pose
+            }],
+        )
+        .unwrap();
+        for _ in 0..90 {
+            session.step(SessionInput::default());
+            overhead.step(SessionInput::default());
+        }
+        assert!(session.actors.actors[0].position[0] <= 1.5 - 52.0 / 256.0 - 0.2 + 1e-4);
+        assert!(overhead.actors.actors[0].position[0] > 1.6);
     }
 }

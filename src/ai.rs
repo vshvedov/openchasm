@@ -7,7 +7,7 @@ use crate::actor_clips::ActorClipSet;
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::combat::RocketDefinitions;
 use crate::pickups::Difficulty;
-use crate::world::{Wall, World};
+use crate::world::{CollisionCircle, Wall, World};
 use std::collections::BTreeMap;
 
 const DT: f32 = 1.0 / 60.0;
@@ -274,9 +274,14 @@ impl EnemyAi {
         definitions: &ActorDefinitions,
         world: &World,
     ) -> Vec<EnemyAttack> {
-        self.tick_inner(actors, definitions, None, world, &|wall| {
-            (1..=120).contains(&wall.texture)
-        })
+        self.tick_inner(
+            actors,
+            definitions,
+            None,
+            world,
+            &|wall| (1..=120).contains(&wall.texture),
+            None,
+        )
     }
 
     /// As `tick`, also emitting projectile launch events from each actor's
@@ -288,9 +293,14 @@ impl EnemyAi {
         rockets: &RocketDefinitions,
         world: &World,
     ) -> Vec<EnemyAttack> {
-        self.tick_inner(actors, definitions, Some(rockets), world, &|wall| {
-            (1..=120).contains(&wall.texture)
-        })
+        self.tick_inner(
+            actors,
+            definitions,
+            Some(rockets),
+            world,
+            &|wall| (1..=120).contains(&wall.texture),
+            None,
+        )
     }
     /// Launch attacks using the level's material-specific shot collision rules.
     pub fn tick_with_collision(
@@ -301,7 +311,34 @@ impl EnemyAi {
         world: &World,
         blocks_shots: &dyn Fn(&Wall) -> bool,
     ) -> Vec<EnemyAttack> {
-        self.tick_inner(actors, definitions, Some(rockets), world, blocks_shots)
+        self.tick_inner(
+            actors,
+            definitions,
+            Some(rockets),
+            world,
+            blocks_shots,
+            None,
+        )
+    }
+    /// As `tick_with_collision`, sweep chase movement against the player,
+    /// living difficulty-enabled actors and the supplied represented objects.
+    pub fn tick_with_actor_collision(
+        &mut self,
+        actors: &mut ActorState,
+        definitions: &ActorDefinitions,
+        rockets: &RocketDefinitions,
+        world: &World,
+        blocks_shots: &dyn Fn(&Wall) -> bool,
+        objects: &[CollisionCircle],
+    ) -> Vec<EnemyAttack> {
+        self.tick_inner(
+            actors,
+            definitions,
+            Some(rockets),
+            world,
+            blocks_shots,
+            Some(objects),
+        )
     }
 
     fn tick_inner(
@@ -311,13 +348,37 @@ impl EnemyAi {
         rockets: Option<&RocketDefinitions>,
         world: &World,
         blocks_shots: &dyn Fn(&Wall) -> bool,
+        objects: Option<&[CollisionCircle]>,
     ) -> Vec<EnemyAttack> {
         let mut attacks = Vec::new();
         let target = world.player.position;
         if !target.iter().all(|v| v.is_finite()) {
             return attacks;
         }
-        for actor in &mut actors.actors {
+        let mut circles = objects.map(|_| {
+            actors
+                .actors
+                .iter()
+                .map(|actor| {
+                    let mode = self
+                        .brains
+                        .get(&actor.source_index)
+                        .map(|brain| brain.mode)?;
+                    if actor.health <= 0
+                        || matches!(mode, Mode::Inactive | Mode::Dead)
+                        || !actor.position.iter().all(|v| v.is_finite())
+                    {
+                        return None;
+                    }
+                    let def = definitions.entries.get(actor.definition_index)?;
+                    Some(CollisionCircle {
+                        center: actor.position,
+                        radius: (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        for (index, actor) in actors.actors.iter_mut().enumerate() {
             let Some(brain) = self.brains.get_mut(&actor.source_index) else {
                 continue;
             };
@@ -513,12 +574,32 @@ impl EnemyAi {
             // the upper bound and rest of the movement rules are provisional.
             let speed = (def.speed as f32 / 10.0).clamp(0.0, 8.0);
             let travel = (speed * DT).min(goal_distance);
-            let radius = (def.wall_radius as f32 / 256.0).clamp(0.05, 0.9);
             let delta = [
                 to_goal[0] / goal_distance * travel,
                 to_goal[1] / goal_distance * travel,
             ];
-            actor.position = move_actor(actor.position, delta, radius, &world.walls);
+            if let (Some(circles), Some(objects)) = (&mut circles, objects) {
+                let radius = (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0);
+                let mut obstacles = Vec::with_capacity(circles.len() + objects.len() + 1);
+                obstacles.push(CollisionCircle {
+                    center: target,
+                    radius: 0.18,
+                });
+                obstacles.extend(
+                    circles.iter().enumerate().filter_map(|(other, circle)| {
+                        (other != index).then_some(*circle).flatten()
+                    }),
+                );
+                obstacles.extend(objects.iter().copied());
+                actor.position = world.move_circle(actor.position, delta, radius, &obstacles);
+                circles[index] = Some(CollisionCircle {
+                    center: actor.position,
+                    radius,
+                });
+            } else {
+                let radius = (def.wall_radius as f32 / 256.0).clamp(0.05, 0.9);
+                actor.position = move_actor(actor.position, delta, radius, &world.walls);
+            }
         }
         attacks
     }
@@ -845,5 +926,86 @@ mod tests {
         assert!(ai.attack_animation(0).is_some());
         assert!(ai.tick(&mut state, &defs, &w).is_empty());
         assert!(ai.attack_animation(0).is_none());
+    }
+    #[test]
+    fn swept_chase_respects_player_and_represented_objects() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].kick = 0;
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let w = world([3.0, 0.0], vec![]);
+        let objects = [CollisionCircle {
+            center: [1.0, 0.0],
+            radius: 0.2,
+        }];
+        for _ in 0..180 {
+            ai.tick_with_actor_collision(&mut state, &defs, &rockets(), &w, &|_| true, &objects);
+        }
+        let radius = defs.entries[1].wall_radius as f32 / 256.0;
+        assert!(state.actors[0].position[0] <= 1.0 - radius - 0.2 + 1e-4);
+        for _ in 0..180 {
+            ai.tick_with_actor_collision(&mut state, &defs, &rockets(), &w, &|_| true, &[]);
+        }
+        assert!(state.actors[0].position[0] <= 3.0 - radius - 0.18 + 1e-4);
+        assert!(state.actors[0].position[0] > 2.0);
+    }
+    #[test]
+    fn swept_chase_blocks_living_peers_but_excludes_dead_and_disabled() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].kick = 0;
+        let mut stationary = defs.entries[1].clone();
+        stationary.speed = 0;
+        defs.entries.push(stationary);
+        let mut other = state.actors[0].clone();
+        other.source_index = 1;
+        other.definition_index = 2;
+        other.position = [1.0, 0.0];
+        state.actors.push(other);
+        let w = world([3.0, 0.0], vec![]);
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let mut dead_state = state.clone();
+        let mut dead_ai = ai.clone();
+        dead_state.actors[1].health = 0;
+        let mut disabled_state = state.clone();
+        disabled_state.actors[1].placement.flags = 1;
+        let mut disabled_ai = EnemyAi::new(&disabled_state, Difficulty::Normal);
+        for _ in 0..100 {
+            ai.tick_with_actor_collision(&mut state, &defs, &rockets(), &w, &|_| true, &[]);
+            dead_ai.tick_with_actor_collision(
+                &mut dead_state,
+                &defs,
+                &rockets(),
+                &w,
+                &|_| true,
+                &[],
+            );
+            disabled_ai.tick_with_actor_collision(
+                &mut disabled_state,
+                &defs,
+                &rockets(),
+                &w,
+                &|_| true,
+                &[],
+            );
+        }
+        let radius = defs.entries[1].wall_radius as f32 / 256.0;
+        assert!(state.actors[0].position[0] <= 1.0 - radius * 2.0 + 1e-4);
+        assert!(dead_state.actors[0].position[0] > 1.0);
+        assert!(disabled_state.actors[0].position[0] > 1.0);
+    }
+    #[test]
+    fn swept_chase_allows_escape_from_existing_object_overlap() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].kick = 0;
+        state.actors[0].position = [0.9, 0.0];
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let w = world([-1.0, 0.0], vec![]);
+        let object = CollisionCircle {
+            center: [1.0, 0.0],
+            radius: 0.3,
+        };
+        for _ in 0..10 {
+            ai.tick_with_actor_collision(&mut state, &defs, &rockets(), &w, &|_| true, &[object]);
+        }
+        assert!(state.actors[0].position[0] < 0.8);
     }
 }

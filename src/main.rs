@@ -13,6 +13,7 @@ mod weapon_render;
 
 use content::{ResourceSet, SourceKind};
 use map::{Map, MAP_SIDE, UNITS_PER_TILE};
+use openchasm::pickups::Difficulty;
 use openchasm::{actors, map, model, monster, objects, process, process_runtime, world};
 use std::env;
 use std::error::Error;
@@ -21,7 +22,7 @@ use std::path::{Path, PathBuf};
 use world::{Player, Wall, World};
 
 fn usage() {
-    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|objects [LEVEL]|gltf-info RESOURCE|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
+    eprintln!("Usage: openchasm [--source full|demo|local|PATH] [--difficulty easy|normal|hard] <sources|info|list [PREFIX]|levels|check|objects [LEVEL]|gltf-info RESOURCE|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
 }
 fn resource_paths(resources: &ResourceSet) -> Vec<String> {
     resources
@@ -252,23 +253,62 @@ fn make_world(map: &Map, graphics: &[WallGraphic]) -> Result<World, Box<dyn Erro
         },
     })
 }
+fn difficulty_mask(difficulty: Difficulty) -> u16 {
+    match difficulty {
+        Difficulty::Easy => 1,
+        Difficulty::Normal => 2,
+        Difficulty::Hard => 4,
+    }
+}
+
+fn parse_options(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Result<(Option<String>, Difficulty, bool), String> {
+    let mut source = None;
+    let mut difficulty = None;
+    while matches!(
+        args.peek().map(String::as_str),
+        Some("--source" | "--archive" | "--difficulty")
+    ) {
+        let option = args.next().expect("peeked option");
+        let value = args
+            .next()
+            .ok_or_else(|| format!("{option} requires a value"))?;
+        if option == "--difficulty" {
+            if difficulty.is_some() {
+                return Err("--difficulty specified more than once".into());
+            }
+            difficulty = Some(match value.to_ascii_lowercase().as_str() {
+                "easy" => Difficulty::Easy,
+                "normal" => Difficulty::Normal,
+                "hard" => Difficulty::Hard,
+                _ => {
+                    return Err(format!(
+                        "invalid difficulty {value:?}; choose easy, normal, or hard"
+                    ))
+                }
+            });
+        } else {
+            if source.is_some() {
+                return Err("source specified more than once".into());
+            }
+            source = Some(value);
+        }
+    }
+    let supplied = difficulty.is_some();
+    Ok((source, difficulty.unwrap_or(Difficulty::Normal), supplied))
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1).peekable();
-    let mut selection = None;
-    if matches!(
-        args.peek().map(String::as_str),
-        Some("--source" | "--archive")
-    ) {
-        args.next();
-        selection = Some(
-            args.next()
-                .ok_or("--source requires a path or source name")?,
-        );
-    }
+    let (selection, difficulty, difficulty_supplied) = parse_options(&mut args)?;
     let command = args.next().unwrap_or_else(|| "info".to_owned());
     if command == "--help" || command == "-h" {
         usage();
         return Ok(());
+    }
+    if difficulty_supplied && command != "view" {
+        return Err("--difficulty applies to view".into());
     }
     if command == "sources" {
         if args.next().is_some() {
@@ -397,12 +437,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let actor_clips =
                     load_actor_clips(&mut resources, &actor_state, &actor_definitions);
                 let instances = objects::instances(&map);
+                for instance in &instances {
+                    object_scene.set_visible(
+                        instance.grid_cell,
+                        instance.difficulty_flags & difficulty_mask(difficulty) != 0,
+                    );
+                }
                 // Only opt in for visible, difficulty-enabled object placements
                 // with a representable render instance; other targets stay closed.
                 let process_objects: Vec<_> = instances
                     .iter()
                     .filter_map(|instance| {
-                        if instance.difficulty_flags & 2 == 0
+                        if instance.difficulty_flags & difficulty_mask(difficulty) == 0
                             || !object_scene.has_cell(instance.grid_cell)
                         {
                             return None;
@@ -435,7 +481,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 &definitions,
                                 &instances,
                                 &script,
-                                openchasm::pickups::Difficulty::Normal,
+                                difficulty,
                             );
                             Some(openchasm::session::ScriptedObjects::new(
                                 states,
@@ -481,7 +527,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     weapons,
                     &instances,
                     &definitions,
-                    openchasm::pickups::Difficulty::Normal,
+                    difficulty,
                 );
                 if let Some(mut inventory) = carry.take() {
                     inventory.keys = [false; 3];
@@ -512,7 +558,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         game,
                         rockets,
                         shot_blocking,
-                        difficulty: openchasm::pickups::Difficulty::Normal,
+                        difficulty,
                     });
                 session.ai.set_clip_metadata(actor_clips);
                 session.set_explosions_enabled(true);
@@ -521,7 +567,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &instances,
                     &definitions,
                     &script,
-                    openchasm::pickups::Difficulty::Normal,
+                    difficulty,
                 ));
                 if let Some(scripted) = scripted {
                     session.set_scripted_objects(scripted);
@@ -540,8 +586,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                         weapon_overlay,
                         projectile_renderer,
                         explosion_renderer,
+                        difficulty,
                     },
-                    &format!("{id}: {name}"),
+                    &format!("{id}: {name} ({difficulty:?})"),
                 )?;
                 if let (Some(inventory), Some(next)) = (next_level, next_campaign_level(&id)) {
                     carry = Some(inventory);
@@ -640,6 +687,41 @@ fn main() {
 #[cfg(test)]
 mod wall_graphics_tests {
     use super::*;
+    #[test]
+    fn options_accept_source_and_difficulty_in_either_order() {
+        let mut args = ["--difficulty", "easy", "--source", "demo", "view", "01"]
+            .into_iter()
+            .map(str::to_owned)
+            .peekable();
+        assert_eq!(
+            parse_options(&mut args).unwrap(),
+            (Some("demo".into()), Difficulty::Easy, true)
+        );
+        assert_eq!(args.next().as_deref(), Some("view"));
+        let mut args = ["--archive", "/tmp/content", "--difficulty", "HARD", "view"]
+            .into_iter()
+            .map(str::to_owned)
+            .peekable();
+        assert_eq!(
+            parse_options(&mut args).unwrap(),
+            (Some("/tmp/content".into()), Difficulty::Hard, true)
+        );
+        let mut args = ["view"].into_iter().map(str::to_owned).peekable();
+        assert_eq!(
+            parse_options(&mut args).unwrap(),
+            (None, Difficulty::Normal, false)
+        );
+        for input in [
+            vec!["--difficulty", "invalid"],
+            vec!["--difficulty"],
+            vec!["--difficulty", "easy", "--difficulty", "hard"],
+            vec!["--source", "demo", "--archive", "x"],
+        ] {
+            let mut args = input.into_iter().map(str::to_owned).peekable();
+            assert!(parse_options(&mut args).is_err());
+        }
+    }
+
     #[test]
     fn process_object_collision_excludes_pickups_and_preserves_authored_radius() {
         use objects::ObjectKind::{Item, LevelObject};

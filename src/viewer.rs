@@ -268,9 +268,13 @@ fn draw_header(frame: &mut [u32], label: &str) {
     );
 }
 
-// Script state retains decorative and dummy placements that combat visibility
-// omits. The client currently runs normal difficulty (bit 2).
-fn level_object_visible(session: &Session, cell: [usize; 2], fallback: bool) -> bool {
+// Script state retains decorative and dummy placements that combat visibility omits.
+fn level_object_visible(
+    session: &Session,
+    cell: [usize; 2],
+    fallback: bool,
+    difficulty_mask: u16,
+) -> bool {
     let Some(state) = session
         .scripted_objects
         .as_ref()
@@ -282,18 +286,25 @@ fn level_object_visible(session: &Session, cell: [usize; 2], fallback: bool) -> 
         .objects
         .as_ref()
         .and_then(|combat| combat.is_active(cell));
-    scripted_object_visible(state.placement.difficulty_flags, active)
+    scripted_object_visible(state.placement.difficulty_flags, active, difficulty_mask)
 }
 
-fn scripted_object_visible(difficulty_flags: u16, active: Option<bool>) -> bool {
-    difficulty_flags & 2 != 0 && active.unwrap_or(true)
+fn scripted_object_visible(
+    difficulty_flags: u16,
+    active: Option<bool>,
+    difficulty_mask: u16,
+) -> bool {
+    difficulty_flags & difficulty_mask != 0 && active.unwrap_or(true)
 }
 
-fn restore_level_visibility(objects: &mut ObjectScene, session: &Session) {
+fn restore_level_visibility(objects: &mut ObjectScene, session: &Session, difficulty_mask: u16) {
     if let Some(scripted) = &session.scripted_objects {
         for state in scripted.states.iter() {
             let cell = state.placement.grid_cell;
-            objects.set_visible(cell, level_object_visible(session, cell, true));
+            objects.set_visible(
+                cell,
+                level_object_visible(session, cell, true, difficulty_mask),
+            );
         }
     }
 }
@@ -304,6 +315,7 @@ pub struct ClientFeedback {
     pub weapon_overlay: WeaponRenderer,
     pub projectile_renderer: ProjectileRenderer,
     pub explosion_renderer: Option<crate::explosion_render::ExplosionRenderer>,
+    pub difficulty: openchasm::pickups::Difficulty,
 }
 
 pub fn run(
@@ -319,14 +331,16 @@ pub fn run(
         weapon_overlay,
         projectile_renderer,
         mut explosion_renderer,
+        difficulty,
     } = feedback;
+    let difficulty_mask = crate::difficulty_mask(difficulty);
     let initial_session = session.clone();
     if let Some(targets) = &session.objects {
         for (cell, visible) in targets.visibility() {
             objects.set_visible(cell, visible);
         }
     }
-    restore_level_visibility(&mut objects, &session);
+    restore_level_visibility(&mut objects, &session, difficulty_mask);
     for cell in session.game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
@@ -521,7 +535,7 @@ pub fn run(
                     objects.set_visible(cell, visible);
                 }
             }
-            restore_level_visibility(&mut objects, &session);
+            restore_level_visibility(&mut objects, &session, difficulty_mask);
             for (cell, visible) in session.game.pickups.visibility() {
                 objects.set_visible(cell, visible);
             }
@@ -641,7 +655,10 @@ pub fn run(
                     .iter()
                     .any(|event| event.cell == cell);
                 let fallback = !hit_destroyed || replaced;
-                objects.set_visible(cell, level_object_visible(&session, cell, fallback));
+                objects.set_visible(
+                    cell,
+                    level_object_visible(&session, cell, fallback, difficulty_mask),
+                );
             }
             for effect in events.process_effects {
                 match effect {
@@ -1084,11 +1101,13 @@ mod tests {
     fn replacement_visibility_uses_final_combat_state_and_difficulty() {
         // A destroyed object replaced by a live target is shown; a destroyed
         // final target stays hidden, and an unshootable dummy stays represented.
-        assert!(scripted_object_visible(7, Some(true)));
-        assert!(!scripted_object_visible(7, Some(false)));
-        assert!(scripted_object_visible(7, None));
-        assert!(!scripted_object_visible(1, Some(true)));
-        assert!(!scripted_object_visible(1, None));
+        assert!(scripted_object_visible(7, Some(true), 2));
+        assert!(!scripted_object_visible(7, Some(false), 2));
+        assert!(scripted_object_visible(7, None, 2));
+        assert!(!scripted_object_visible(1, Some(true), 2));
+        assert!(!scripted_object_visible(1, None, 2));
+        assert!(scripted_object_visible(1, None, 1));
+        assert!(!scripted_object_visible(1, None, 4));
     }
     #[test]
     fn wheel_cycles_owned_nonempty_weapons_and_wraps() {

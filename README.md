@@ -13,12 +13,13 @@ cargo run --release -- sources
 cargo run --release -- --source full view 01
 ```
 
-Click the window to capture the mouse; move it or use **left/right arrows** to turn. Use **WASD** to move, **E** to use nearby linked objects, **Space** or the right mouse button to jump, the left mouse button to fire, **1–8** to select owned weapons or the **mouse wheel** to cycle through owned weapons with ammunition, **R** to restart the level, and **Escape** to quit. After a supported level exit, press **Enter** to continue. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
+Click the window to capture the mouse; move it or use **left/right arrows** to turn. Use **WASD** to move, **E** to use nearby linked objects, **Space** or the right mouse button to jump, the left mouse button to fire, **1–8** to select owned weapons or the **mouse wheel** to cycle through owned weapons with ammunition, **R** to restart the level, and **Escape** to quit. After a supported level exit, press **Enter** to continue. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Select `easy`, `normal`, or `hard` with `--difficulty` before `view`; the default is `normal`. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
 
 Examples:
 
 ```sh
-cargo run --release -- --source demo view 01
+cargo run --release -- --source demo --difficulty easy view 01
+cargo run --release -- --difficulty hard --source full view 01
 cargo run --release -- --source /path/to/csm.bin levels
 cargo run --release -- --source /path/to/loose-data view 01
 cargo run --release -- --source full check

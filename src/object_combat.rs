@@ -38,6 +38,7 @@ struct Target {
     health: Option<i32>,
     /// Raw BlowUp value is preserved for a future destruction/effect system.
     blow_up: i32,
+    blastable: bool,
     difficulty_enabled: bool,
     enabled: bool,
     destroyed: bool,
@@ -115,6 +116,7 @@ impl ObjectCombat {
                 radius,
                 health: (def.break_limit > 0).then_some(def.break_limit),
                 blow_up: def.blow_up,
+                blastable: def.collision_radius > 0 && def.blow_up != 0 && def.break_limit > 0,
                 difficulty_enabled: instance.difficulty_flags & mask != 0,
                 enabled: true,
                 destroyed: false,
@@ -161,6 +163,7 @@ impl ObjectCombat {
         target.radius = target_radius(def);
         target.health = (def.break_limit > 0).then_some(transition.new_health);
         target.blow_up = def.blow_up;
+        target.blastable = def.collision_radius > 0 && def.blow_up != 0 && def.break_limit > 0;
         target.destroyed = false;
         true
     }
@@ -275,6 +278,20 @@ impl ObjectCombat {
             destroyed: target.destroyed,
             blow_up: target.blow_up,
         })
+    }
+
+    /// Active destructible blast targets; height is supplied by the host.
+    pub fn explosion_targets(&self) -> impl Iterator<Item = ([usize; 2], [f32; 2], f32)> + '_ {
+        self.targets
+            .iter()
+            .filter(|target| {
+                target.blastable
+                    && target.shootable
+                    && target.difficulty_enabled
+                    && target.enabled
+                    && !target.destroyed
+            })
+            .map(|target| (target.cell, target.position, target.radius))
     }
 
     /// Return whether a tracked object can currently be hit. Untracked cells

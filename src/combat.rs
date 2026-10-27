@@ -185,6 +185,20 @@ impl Combat {
     where
         F: Fn(&Wall) -> bool,
     {
+        self.fire_with_explosions(weapon, context, blocks_shots, false)
+    }
+
+    /// Enable authored grenade firing only when the owning session handles splash.
+    pub fn fire_with_explosions<F>(
+        &mut self,
+        weapon: usize,
+        context: ShotContext<'_>,
+        blocks_shots: F,
+        explosions: bool,
+    ) -> FireResult
+    where
+        F: Fn(&Wall) -> bool,
+    {
         let ShotContext {
             inventory,
             weapons,
@@ -213,8 +227,8 @@ impl Combat {
             return FireResult::Unsupported;
         }
         let physical = !rocket.model_name.is_empty();
-        // Grenade and mine behavior require gravity, bouncing and placement.
-        if physical && !matches!(weapon, 3 | 4 | 7) {
+        // Mines require placement. Grenades require an explicit splash host.
+        if physical && !matches!(weapon, 3 | 4 | 7) && !(weapon == 5 && explosions) {
             return FireResult::Unsupported;
         }
         if inventory.ammo[weapon] == 0 {

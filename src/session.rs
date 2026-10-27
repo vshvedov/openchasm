@@ -2,6 +2,7 @@
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpact};
+use crate::explosives::{self, Cylinder, DamageEvent, Explosion, ExplosionTarget, TargetId};
 use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
@@ -19,6 +20,7 @@ use crate::quake::{QuakeField, QuakeZone};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
 use crate::wind::{WindError, WindField};
 use crate::world::{CollisionCircle, Input, World};
+use std::collections::BTreeMap;
 
 pub struct LevelSetup {
     pub world: World,
@@ -50,6 +52,9 @@ pub struct SessionEvents {
     pub damage: u16,
     pub enemy_attacks: Vec<EnemyAttack>,
     pub projectile_impacts: Vec<Impact>,
+    /// Impact explosions and raw pre-armor damage, in deterministic order.
+    pub explosions: Vec<Explosion>,
+    pub explosion_damage: Vec<DamageEvent>,
     /// Object cell and whether it was destroyed by this hit.
     pub object_hits: Vec<([usize; 2], bool)>,
     /// Ordered committed model replacements; the host must apply before next tick.
@@ -129,6 +134,8 @@ pub struct Session {
     pub ai: EnemyAi,
     pub selected_weapon: usize,
     pub projectiles: ProjectileSystem,
+    explosions_enabled: bool,
+    projectile_heights: BTreeMap<u64, f32>,
     pub objects: Option<ObjectCombat>,
     pub scripted_objects: Option<ScriptedObjects>,
     pub mission: Option<MissionState>,
@@ -172,6 +179,8 @@ impl Session {
             ai,
             selected_weapon: 0,
             projectiles: ProjectileSystem::new(),
+            explosions_enabled: false,
+            projectile_heights: BTreeMap::new(),
             objects: None,
             scripted_objects: None,
             mission: None,
@@ -183,6 +192,12 @@ impl Session {
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Opt into provisional straight 2D grenades and impact splash. The host
+    /// must consume explosion events and synchronize resulting object changes.
+    pub fn set_explosions_enabled(&mut self, enabled: bool) {
+        self.explosions_enabled = enabled;
+    }
+
     /// Install shootable object state before taking the restart snapshot.
     pub fn set_objects(&mut self, objects: ObjectCombat) {
         self.objects = Some(objects);
@@ -321,6 +336,134 @@ impl Session {
             }
         }
         (attempts, true)
+    }
+
+    /// Apply one impact as a transaction. Damage is only emitted after every
+    /// object destruction script has succeeded; direct impact is not applied.
+    fn apply_explosion(
+        &mut self,
+        explosion: Explosion,
+        impact: Impact,
+        events: &mut SessionEvents,
+        attempts: &mut Vec<ProcessEvent>,
+    ) {
+        let mut targets = vec![ExplosionTarget {
+            id: TargetId::Player,
+            cylinder: Cylinder {
+                center: self.world.player.position,
+                radius: 0.18,
+                bottom: self.vertical.feet(),
+                top: self.vertical.head(),
+            },
+        }];
+        targets.extend(self.actors.actors.iter().filter_map(|actor| {
+            if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive) {
+                return None;
+            }
+            let def = self.actor_definitions.entries.get(actor.definition_index)?;
+            Some(ExplosionTarget {
+                id: TargetId::Actor {
+                    source_index: actor.source_index,
+                },
+                cylinder: Cylinder {
+                    center: actor.position,
+                    radius: (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0),
+                    bottom: 0.0,
+                    top: 1.0,
+                },
+            })
+        }));
+        if let Some(objects) = &self.objects {
+            targets.extend(objects.explosion_targets().map(|(cell, center, radius)| {
+                ExplosionTarget {
+                    id: TargetId::Object { cell },
+                    cylinder: Cylinder {
+                        center,
+                        radius,
+                        bottom: 0.0,
+                        top: 1.0,
+                    },
+                }
+            }));
+        }
+        let Ok(damage) = explosives::resolve_explosion(explosion, &targets) else {
+            return;
+        };
+        let before = self.clone();
+        let attempt_count = attempts.len();
+        let hit_count = events.object_hits.len();
+        let transition_count = events.object_transitions.len();
+        let quake_count = events.quake_changes.len();
+        let previous_damage = events.damage;
+        // Contact still dispatches shoot links, independently of blast targets.
+        let hit_cell = match impact.target {
+            ImpactTarget::Object { cell } => Some([cell[0] as u8, cell[1] as u8]),
+            ImpactTarget::Wall { wall_index } => {
+                self.world.walls.get(wall_index).and_then(|wall| wall.cell)
+            }
+            _ => None,
+        };
+        if let Some(cell) = hit_cell {
+            attempts.extend(self.processes.activate_at("shoot", cell));
+        }
+        for item in &damage {
+            match item.target {
+                TargetId::Player => {
+                    events.damage = events.damage.saturating_add(
+                        self.apply_player_damage(item.damage.clamp(0, u16::MAX as i32) as u16),
+                    );
+                }
+                TargetId::Actor { source_index } => {
+                    if let Some(actor) = self
+                        .actors
+                        .actors
+                        .iter_mut()
+                        .find(|actor| actor.source_index == source_index)
+                    {
+                        actor.health = actor.health.saturating_sub(item.damage).max(0);
+                        if actor.health > 0 {
+                            self.ai.alert(
+                                source_index,
+                                explosion.center[..2].try_into().expect("two coordinates"),
+                            );
+                        }
+                    }
+                }
+                TargetId::Object { cell } => {
+                    let Some(hit) = self
+                        .objects
+                        .as_mut()
+                        .and_then(|objects| objects.apply_hit(cell, item.damage))
+                    else {
+                        continue;
+                    };
+                    self.sync_object_damage(cell, item.damage);
+                    if hit.destroyed {
+                        let (destroy_attempts, accepted) =
+                            self.activate_destroy([cell[0] as u8, cell[1] as u8], events);
+                        if !accepted {
+                            *self = before;
+                            attempts.truncate(attempt_count);
+                            events.object_hits.truncate(hit_count);
+                            events.object_transitions.truncate(transition_count);
+                            events.quake_changes.truncate(quake_count);
+                            events.damage = previous_damage;
+                            return;
+                        }
+                        attempts.extend(destroy_attempts);
+                        if !events.object_transitions[transition_count..]
+                            .iter()
+                            .any(|t| t.cell == cell)
+                        {
+                            self.invalidate_process_object(cell);
+                        }
+                    }
+                    events.object_hits.push((cell, hit.destroyed));
+                }
+            }
+        }
+        events.explosions.push(explosion);
+        events.explosion_damage.extend(damage);
     }
 
     /// Attach a freshly parsed mission before taking the session's restart snapshot.
@@ -674,7 +817,7 @@ impl Session {
                 .as_ref()
                 .map(|_| self.processes.clone());
             let attempts_before_hit = attempts.len();
-            let mut shot = self.combat.fire(
+            let mut shot = self.combat.fire_with_explosions(
                 self.selected_weapon,
                 ShotContext {
                     inventory: &mut self.game.inventory,
@@ -693,6 +836,7 @@ impl Session {
                         self.vertical.eye(),
                     )
                 },
+                self.explosions_enabled,
             );
             match shot {
                 FireResult::Fired(ShotImpact::Object {
@@ -748,7 +892,14 @@ impl Session {
                     origin: self.world.player.position,
                     direction: [cos, sin],
                 };
-                if self.projectiles.spawn(launch, &self.rockets).is_err() {
+                let spawned = if self.explosions_enabled && self.selected_weapon == 5 {
+                    self.projectiles.spawn_straight(launch, &self.rockets)
+                } else {
+                    self.projectiles.spawn(launch, &self.rockets)
+                };
+                if let Ok(id) = spawned {
+                    self.projectile_heights.insert(id, self.vertical.eye());
+                } else {
                     self.game.inventory.ammo[self.selected_weapon] =
                         self.game.inventory.ammo[self.selected_weapon].saturating_add(1);
                     self.combat.cancel_shot();
@@ -781,17 +932,18 @@ impl Session {
                 target,
             } = attack.kind
             {
-                let _ = self.projectiles.spawn(
-                    Launch {
-                        owner: Owner::Enemy {
-                            source_index: attack.source_index,
-                        },
-                        rocket_id,
-                        origin,
-                        direction: [target[0] - origin[0], target[1] - origin[1]],
+                let launch = Launch {
+                    owner: Owner::Enemy {
+                        source_index: attack.source_index,
                     },
-                    &self.rockets,
-                );
+                    rocket_id,
+                    origin,
+                    direction: [target[0] - origin[0], target[1] - origin[1]],
+                };
+                let spawned = self.projectiles.spawn(launch, &self.rockets);
+                if let Ok(id) = spawned {
+                    self.projectile_heights.insert(id, 1.0);
+                }
                 continue;
             }
             events.damage = events
@@ -808,6 +960,28 @@ impl Session {
         );
         for index in 0..events.projectile_impacts.len() {
             let impact = events.projectile_impacts[index];
+            let height = self
+                .projectile_heights
+                .remove(&impact.projectile_id)
+                .unwrap_or(0.75);
+            let radius_raw = self
+                .rockets
+                .0
+                .get(impact.rocket_id)
+                .and_then(|rocket| rocket.raw_fields.get(2))
+                .copied()
+                .unwrap_or(0);
+            if self.explosions_enabled && radius_raw > 200 && impact.target != ImpactTarget::Expired
+            {
+                let explosion = Explosion {
+                    owner: impact.owner,
+                    center: [impact.position[0], impact.position[1], height],
+                    radius: radius_raw as f32 / 256.0,
+                    damage: impact.damage,
+                };
+                self.apply_explosion(explosion, impact, &mut events, &mut attempts);
+                continue;
+            }
             match impact.target {
                 ImpactTarget::Player => {
                     events.damage = events.damage.saturating_add(
@@ -2240,5 +2414,358 @@ mod tests {
         assert_eq!(session.game.pickups.is_visible([0, 0]), Some(false));
         assert_eq!(session.processes.cell_type([3, 0]), Some(164));
         assert_eq!(accepted.object_transitions.len(), 1);
+    }
+    #[test]
+    fn grenade_opt_in_explodes_once_and_hurts_owner() {
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.walls.push(Wall {
+            a: [1.5, 0.0],
+            b: [1.5, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "grenade.3o".into(),
+            power: 100,
+            raw_fields: vec![2, 0, 424, 42, 100, 0, 0, 1, 0, 0, 0, 18],
+        }]);
+        session.game.inventory.weapons[5] = true;
+        session.game.inventory.ammo[5] = 1;
+        let mut disabled = session.clone();
+        assert_eq!(
+            disabled
+                .step(SessionInput {
+                    fire: true,
+                    select_weapon: Some(5),
+                    ..Default::default()
+                })
+                .shot,
+            Some(FireResult::Unsupported)
+        );
+        assert_eq!(disabled.game.inventory.ammo[5], 1);
+        let mut below_threshold = session.clone();
+        below_threshold.rockets.0[0].raw_fields[2] = 200;
+        below_threshold.set_explosions_enabled(true);
+        below_threshold.step(SessionInput {
+            fire: true,
+            select_weapon: Some(5),
+            ..Default::default()
+        });
+        let mut impacts = 0;
+        for _ in 0..20 {
+            let events = below_threshold.step(SessionInput::default());
+            impacts += events.projectile_impacts.len();
+            assert!(events.explosions.is_empty());
+        }
+        assert_eq!(impacts, 1);
+        assert_eq!(below_threshold.game.inventory.health, 100);
+        session.set_explosions_enabled(true);
+        let fire = session.step(SessionInput {
+            fire: true,
+            select_weapon: Some(5),
+            ..Default::default()
+        });
+        assert!(matches!(
+            fire.shot,
+            Some(FireResult::Fired(ShotImpact::Launch { rocket_id: 0 }))
+        ));
+        let mut seen = 0;
+        for _ in 0..20 {
+            let events = session.step(SessionInput::default());
+            seen += events.explosions.len();
+            if !events.explosions.is_empty() {
+                assert!(events
+                    .explosion_damage
+                    .iter()
+                    .any(|e| e.target == TargetId::Player
+                        && e.owner == Owner::Player
+                        && e.damage > 0));
+                assert!(events.damage > 0);
+            }
+        }
+        assert_eq!(seen, 1);
+        assert!(session.game.inventory.health < 100);
+    }
+    #[test]
+    fn gravity_bounce_and_homing_grenades_are_rejected_without_ammo_loss() {
+        for index in [1, 5, 9] {
+            let mut session = mission_session("");
+            let mut raw = vec![2, 0, 424, 42, 100, 0, 0, 0, 0, 0, 0];
+            raw[index] = 1;
+            session.rockets = RocketDefinitions(vec![RocketDefinition {
+                model_name: "grenade.3o".into(),
+                power: 100,
+                raw_fields: raw,
+            }]);
+            session.game.inventory.weapons[5] = true;
+            session.game.inventory.ammo[5] = 1;
+            session.set_explosions_enabled(true);
+            assert_eq!(
+                session
+                    .step(SessionInput {
+                        fire: true,
+                        select_weapon: Some(5),
+                        ..Default::default()
+                    })
+                    .shot,
+                Some(FireResult::Unsupported)
+            );
+            assert_eq!(session.game.inventory.ammo[5], 1);
+            assert!(session.projectiles.active().is_empty());
+        }
+    }
+    #[test]
+    fn explosion_applies_only_one_hit_to_direct_actor_and_skips_zero_damage() {
+        let mut session = mission_session("");
+        let definition = ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 32,
+            actor_radius: 32,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        };
+        session.actor_definitions.entries.push(definition);
+        let placement = Monster {
+            position: [512, 0],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [2.0, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        let explosion = Explosion {
+            owner: Owner::Player,
+            center: [2.0, 0.5, 0.75],
+            radius: 1.0,
+            damage: 30,
+        };
+        let impact = Impact {
+            projectile_id: 0,
+            owner: Owner::Player,
+            rocket_id: 0,
+            target: ImpactTarget::Actor { source_index: 7 },
+            position: [2.0, 0.5],
+            damage: 30,
+            time: 0.0,
+        };
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        session.apply_explosion(explosion, impact, &mut events, &mut attempts);
+        assert_eq!(session.actors.actors[0].health, 70);
+        assert_eq!(
+            events
+                .explosion_damage
+                .iter()
+                .filter(|event| event.target == TargetId::Actor { source_index: 7 })
+                .count(),
+            1
+        );
+        assert!(!events
+            .explosion_damage
+            .iter()
+            .any(|event| event.target == TargetId::Player));
+    }
+    #[test]
+    fn explosion_object_script_failure_rolls_back_all_damage_and_contact_links() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text = "#proc1\n#action\nchange 3 0 165\n#end\n#proc2\n#action\nplayani 99\n#end\n#links\nshoot 1 0 2\ndestroy 1 0 1\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        let def = |name: &str, health, blow_up| ObjectDefinition {
+            collision_radius: 32,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up,
+            break_limit: health,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![
+                def("barrel.3o", 10, 1),
+                def("switch.3o", 0, 0),
+                def("dummy.3o", 0, 0),
+            ],
+        };
+        let object = |cell: [usize; 2], definition_index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index,
+            grid_cell: cell,
+            position: [cell[0] as f32 + 0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let instances = [object([1, 0], 0), object([3, 0], 1)];
+        let mut cells = [0; 4096];
+        cells[64] = 163;
+        cells[192] = 164;
+        let poses: Vec<_> = instances
+            .iter()
+            .map(|o| ProcessObject {
+                cell: [o.grid_cell[0] as u8, 0],
+                position: o.position,
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 0.125,
+            })
+            .collect();
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        session.set_scripted_objects(ScriptedObjects::new(
+            ObjectStates::new(&instances, &defs).unwrap(),
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        let explosion = Explosion {
+            owner: Owner::Player,
+            center: [1.5, 0.5, 0.75],
+            radius: 2.0,
+            damage: 100,
+        };
+        let impact = Impact {
+            projectile_id: 0,
+            owner: Owner::Player,
+            rocket_id: 0,
+            target: ImpactTarget::Object { cell: [1, 0] },
+            position: [1.5, 0.5],
+            damage: 100,
+            time: 0.0,
+        };
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        session.apply_explosion(explosion, impact, &mut events, &mut attempts);
+        assert_eq!(session.game.inventory.health, 100);
+        assert_eq!(
+            session.objects.as_ref().unwrap().is_active([1, 0]),
+            Some(true)
+        );
+        assert_eq!(session.processes.cell_type([3, 0]), Some(164));
+        assert!(events.explosions.is_empty());
+        assert!(events.explosion_damage.is_empty());
+        assert!(session.processes.take_effects().is_empty());
+        assert!(attempts.is_empty());
+        session
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([3, 0], 165);
+        session.apply_explosion(explosion, impact, &mut events, &mut attempts);
+        assert!(session.game.inventory.health < 100);
+        assert_eq!(
+            session.objects.as_ref().unwrap().is_active([1, 0]),
+            Some(false)
+        );
+        assert_eq!(session.processes.cell_type([3, 0]), Some(165));
+        assert_eq!(events.explosions.len(), 1);
+        assert_eq!(events.object_hits, vec![([1, 0], true)]);
+        assert!(session
+            .processes
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, ProcessEffect::PlayAnimation { object_id: 99 })));
+    }
+    #[test]
+    fn explosion_mode_preserves_legacy_enemy_and_mega_projectile_launches() {
+        let mut session = mission_session("");
+        let definition = ActorDefinition {
+            model_name: "gross.car".into(),
+            wall_radius: 32,
+            actor_radius: 32,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: 0,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        };
+        session.actor_definitions.entries.push(definition);
+        let placement = Monster {
+            position: [4 * 256, 128],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [4.5, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "gravity.3o".into(),
+            power: 100,
+            raw_fields: vec![4, 3, 640, 42, 100, 1, 0, 0, 0, 1, 0],
+        }]);
+        session.game.inventory.weapons[7] = true;
+        session.game.inventory.ammo[7] = 1;
+        session.set_explosions_enabled(true);
+        let events = session.step(SessionInput {
+            fire: true,
+            select_weapon: Some(7),
+            ..Default::default()
+        });
+        assert!(matches!(
+            events.shot,
+            Some(FireResult::Fired(ShotImpact::Launch { rocket_id: 0 }))
+        ));
+        assert!(events
+            .enemy_attacks
+            .iter()
+            .any(|attack| matches!(attack.kind, EnemyAttackKind::Ranged { instant: false, .. })));
+        assert!(session
+            .projectiles
+            .active()
+            .iter()
+            .any(|p| p.owner == Owner::Player));
+        assert!(session
+            .projectiles
+            .active()
+            .iter()
+            .any(|p| p.owner == Owner::Enemy { source_index: 7 }));
     }
 }

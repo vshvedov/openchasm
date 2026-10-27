@@ -221,6 +221,25 @@ impl ProjectileSystem {
         Ok(id)
     }
 
+    /// Conservative opt-in path: no gravity, bounce, or homing physics.
+    pub fn spawn_straight(
+        &mut self,
+        launch: Launch,
+        rockets: &RocketDefinitions,
+    ) -> Result<u64, SpawnError> {
+        let rocket = rockets
+            .0
+            .get(launch.rocket_id)
+            .ok_or(SpawnError::UnknownRocket)?;
+        if [1, 5, 9]
+            .into_iter()
+            .any(|index| rocket.raw_fields.get(index).copied().unwrap_or(0) != 0)
+        {
+            return Err(SpawnError::InvalidRocket);
+        }
+        self.spawn(launch, rockets)
+    }
+
     /// Advance using the current level and actor state. The wall predicate is
     /// the caller's material-specific shooting collision rule. The returned
     /// impacts are sorted by their time in the tick and then projectile ID.

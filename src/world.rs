@@ -60,7 +60,12 @@ fn scale(a: [f32; 2], k: f32) -> [f32; 2] {
 }
 
 /// Earliest entry time and outward contact normal of a moving disc against a segment.
-fn sweep_wall(origin: [f32; 2], delta: [f32; 2], wall: &Wall) -> Option<(f32, [f32; 2])> {
+fn sweep_wall(
+    origin: [f32; 2],
+    delta: [f32; 2],
+    wall: &Wall,
+    radius: f32,
+) -> Option<(f32, [f32; 2])> {
     let edge = sub(wall.b, wall.a);
     let edge_length_sq = dot(edge, edge);
     if edge_length_sq < 1e-12 {
@@ -87,7 +92,7 @@ fn sweep_wall(origin: [f32; 2], delta: [f32; 2], wall: &Wall) -> Option<(f32, [f
     );
     let separation = sub(origin, closest);
     let separation_sq = dot(separation, separation);
-    if separation_sq < PLAYER_RADIUS * PLAYER_RADIUS {
+    if separation_sq < radius * radius {
         if separation_sq > 1e-12 {
             consider(0.0, scale(separation, 1.0 / separation_sq.sqrt()));
         } else {
@@ -101,7 +106,7 @@ fn sweep_wall(origin: [f32; 2], delta: [f32; 2], wall: &Wall) -> Option<(f32, [f
     let travel_normal = dot(delta, normal);
     if travel_normal.abs() > 1e-8 {
         for side in [-1.0, 1.0] {
-            let time = (side * PLAYER_RADIUS - initial_distance) / travel_normal;
+            let time = (side * radius - initial_distance) / travel_normal;
             if (0.0..=1.0).contains(&time) {
                 let contact = add(relative, scale(delta, time));
                 let along = dot(contact, tangent);
@@ -118,7 +123,7 @@ fn sweep_wall(origin: [f32; 2], delta: [f32; 2], wall: &Wall) -> Option<(f32, [f
         for point in [wall.a, wall.b] {
             let offset = sub(origin, point);
             let b = dot(offset, delta);
-            let c = dot(offset, offset) - PLAYER_RADIUS * PLAYER_RADIUS;
+            let c = dot(offset, offset) - radius * radius;
             let discriminant = b * b - speed_sq * c;
             if discriminant >= 0.0 {
                 let time = (-b - discriminant.sqrt()) / speed_sq;
@@ -140,6 +145,7 @@ fn sweep_circle(
     origin: [f32; 2],
     delta: [f32; 2],
     circle: &CollisionCircle,
+    radius: f32,
 ) -> Option<(f32, [f32; 2])> {
     if !circle.radius.is_finite()
         || circle.radius < 0.0
@@ -147,7 +153,7 @@ fn sweep_circle(
     {
         return None;
     }
-    let combined = PLAYER_RADIUS + circle.radius;
+    let combined = radius + circle.radius;
     let combined_sq = combined * combined;
     let offset = sub(origin, circle.center);
     let distance_sq = dot(offset, offset);
@@ -184,12 +190,22 @@ fn sweep_circle(
 }
 
 fn move_and_slide(
-    mut position: [f32; 2],
-    mut displacement: [f32; 2],
+    position: [f32; 2],
+    displacement: [f32; 2],
     walls: &[Wall],
     circles: &[CollisionCircle],
 ) -> [f32; 2] {
-    // Multiple contacts let the player slide along walls and stop at corners.
+    move_circle_and_slide(position, displacement, PLAYER_RADIUS, walls, circles)
+}
+
+fn move_circle_and_slide(
+    mut position: [f32; 2],
+    mut displacement: [f32; 2],
+    radius: f32,
+    walls: &[Wall],
+    circles: &[CollisionCircle],
+) -> [f32; 2] {
+    // Multiple contacts let a disc slide along walls and stop at corners.
     for _ in 0..4 {
         let travel_sq = dot(displacement, displacement);
         if travel_sq < 1e-12 {
@@ -198,11 +214,11 @@ fn move_and_slide(
         let hit = walls
             .iter()
             .filter(|wall| wall.blocks_movement)
-            .filter_map(|wall| sweep_wall(position, displacement, wall))
+            .filter_map(|wall| sweep_wall(position, displacement, wall, radius))
             .chain(
                 circles
                     .iter()
-                    .filter_map(|circle| sweep_circle(position, displacement, circle)),
+                    .filter_map(|circle| sweep_circle(position, displacement, circle, radius)),
             )
             .min_by(|a, b| a.0.total_cmp(&b.0));
         let Some((time, normal)) = hit else {
@@ -239,6 +255,26 @@ impl World {
         hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     }
 
+    /// Move a disc using the same swept wall and circle collision as the player.
+    pub fn move_circle(
+        &self,
+        position: [f32; 2],
+        displacement: [f32; 2],
+        radius: f32,
+        circles: &[CollisionCircle],
+    ) -> [f32; 2] {
+        if !position
+            .iter()
+            .chain(displacement.iter())
+            .all(|v| v.is_finite())
+            || !radius.is_finite()
+            || radius <= 0.0
+        {
+            return position;
+        }
+        move_circle_and_slide(position, displacement, radius, &self.walls, circles)
+    }
+
     /// Advance a bounded time step using a swept circular player and wall sliding.
     /// Gameplay values and material rules remain provisional pending comparison.
     pub fn step(&mut self, input: Input, dt: f32) {
@@ -249,7 +285,19 @@ impl World {
     /// a 2D approximation; circles should include only live, vertically
     /// overlapping actors. The input time cap and movement constants match step.
     pub fn step_with_circles(&mut self, input: Input, dt: f32, circles: &[CollisionCircle]) {
-        if !self.player.angle.is_finite()
+        self.step_with_external(input, dt, circles, [0.0, 0.0]);
+    }
+
+    /// Combine external displacement with input before sweeping for collisions.
+    pub fn step_with_external(
+        &mut self,
+        input: Input,
+        dt: f32,
+        circles: &[CollisionCircle],
+        external: [f32; 2],
+    ) {
+        if !external.iter().all(|v| v.is_finite())
+            || !self.player.angle.is_finite()
             || !self.player.position.iter().all(|value| value.is_finite())
             || !dt.is_finite()
             || dt <= 0.0
@@ -270,8 +318,8 @@ impl World {
             strafe /= magnitude;
         }
         let displacement = [
-            (cos * forward - sin * strafe) * 2.5 * dt,
-            (sin * forward + cos * strafe) * 2.5 * dt,
+            (cos * forward - sin * strafe) * 2.5 * dt + external[0],
+            (sin * forward + cos * strafe) * 2.5 * dt + external[1],
         ];
         self.player.position =
             move_and_slide(self.player.position, displacement, &self.walls, circles);

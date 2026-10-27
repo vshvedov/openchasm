@@ -10,7 +10,8 @@ use crate::pickups::{Difficulty, PickupEvent};
 use crate::process_runtime::{ProcessEffect, ProcessOutcome, ProcessRuntime};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
-use crate::world::{Input, World};
+use crate::wind::{WindError, WindField};
+use crate::world::{CollisionCircle, Input, World};
 
 pub struct LevelSetup {
     pub world: World,
@@ -49,6 +50,8 @@ pub struct SessionEvents {
     pub process_effects: Vec<ProcessEffect>,
     pub hazard_damage: Vec<HazardDamage>,
     pub vertical: VerticalEvents,
+    /// Invalid or duplicate wind activation, if emitted by a process.
+    pub wind_errors: Vec<WindError>,
 }
 
 #[derive(Clone)]
@@ -65,6 +68,8 @@ pub struct Session {
     pub objects: Option<ObjectCombat>,
     pub mission: Option<MissionState>,
     pub hazards: Hazards,
+    pub wind: WindField,
+    pending_wind_errors: Vec<WindError>,
     /// Absolute offsets in original script units, indexed by wall index.
     pub wall_elevations: Vec<f32>,
     base_wall_blocking: Vec<bool>,
@@ -105,6 +110,8 @@ impl Session {
             objects: None,
             mission: None,
             hazards: Hazards::default(),
+            wind: WindField::new(),
+            pending_wind_errors: Vec::new(),
             combat: Combat::new(),
             rockets: setup.rockets,
             shot_blocking: setup.shot_blocking,
@@ -177,6 +184,17 @@ impl Session {
         let effects = self.processes.take_effects();
         for effect in &effects {
             self.hazards.apply_effect(effect);
+            match effect {
+                ProcessEffect::WindActivated { process_id, zones } => {
+                    if let Err(error) = self.wind.activate(*process_id, zones) {
+                        self.pending_wind_errors.push(error);
+                    }
+                }
+                ProcessEffect::WindDeactivated { process_id } => {
+                    self.wind.deactivate(*process_id);
+                }
+                _ => {}
+            }
             if let ProcessEffect::ObjectPose { cell, position, .. } = *effect {
                 let cell = [usize::from(cell[0]), usize::from(cell[1])];
                 self.game.pickups.set_position(cell, position);
@@ -279,7 +297,64 @@ impl Session {
                     radius: object.blocking_radius,
                 }),
         );
-        self.world.step_with_circles(input.movement, DT, &circles);
+        let displacement = self
+            .wind
+            .displacement(self.world.player.position, DT)
+            .unwrap_or([0.0, 0.0]);
+        self.world
+            .step_with_external(input.movement, DT, &circles, displacement);
+        // Move live actors in stable order using the same tick-start field.
+        // Rebuild obstacles after each move, so subsequent actors see new positions.
+        for index in 0..self.actors.actors.len() {
+            let actor = &self.actors.actors[index];
+            if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive) {
+                continue;
+            }
+            let Some(definition) = self.actor_definitions.entries.get(actor.definition_index)
+            else {
+                continue;
+            };
+            let radius = (definition.wall_radius as f32 / 256.0).clamp(0.05, 2.0);
+            let position = actor.position;
+            let displacement = self.wind.displacement(position, DT).unwrap_or([0.0, 0.0]);
+            if displacement == [0.0, 0.0] {
+                continue;
+            }
+            let mut obstacles = vec![CollisionCircle {
+                center: self.world.player.position,
+                radius: 0.18,
+            }];
+            obstacles.extend(self.actors.actors.iter().enumerate().filter_map(
+                |(other_index, other)| {
+                    if other_index == index
+                        || other.health <= 0
+                        || self.ai.mode(other.source_index) == Some(Mode::Inactive)
+                    {
+                        return None;
+                    }
+                    let definition = self.actor_definitions.entries.get(other.definition_index)?;
+                    Some(CollisionCircle {
+                        center: other.position,
+                        radius: (definition.wall_radius as f32 / 256.0).clamp(0.05, 2.0),
+                    })
+                },
+            ));
+            obstacles.extend(
+                self.processes
+                    .objects()
+                    .filter(|object| {
+                        object.blocking_radius > 0.0
+                            && object.elevation_raw / 64.0 < self.vertical.head()
+                    })
+                    .map(|object| CollisionCircle {
+                        center: object.position,
+                        radius: object.blocking_radius,
+                    }),
+            );
+            self.actors.actors[index].position =
+                self.world
+                    .move_circle(position, displacement, radius, &obstacles);
+        }
         events.pickups = self.game.collect_near(self.world.player.position);
         self.processes.set_keys(self.game.inventory.keys);
         let mut attempts = Vec::new();
@@ -500,6 +575,7 @@ impl Session {
                 }
             }
         }
+        events.wind_errors = std::mem::take(&mut self.pending_wind_errors);
         events
     }
 }
@@ -561,6 +637,103 @@ mod tests {
         session.set_mission(MissionPlan::parse(&script, text));
         session
     }
+    #[test]
+    fn scripted_wind_starts_next_tick_and_cannot_push_player_through_wall() {
+        use crate::process_runtime::ProcessCapabilities;
+        use crate::world::Wall;
+        let text = "#proc1\n#action\nnonstop\nwind 0 0 5 5 64 0\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let mut session = mission_session(text);
+        session.world.walls.push(Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        session.processes = ProcessRuntime::with_wind(
+            &Script::parse(text),
+            &session.world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        let first = session.step(SessionInput::default());
+        assert!(first.wind_errors.is_empty());
+        assert!(session.wind.is_active(1));
+        assert_eq!(session.world.player.position, [0.5, 0.5]);
+        for _ in 0..20 {
+            assert!(session.step(SessionInput::default()).wind_errors.is_empty());
+        }
+        assert!(session.world.player.position[0] > 0.8);
+        assert!(session.world.player.position[0] <= 0.8201);
+    }
+
+    #[test]
+    fn wind_moves_live_actor_with_its_own_collision_radius() {
+        use crate::wind::WindZone;
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.player.position = [5.5, 5.5];
+        session.world.walls.push(Wall {
+            a: [2.0, 0.0],
+            b: [2.0, 2.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "test.car".into(),
+            wall_radius: 64,
+            actor_radius: 64,
+            speed: 0,
+            rotation_speed: 0,
+            health: 30,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: "".into(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 0,
+            definition_index: 0,
+            placement: Monster {
+                position: [256, 128],
+                id: 100,
+                angle: 0,
+                flags: 2,
+            },
+            position: [1.0, 0.5],
+            angle_radians: 0.0,
+            health: 30,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session
+            .wind
+            .activate(
+                1,
+                &[WindZone {
+                    min_cell: [0, 0],
+                    max_cell: [5, 5],
+                    direction: [64, 0],
+                }],
+            )
+            .unwrap();
+        for _ in 0..10 {
+            session.step(SessionInput::default());
+        }
+        let x = session.actors.actors[0].position[0];
+        assert!(x > 1.7 && x <= 1.7501, "{x}");
+        session.actors.actors[0].health = 0;
+        session.step(SessionInput::default());
+        assert_eq!(session.actors.actors[0].position[0], x);
+    }
+
     #[test]
     fn look_input_is_finite_bounded_and_applied_before_movement() {
         let mut session = mission_session("");

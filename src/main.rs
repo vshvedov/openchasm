@@ -349,7 +349,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         })
                     })
                     .collect();
-                let processes = process_runtime::ProcessRuntime::with_objects_and_hazards(
+                let processes = process_runtime::ProcessRuntime::with_wind(
                     &script,
                     &world,
                     process_runtime::ProcessCapabilities {

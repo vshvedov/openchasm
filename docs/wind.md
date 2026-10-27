@@ -9,3 +9,13 @@ Overlapping regions follow the published PanzerChasm implementation: activation 
 The algorithm and 0.5 factor are based on [PanzerChasm's ProcessWind and monster update](https://github.com/Panzerschrek/Chasm-Reverse/blob/master/src/server/map.cpp). Their comments describe interpolation as approximate; neither the original engine's units nor edge handling have been verified. Signed field values are limited to the reference's signed-byte range and invalid inputs fail without altering state.
 
 The local campaign contains 57 six-field wind commands with valid zones. Level 16 process 7's field gives raw +8, +10 and +12 along its three horizontal regions at cell centers. Level 12 process 26 contains one `wind 34 31 34 32 10 0 1` command with a seventh field; its meaning remains unknown and the standalone field does not parse or discard it. A future process parser should preserve or reject that variant rather than silently treating it as proven behavior.
+
+The session consumes process wind activation and deactivation effects. Wind
+active at the start of a 60 Hz tick is combined with player input in one swept
+collision move, then applied to living actors in stable actor order using their
+provisional wall radii. Actors collide with walls, the player, other living
+actors, and represented blocking process objects. A wind activated during the
+process update starts moving entities on the next tick. Invalid activation
+errors are exposed in `SessionEvents::wind_errors`. The existing 2D wall and
+object clearance rules are approximations; actor wind uses the same current
+wall blocking state as player movement, pending actor-specific vertical physics.

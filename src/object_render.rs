@@ -437,6 +437,7 @@ struct Raster<'a> {
     palette: &'a [u32; 256],
     translucent: Option<Translucency>,
     instance_light: f32,
+    instance_static_light: Option<f32>,
 }
 impl Raster<'_> {
     fn put(&mut self, pixel: usize, distance: f32, rgb: u32, alpha: u8) {
@@ -497,7 +498,9 @@ impl Raster<'_> {
                     continue;
                 }
                 let rgb = self.palette[index as usize];
-                let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
+                let attenuation = self
+                    .instance_static_light
+                    .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
                 let channel = |base: u32| {
                     ((base as f32 * attenuation * (1.0 + self.instance_light)) as u32).min(255)
                 };
@@ -572,7 +575,9 @@ impl Raster<'_> {
                 if rgba[3] == 0 {
                     continue;
                 }
-                let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
+                let attenuation = self
+                    .instance_static_light
+                    .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
                 let channel = |base: u8| {
                     ((f32::from(base) * attenuation * (1.0 + self.instance_light)) as u32).min(255)
                 };
@@ -1387,6 +1392,7 @@ impl ObjectScene {
     }
 
     /// Paint visible objects against per-pixel wall/object depth.
+    #[cfg(test)]
     pub fn render(
         &self,
         frame: &mut [u32],
@@ -1428,6 +1434,22 @@ impl ObjectScene {
         mines: &[openchasm::explosives::Mine],
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
+        self.render_with_static_light(frame, depth, width, height, camera, mines, lights, None);
+    }
+
+    /// Apply static light at each object's position, with dynamic additions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_static_light(
+        &self,
+        frame: &mut [u32],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        mines: &[openchasm::explosives::Mine],
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+        static_light: Option<&crate::map::StaticLightMap>,
+    ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
@@ -1446,6 +1468,7 @@ impl ObjectScene {
             palette: &self.palette,
             translucent: None,
             instance_light: 0.0,
+            instance_static_light: None,
         };
         let mine_instances: Vec<_> = self
             .mine_mesh
@@ -1484,6 +1507,8 @@ impl ObjectScene {
                 continue;
             }
             raster.instance_light = lights.map_or(0.0, |lights| lights.sample(instance.position));
+            raster.instance_static_light =
+                static_light.and_then(|light| light.sample(instance.position));
             let mesh = &self.meshes[instance.mesh];
             let dx = instance.position[0] - player.position[0];
             let dy = instance.position[1] - player.position[1];
@@ -1615,6 +1640,52 @@ pub(crate) mod tests {
             .map(|i| (i.cell, i.object_definition_index, i.position, i.visible))
             .collect()
     }
+    #[test]
+    fn authored_light_shades_scene_mesh_without_changing_depth() {
+        let light_map = |value| {
+            let mut data = vec![0; 0x27001 + 4];
+            data[1..0x10001].fill(value);
+            crate::map::Map::parse(&data).unwrap()
+        };
+        let dark = light_map(35);
+        let bright = light_map(5);
+        let scene = gltf_scene(255);
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut frame_dark = vec![0; 64 * 64];
+        let mut frame_bright = frame_dark.clone();
+        let mut depth_dark = vec![f32::INFINITY; frame_dark.len()];
+        let mut depth_bright = depth_dark.clone();
+        scene.render_with_static_light(
+            &mut frame_dark,
+            &mut depth_dark,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            Some(dark.static_light()),
+        );
+        scene.render_with_static_light(
+            &mut frame_bright,
+            &mut depth_bright,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            Some(bright.static_light()),
+        );
+        assert!(frame_bright.iter().zip(&frame_dark).any(|(a, b)| a > b));
+        assert_eq!(depth_bright, depth_dark);
+    }
+
     #[test]
     fn instance_light_brightens_translucent_mesh_without_changing_depth() {
         use openchasm::light_sources::{
@@ -2667,6 +2738,7 @@ pub(crate) mod tests {
             palette: &palette,
             translucent: None,
             instance_light: 0.0,
+            instance_static_light: None,
         };
         raster.triangle(triangle, &model, 0);
         assert_eq!(raster.frame[0], 0x123456);
@@ -2726,6 +2798,7 @@ pub(crate) mod tests {
                 palette: &palette,
                 translucent: None,
                 instance_light: 0.0,
+                instance_static_light: None,
             };
             // The two surfaces cross: their order reverses across the triangle.
             let draws = [(tri(1.0, 4.0, 1.0), &red), (tri(4.0, 1.0, 4.0), &blue)];
@@ -2772,6 +2845,7 @@ pub(crate) mod tests {
             palette: &palette,
             translucent: None,
             instance_light: 0.0,
+            instance_static_light: None,
         };
         raster.put(0, 3.0, 0xff0000, 128);
         raster.put(0, 1.0, 0x0000ff, 255);

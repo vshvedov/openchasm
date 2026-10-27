@@ -195,6 +195,7 @@ impl WeaponRenderer {
 
     /// Draw over the world using a separate weapon depth buffer. Indices are
     /// zero-based, matching inventory. Frame is clamped to the animation.
+    #[cfg(test)]
     pub fn render(
         &self,
         frame: &mut [u32],
@@ -203,6 +204,21 @@ impl WeaponRenderer {
         weapon: usize,
         pose: WeaponPose,
         frame_index: usize,
+    ) {
+        self.render_with_light(frame, width, height, weapon, pose, frame_index, 1.0);
+    }
+
+    /// Draw with a bounded static light factor sampled at the camera position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_light(
+        &self,
+        frame: &mut [u32],
+        width: usize,
+        height: usize,
+        weapon: usize,
+        pose: WeaponPose,
+        frame_index: usize,
+        light: f32,
     ) {
         if width == 0 || height == 0 || width.checked_mul(height) != Some(frame.len()) {
             return;
@@ -226,6 +242,11 @@ impl WeaponRenderer {
             height,
             palette: &self.palette,
             model: &weapon.model,
+            light: if light.is_finite() {
+                light.clamp(0.0, 1.3)
+            } else {
+                1.0
+            },
         };
         for polygon in &weapon.model.polygons {
             let mut input = Vec::with_capacity(polygon.vertex_count());
@@ -328,6 +349,7 @@ struct Raster<'a> {
     height: usize,
     palette: &'a [u32; 256],
     model: &'a Model,
+    light: f32,
 }
 impl Raster<'_> {
     fn triangle(&mut self, triangle: [Projected; 3], flags: u8) {
@@ -369,7 +391,10 @@ impl Raster<'_> {
                 if flags & 0x0e != 0 && index == 255 {
                     continue;
                 }
-                self.frame[pixel] = self.palette[index as usize];
+                let rgb = self.palette[index as usize];
+                let channel =
+                    |shift: u32| ((((rgb >> shift) & 255u32) as f32 * self.light) as u32).min(255);
+                self.frame[pixel] = channel(16) << 16 | channel(8) << 8 | channel(0);
                 self.depth[pixel] = distance;
             }
         }
@@ -449,6 +474,13 @@ mod tests {
         let mut clamped = vec![0; 64 * 64];
         renderer.render(&mut clamped, 64, 64, 0, WeaponPose::Idle, usize::MAX);
         assert_eq!(second, clamped);
+        let mut dark = vec![0; 64 * 64];
+        renderer.render_with_light(&mut dark, 64, 64, 0, WeaponPose::Idle, 0, 0.25);
+        let pixel = first.iter().position(|&rgb| rgb != 0).unwrap();
+        assert_eq!(dark[pixel], 0x3f0000);
+        let mut invalid = vec![0; 64 * 64];
+        renderer.render_with_light(&mut invalid, 64, 64, 0, WeaponPose::Idle, 0, f32::NAN);
+        assert_eq!(first, invalid);
     }
 
     #[test]
@@ -528,6 +560,7 @@ mod tests {
                 height: 4,
                 palette: &palette,
                 model: &model,
+                light: 1.0,
             };
             raster.triangle([p(0.0, 0.0), p(4.0, 0.0), p(0.0, 4.0)], 2);
         }
@@ -541,6 +574,7 @@ mod tests {
                 height: 4,
                 palette: &palette,
                 model: &model,
+                light: 1.0,
             };
             raster.triangle([p(0.0, 0.0), p(4.0, 0.0), p(0.0, 4.0)], 0);
         }

@@ -18,6 +18,7 @@ pub struct PlaneRenderer {
     floor_ids: Vec<u8>,
     ceiling_ids: Vec<u8>,
     textures: Vec<u32>,
+    static_light: crate::map::StaticLightMap,
     sky: Option<Sky>,
 }
 
@@ -44,8 +45,13 @@ impl PlaneRenderer {
             floor_ids,
             ceiling_ids,
             textures,
+            static_light: map.static_light().clone(),
             sky: None,
         }
+    }
+
+    pub fn static_light(&self) -> &crate::map::StaticLightMap {
+        &self.static_light
     }
 
     pub fn set_sky(&mut self, sky: Sky) {
@@ -152,7 +158,6 @@ impl PlaneRenderer {
                 2.0 * distance * camera_plane[0] / width as f32,
                 2.0 * distance * camera_plane[1] / width as f32,
             ];
-            let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
             for (x, pixel) in row.iter_mut().enumerate() {
                 let world_x = start[0] + increment[0] * (x as f32 + 0.5);
                 let world_y = start[1] + increment[1] * (x as f32 + 0.5);
@@ -179,8 +184,9 @@ impl PlaneRenderer {
                         + ty * FLOOR_TEXTURE_SIDE
                         + tx];
                 let light = lights.map_or(0.0, |lights| lights.sample([world_x, world_y]));
+                let static_light = self.static_light.sample([world_x, world_y]).unwrap_or(1.0);
                 let shade =
-                    |channel| ((channel as f32 * attenuation * (1.0 + light)) as u32).min(255);
+                    |channel| ((channel as f32 * static_light * (1.0 + light)) as u32).min(255);
                 if let Some(buffer) = depth.as_deref_mut() {
                     buffer[y * width + x] = distance;
                 }
@@ -198,6 +204,7 @@ mod tests {
 
     fn fixtures(floor_id: u8, ceiling_id: u8) -> (Map, Floors, Palette) {
         let mut map = vec![0; 0x27001 + 4];
+        map[1..0x10001].fill(20);
         map[0x23001..0x24001].fill(ceiling_id);
         map[0x24001..0x25001].fill(floor_id);
         let mut floors = vec![0; 64 + 64 * 64 * 86];
@@ -212,6 +219,33 @@ mod tests {
             Floors::parse(&floors).unwrap(),
             Palette::parse(&palette).unwrap(),
         )
+    }
+
+    #[test]
+    fn installed_map_contains_spatially_varying_authored_light() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "assets/csm.bin".into());
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = crate::content::ResourceSet::open(&path).unwrap();
+        let map = Map::parse(&resources.read("map/map.01").unwrap()).unwrap();
+        let light = map.static_light();
+        let mut minimum = f32::INFINITY;
+        let mut maximum = 0.0_f32;
+        for y in 0..256 {
+            for x in 0..256 {
+                let value = light.sample([x as f32 / 4.0, y as f32 / 4.0]).unwrap();
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
+            }
+        }
+        assert!(minimum >= 0.0 && maximum <= 1.3 && maximum - minimum > 0.5);
+        assert!(light.sample([-1.0, 0.0]).is_none());
+        assert!(light.wall_sample([64, 0], 0.5).is_none());
     }
 
     #[test]
@@ -370,8 +404,11 @@ mod tests {
             position: [16.5, 16.5],
             angle: 0.0,
         };
-        renderer.render(
+        let mut low_depth = vec![f32::INFINITY; 64];
+        let mut high_depth = low_depth.clone();
+        renderer.render_with_depth(
             &mut low,
+            &mut low_depth,
             8,
             8,
             CameraView {
@@ -379,9 +416,11 @@ mod tests {
                 eye_height: 0.75,
                 pitch: 0.0,
             },
+            None,
         );
-        renderer.render(
+        renderer.render_with_depth(
             &mut high,
+            &mut high_depth,
             8,
             8,
             CameraView {
@@ -389,10 +428,10 @@ mod tests {
                 eye_height: 1.25,
                 pitch: 0.0,
             },
+            None,
         );
-        // Higher camera sees a more distant floor and a closer ceiling.
-        assert!((low[7 * 8 + 4] & 0xff0000) > (high[7 * 8 + 4] & 0xff0000));
-        assert!((low[4] & 0x00ff00) < (high[4] & 0x00ff00));
+        assert!(low_depth[7 * 8 + 4] < high_depth[7 * 8 + 4]);
+        assert!(low_depth[4] > high_depth[4]);
     }
     #[test]
     fn empty_and_sky_cells_leave_the_fallback_background() {

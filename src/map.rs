@@ -8,6 +8,8 @@ pub const MAP_SIDE: usize = 64;
 pub const UNITS_PER_TILE: f32 = 256.0;
 const GRID_CELLS: usize = MAP_SIDE * MAP_SIDE;
 const WALLS_OFFSET: usize = 0x18001;
+const LIGHTMAP_SIDE: usize = MAP_SIDE * 4;
+const WALL_LIGHT_OFFSET: usize = 1 + LIGHTMAP_SIDE * LIGHTMAP_SIDE;
 const WALL_SIZE: usize = 11;
 const CELLS_OFFSET: usize = 0x23001;
 const LIGHT_COUNT_OFFSET: usize = 0x27001;
@@ -70,10 +72,55 @@ impl Monster {
     }
 }
 
+/// Authored light bytes. Sampling follows an independent reconstruction and
+/// remains provisional until checked against the original renderer.
+#[derive(Debug, Clone)]
+pub struct StaticLightMap {
+    grid: Vec<u8>,
+    wall_data: Vec<u8>,
+}
+impl StaticLightMap {
+    fn intensity(raw: u8) -> f32 {
+        let converted = 255u16.saturating_sub(u16::from(raw) * 6);
+        f32::from(converted) * (1.3 / 255.0)
+    }
+    /// Four samples per tile. Invalid and off-map positions have no sample.
+    pub fn sample(&self, position: [f32; 2]) -> Option<f32> {
+        if !position
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0 && *v < MAP_SIDE as f32)
+        {
+            return None;
+        }
+        let x = (position[0] * 4.0) as usize;
+        let y = (position[1] * 4.0) as usize;
+        // Reference shifts source grid one sample right; first column is not
+        // specified there, so repeat the first available sample.
+        let source_x = x.saturating_sub(1);
+        self.grid
+            .get(source_x + y * LIGHTMAP_SIDE)
+            .copied()
+            .map(Self::intensity)
+    }
+    /// Eight samples per authored wall cell. The reference's two-byte offset
+    /// and direction are provisional. Out-of-range cells/UV return no sample.
+    pub fn wall_sample(&self, cell: [u8; 2], along: f32) -> Option<f32> {
+        let [x, y] = cell.map(usize::from);
+        if x >= MAP_SIDE || y >= MAP_SIDE || !along.is_finite() {
+            return None;
+        }
+        let sample = (along.clamp(0.0, 1.0) * 8.0).floor().min(7.0) as usize;
+        // wall_data starts two bytes before the nominal wall-light section.
+        let index = (x + y * MAP_SIDE) * 8 + sample;
+        self.wall_data.get(index).copied().map(Self::intensity)
+    }
+}
+
 #[derive(Debug)]
 pub struct Map {
     // All four arrays retain the original x-major order.
     walls: Vec<WallCell>,
+    static_light: StaticLightMap,
     ceilings: Vec<u8>,
     floors: Vec<u8>,
     ambient_light: Vec<u8>,
@@ -150,6 +197,10 @@ impl Map {
         }
         Ok(Self {
             walls,
+            static_light: StaticLightMap {
+                grid: data[1..WALL_LIGHT_OFFSET].to_vec(),
+                wall_data: data[WALL_LIGHT_OFFSET - 2..WALLS_OFFSET - 2].to_vec(),
+            },
             ceilings: grid(0),
             floors: grid(1),
             ambient_light: grid(2),
@@ -165,6 +216,9 @@ impl Map {
         } else {
             None
         }
+    }
+    pub fn static_light(&self) -> &StaticLightMap {
+        &self.static_light
     }
     pub fn wall(&self, x: usize, y: usize) -> Option<&WallCell> {
         self.walls.get(Self::index(x, y)?)
@@ -234,6 +288,21 @@ mod tests {
         assert!(map.monsters[0].is_player_spawn());
         assert_eq!(map.monsters[0].angle, 5);
         assert!(Map::parse(&data[..data.len() - 1]).is_err());
+    }
+    #[test]
+    fn static_light_decodes_spatial_grid_and_wall_samples_safely() {
+        let mut bytes = vec![0; LIGHT_COUNT_OFFSET + 4];
+        // Sample (x=5,y=9) reads source grid (4,9), shifted as reference.
+        bytes[1 + 4 + 9 * LIGHTMAP_SIDE] = 30;
+        bytes[WALL_LIGHT_OFFSET - 2 + (3 + 2 * MAP_SIDE) * 8 + 6] = 40;
+        let map = Map::parse(&bytes).unwrap();
+        let light = map.static_light();
+        assert!((light.sample([1.25, 2.25]).unwrap() - 1.3 * 75.0 / 255.0).abs() < 1e-6);
+        assert!((light.wall_sample([3, 2], 0.75).unwrap() - 1.3 * 15.0 / 255.0).abs() < 1e-6);
+        assert!(light.sample([f32::NAN, 0.0]).is_none());
+        assert!(light.sample([64.0, 0.0]).is_none());
+        assert!(light.wall_sample([3, 2], f32::INFINITY).is_none());
+        assert_eq!(StaticLightMap::intensity(255), 0.0);
     }
     #[test]
     fn floor_texture_stride_and_bounds() {

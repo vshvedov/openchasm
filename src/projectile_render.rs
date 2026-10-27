@@ -152,6 +152,7 @@ impl ProjectileRenderer {
 
     /// Render snapshots after walls and models, and before the HUD/weapon, with
     /// the same depth array so both world geometry and projectiles occlude them.
+    #[cfg(test)]
     pub fn render(
         &self,
         frame: &mut [u32],
@@ -160,6 +161,21 @@ impl ProjectileRenderer {
         height: usize,
         camera: CameraView,
         projectiles: &[ProjectileVisual],
+    ) {
+        self.render_with_static_light(frame, depth, width, height, camera, projectiles, None);
+    }
+
+    /// Sample authored light per projectile; fullbright definitions bypass it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_static_light(
+        &self,
+        frame: &mut [u32],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        projectiles: &[ProjectileVisual],
+        static_light: Option<&crate::map::StaticLightMap>,
     ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
@@ -179,6 +195,7 @@ impl ProjectileRenderer {
             width,
             height,
             palette: &self.palette,
+            static_light: None,
         };
         for projectile in projectiles {
             if !projectile.position.iter().all(|v| v.is_finite())
@@ -195,6 +212,8 @@ impl ProjectileRenderer {
             else {
                 continue;
             };
+            raster.static_light = static_light
+                .and_then(|light| light.sample([projectile.position[0], projectile.position[1]]));
             let (yaw_sin, yaw_cos) = (projectile.yaw - std::f32::consts::FRAC_PI_2).sin_cos();
             let (pitch_sin, pitch_cos) = projectile.pitch.sin_cos();
             let pose = mesh.vertices(projectile.elapsed_seconds);
@@ -312,6 +331,7 @@ struct Raster<'a> {
     width: usize,
     height: usize,
     palette: &'a [u32; 256],
+    static_light: Option<f32>,
 }
 impl Raster<'_> {
     fn triangle(&mut self, triangle: [Projected; 3], model: &Model, flags: u8, fullbright: bool) {
@@ -354,7 +374,8 @@ impl Raster<'_> {
                 let attenuation = if fullbright {
                     1.0
                 } else {
-                    (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0)
+                    self.static_light
+                        .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0))
                 };
                 let channel = |c: u32| (c as f32 * attenuation) as u32;
                 self.frame[pixel] = (channel((rgb >> 16) & 255) << 16)
@@ -613,8 +634,31 @@ mod tests {
         assert!(frame[pixel] < 0xff0000);
         frame.fill(0);
         depth.fill(f32::INFINITY);
+        let mut map_bytes = vec![0; 0x27001 + 4];
+        map_bytes[1..0x10001].fill(35);
+        let map = crate::map::Map::parse(&map_bytes).unwrap();
+        renderer.render_with_static_light(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            Some(map.static_light()),
+        );
+        assert!(frame[pixel] < 0x800000);
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
         shot.rocket_type = 2;
-        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        renderer.render_with_static_light(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            Some(map.static_light()),
+        );
         assert_eq!(frame[pixel], 0xff0000);
         frame.fill(0);
         depth.fill(1.0);

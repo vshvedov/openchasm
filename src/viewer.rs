@@ -541,13 +541,19 @@ fn render(
             let origin = camera.horizon(HEIGHT) - (2.0 + offset - camera.eye_height) * half;
             let top = origin.max(0.0).min(HEIGHT as f32) as usize;
             let bottom = (origin + half * 2.0).max(0.0).min(HEIGHT as f32) as usize;
-            let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
             let point = [
                 camera.player.position[0] + direction[0] * distance,
                 camera.player.position[1] + direction[1] * distance,
             ];
-            // Provisional linear XY falloff brightens the existing distance
-            // shading; it does not reproduce original lightmaps or occlusion.
+            // Authored wall samples use the independent reference's provisional
+            // offset and conversion. Unmapped walls retain distance shading.
+            let attenuation = planes
+                .and_then(|p| {
+                    world.walls[index]
+                        .cell
+                        .and_then(|cell| p.static_light().wall_sample(cell, along))
+                })
+                .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
             let light = scene.lights.map_or(0.0, |lights| lights.sample(point));
             let channel = |base: u32| ((base as f32 * attenuation * (1.0 + light)) as u32).min(255);
             let color = (channel(75 + texture * 37 % 110) << 16)
@@ -579,21 +585,16 @@ fn render(
         }
     }
     if let Some(objects) = objects {
-        if scene.lights.is_some() {
-            objects.render_with_mines_and_lights(
-                frame,
-                depth,
-                WIDTH,
-                HEIGHT,
-                camera,
-                scene.mines,
-                scene.lights,
-            );
-        } else if scene.mines.is_empty() {
-            objects.render(frame, depth, WIDTH, HEIGHT, camera);
-        } else {
-            objects.render_with_mines(frame, depth, WIDTH, HEIGHT, camera, scene.mines);
-        }
+        objects.render_with_static_light(
+            frame,
+            depth,
+            WIDTH,
+            HEIGHT,
+            camera,
+            scene.mines,
+            scene.lights,
+            planes.map(PlaneRenderer::static_light),
+        );
     }
 }
 
@@ -1419,13 +1420,14 @@ pub fn run(
                 pitch: session.projectile_pitch(projectile.id).unwrap_or(0.0),
             })
             .collect();
-        projectile_renderer.render(
+        projectile_renderer.render_with_static_light(
             &mut frame,
             &mut depth,
             WIDTH,
             HEIGHT,
             camera,
             &projectile_visuals,
+            Some(planes.static_light()),
         );
         if let Some(renderer) = &explosion_renderer {
             renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
@@ -1438,13 +1440,17 @@ pub fn run(
         }
         let (pose, frame_index) = weapon_clock
             .pose(weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Idle));
-        weapon_overlay.render(
+        weapon_overlay.render_with_light(
             &mut frame,
             WIDTH,
             HEIGHT,
             session.selected_weapon,
             pose,
             frame_index,
+            planes
+                .static_light()
+                .sample(camera.player.position)
+                .unwrap_or(1.0),
         );
         apply_damage_tint(&mut frame, damage_feedback.flash);
         minimap.draw(&mut frame, WIDTH, HEIGHT, &session.world);
@@ -1921,6 +1927,74 @@ mod tests {
         );
         assert!(top(&depth) > lower_camera_top + 10);
     }
+    #[test]
+    fn authored_wall_light_changes_shading_without_changing_depth() {
+        let make_planes = |value| {
+            let mut bytes = vec![0; 0x27001 + 4];
+            bytes[0x10001 - 2..0x18001 - 2].fill(value);
+            bytes[0x23001..0x25001].fill(63);
+            let map = crate::map::Map::parse(&bytes).unwrap();
+            let floors = crate::map::Floors::parse(&vec![0; 64 + 64 * 64 * 86]).unwrap();
+            let palette = crate::texture::Palette::parse(&[0; 768]).unwrap();
+            PlaneRenderer::new(&map, &floors, &palette)
+        };
+        let dark = make_planes(35);
+        let bright = make_planes(5);
+        let world = World {
+            walls: vec![Wall {
+                a: [2.0, -1.0],
+                b: [2.0, 1.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([2, 2]),
+            }],
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+        };
+        let textures = vec![
+            None,
+            Some(ViewerTexture {
+                width: 1,
+                height: 1,
+                pixels: vec![0xff808080],
+            }),
+        ];
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        let scene = || RenderWorld {
+            world: &world,
+            elevations: &[],
+            eye_height: 1.0,
+            yaw_offset: 0.0,
+            pitch: 0.0,
+            mines: &[],
+            lights: None,
+        };
+        render(
+            &mut frame,
+            &mut depth,
+            scene(),
+            &textures,
+            Some(&dark),
+            None,
+        );
+        let pixel = HEIGHT / 2 * WIDTH + WIDTH / 2;
+        let dark_color = frame[pixel];
+        let wall_depth = depth[pixel];
+        render(
+            &mut frame,
+            &mut depth,
+            scene(),
+            &textures,
+            Some(&bright),
+            None,
+        );
+        assert!(frame[pixel] > dark_color);
+        assert_eq!(depth[pixel], wall_depth);
+    }
+
     #[test]
     fn pitched_ceiling_occludes_the_top_of_an_elevated_wall() {
         let mut bytes = vec![0; 0x27001 + 4];

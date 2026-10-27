@@ -39,6 +39,7 @@ pub enum TransactionError {
     CollisionNotClear { cell: [usize; 2] },
     PoseMismatch { cell: [usize; 2] },
     RuntimeObject(RuntimeObjectSyncError),
+    WrongPhase,
 }
 
 /// Holds exclusive borrows until validation and commit are complete. Dropping
@@ -180,9 +181,21 @@ impl<'a> ProcessTransaction<'a> {
         &self.transitions
     }
 
+    /// Publish the activation schedule after full preflight. Target copies are
+    /// deliberately discarded and revalidated at the deadline.
+    pub fn schedule(self) -> Result<ProcessEvent, TransactionError> {
+        if !self.process.is_delayed() {
+            return Err(TransactionError::WrongPhase);
+        }
+        Ok(self.process.commit_schedule())
+    }
+
     /// Publish all validated states; the host must consume the ordered object
     /// transitions for presentation before advancing simulation again.
     pub fn commit(self) -> Result<ProcessEvent, TransactionError> {
+        if self.process.is_delayed() {
+            return Err(TransactionError::WrongPhase);
+        }
         *self.object_states = self.staged_states;
         *self.object_combat = self.staged_combat;
         *self.quake_field = self.staged_quake;

@@ -109,6 +109,8 @@ pub struct SessionEvents {
     /// Mission presentation/completion events produced during this step.
     pub mission: Vec<MissionEvent>,
     pub process_effects: Vec<ProcessEffect>,
+    /// Due delayed processes that could not commit this tick and will retry.
+    pub delayed_process_blocked: Vec<ProcessEvent>,
     pub hazard_damage: Vec<HazardDamage>,
     pub vertical: VerticalEvents,
     /// A committed player teleport or an explicitly rejected attempt.
@@ -456,10 +458,13 @@ impl Session {
         id: u16,
         events: &mut SessionEvents,
     ) -> Result<ProcessEvent, (ProcessOutcome, bool)> {
-        let prepared = self
-            .processes
-            .prepare_at(kind, cell, id)
-            .map_err(|outcome| (outcome, false))?;
+        let prepared = if kind == "due" {
+            self.processes.prepare_due(id)
+        } else {
+            self.processes.prepare_at(kind, cell, id)
+        }
+        .map_err(|outcome| (outcome, false))?;
+        let delayed = prepared.is_delayed();
         let quakes: Vec<_> = prepared
             .actions()
             .iter()
@@ -512,6 +517,11 @@ impl Session {
             self.ambient.as_mut(),
         )
         .map_err(|_| (ProcessOutcome::Unsupported, true))?;
+        if delayed {
+            return transaction
+                .schedule()
+                .map_err(|_| (ProcessOutcome::Unsupported, true));
+        }
         let transitions = transaction.transitions().to_vec();
         let event = transaction
             .commit()
@@ -1412,6 +1422,15 @@ impl Session {
                 }
             }
             self.processes.advance_motions(&mut self.world, DT);
+            for id in self.processes.ready_delayed() {
+                // Failed revalidation leaves the deadline pending for retry.
+                if let Err((outcome, _)) = self.try_staged_process("due", [0, 0], id, &mut events) {
+                    events.delayed_process_blocked.push(ProcessEvent {
+                        process_id: id,
+                        outcome,
+                    });
+                }
+            }
         }
         // Process-owned object positions must be applied before this tick's
         // hitscan or projectile queries and before enemy simulation.
@@ -2050,6 +2069,57 @@ mod tests {
         assert_eq!(session.ambient_grid().unwrap().cell([1, 1]), Some(7));
         assert_eq!(session.ambient_grid().unwrap().cell([3, 3]), Some(7));
         assert_eq!(session.ambient_grid().unwrap().cell([4, 4]), Some(0));
+    }
+
+    #[test]
+    fn delayed_ambient_revalidates_at_deadline_and_retries_atomically() {
+        let text = "#proc1\nstartdelay 0.05\n#action\nambient 0 0 2 2 5\nunlock 2\n#end\n#proc2\nlock\nonmessage 1\n#end\n#links\nlink 0 0 1\nlink 3 0 2\n#end\n";
+        let mut session = ambient_session(text);
+        let before = session.ambient.clone().unwrap();
+        let mut no_grid = session.clone();
+        no_grid.ambient = None;
+        assert!(no_grid
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .is_err());
+        assert!(no_grid.processes.ready_delayed().is_empty());
+        assert!(session
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .is_ok());
+        assert_eq!(session.ambient.as_ref().unwrap(), &before);
+        assert_eq!(
+            session.processes.activate_at("link", [3, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        session.ambient = None;
+        let mut blocked = false;
+        for _ in 0..5 {
+            let events = session.step(SessionInput::default());
+            assert!(events.process_effects.is_empty());
+            blocked |= events
+                .delayed_process_blocked
+                .iter()
+                .any(|event| event.process_id == 1 && event.outcome == ProcessOutcome::Unsupported);
+        }
+        assert!(blocked);
+        assert_eq!(session.processes.ready_delayed(), vec![1]);
+        assert_eq!(
+            session.processes.activate_at("link", [3, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        let mut restored = session.clone();
+        session.ambient = Some(before.clone());
+        restored.ambient = Some(before);
+        session.step(SessionInput::default());
+        restored.step(SessionInput::default());
+        assert_eq!(session.ambient_grid().unwrap().cell([0, 0]), Some(5));
+        assert_eq!(session.ambient, restored.ambient);
+        assert!(session.processes.ready_delayed().is_empty());
+        assert_ne!(
+            session.processes.activate_at("link", [3, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        session.step(SessionInput::default());
+        assert!(session.processes.ready_delayed().is_empty());
     }
 
     #[test]

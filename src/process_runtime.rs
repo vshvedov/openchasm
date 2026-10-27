@@ -830,10 +830,11 @@ impl RuntimeProcess {
         }
         // `nonstop` modifies zone lifecycle. Without an understood persistent
         // effect it cannot safely make an otherwise unsupported script runnable.
-        if nonstop && death_zones.is_empty() && wind_zones.is_empty() {
-            supported = false;
-        }
-        if !immediate_actions.is_empty() && property_float(process, "startdelay", 0.0) > 0.0 {
+        if nonstop
+            && death_zones.is_empty()
+            && wind_zones.is_empty()
+            && immediate_actions.is_empty()
+        {
             supported = false;
         }
         if !object_motions.is_empty()
@@ -974,6 +975,7 @@ impl RuntimeProcess {
                     || !self.cell_changes.is_empty()
                     || !self.death_zones.is_empty()
                     || !self.wind_zones.is_empty()
+                    || (self.delay > 0.0 && !self.immediate_actions.is_empty())
                 {
                     self.phase = if self.delay > 0.0 {
                         Phase::Delay(self.delay)
@@ -1077,6 +1079,10 @@ impl RuntimeProcess {
                 if remaining > dt {
                     self.phase = Phase::Delay(remaining - dt);
                 } else {
+                    if !self.immediate_actions.is_empty() {
+                        self.phase = Phase::Delay(0.0);
+                        return;
+                    }
                     self.phase = Phase::Opening;
                     self.start_hazard(process_id, effects);
                     self.progress = ((dt - remaining) / self.duration).min(1.0);
@@ -1313,9 +1319,41 @@ pub struct PreparedProcess<'a> {
     actions: Vec<ImmediateAction>,
     object_sync_complete: bool,
     ambient_sync_complete: bool,
+    scheduled: Option<ProcessRuntime>,
     event: ProcessEvent,
 }
 impl PreparedProcess<'_> {
+    pub fn is_delayed(&self) -> bool {
+        self.scheduled.is_some()
+    }
+
+    /// Publish only the already-validated schedule, not staged target edits.
+    pub(crate) fn commit_schedule(self) -> ProcessEvent {
+        if !self.object_sync_complete
+            && self
+                .actions
+                .iter()
+                .any(|a| matches!(a, ImmediateAction::Object(_)))
+            || !self.ambient_sync_complete
+                && self
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, ImmediateAction::Ambient(_)))
+        {
+            return ProcessEvent {
+                process_id: self.event.process_id,
+                outcome: ProcessOutcome::Unsupported,
+            };
+        }
+        let Some(scheduled) = self.scheduled else {
+            return ProcessEvent {
+                process_id: self.event.process_id,
+                outcome: ProcessOutcome::Unsupported,
+            };
+        };
+        *self.runtime = scheduled;
+        self.event
+    }
     pub(crate) fn mark_ambient_staged(&mut self) {
         self.ambient_sync_complete = true;
     }
@@ -1395,6 +1433,12 @@ impl PreparedProcess<'_> {
         Ok(())
     }
     pub fn commit(self) -> ProcessEvent {
+        if self.scheduled.is_some() {
+            return ProcessEvent {
+                process_id: self.event.process_id,
+                outcome: ProcessOutcome::Unsupported,
+            };
+        }
         if !self.ambient_sync_complete
             && self
                 .actions
@@ -1698,6 +1742,15 @@ impl ProcessRuntime {
         };
         let outcome = match result {
             Ok((changes, animations)) => {
+                let deferred = self.processes.get(&id).is_some_and(|p| {
+                    matches!(p.phase, Phase::Delay(_)) && !p.immediate_actions.is_empty()
+                });
+                if deferred {
+                    return ProcessEvent {
+                        process_id: id,
+                        outcome: ProcessOutcome::Accepted,
+                    };
+                }
                 if let Some(process) = self.processes.get_mut(&id) {
                     if process.phase == Phase::Opening {
                         process.start_hazard(id, &mut self.effects);
@@ -1760,13 +1813,83 @@ impl ProcessRuntime {
         if event.outcome != ProcessOutcome::Accepted {
             return Err(event.outcome);
         }
+        let scheduled = staged
+            .processes
+            .get(&id)
+            .is_some_and(|p| matches!(p.phase, Phase::Delay(_)) && !p.immediate_actions.is_empty())
+            .then(|| staged.clone());
         Ok(PreparedProcess {
             runtime: self,
             staged,
             actions,
             object_sync_complete: false,
             ambient_sync_complete: false,
+            scheduled,
             event,
+        })
+    }
+
+    /// Stable process IDs whose delayed actions have reached their deadline.
+    /// A failed host preflight leaves the process here for a future retry.
+    pub fn ready_delayed(&self) -> Vec<u16> {
+        self.processes
+            .iter()
+            .filter_map(|(&id, p)| {
+                (matches!(p.phase, Phase::Delay(v) if v <= 0.0) && !p.immediate_actions.is_empty())
+                    .then_some(id)
+            })
+            .collect()
+    }
+
+    /// Stage the complete start of an already armed delayed procedure.
+    pub fn prepare_due(&mut self, id: u16) -> Result<PreparedProcess<'_>, ProcessOutcome> {
+        let p = self.processes.get(&id).ok_or(ProcessOutcome::Missing)?;
+        if !matches!(p.phase, Phase::Delay(v) if v <= 0.0) || p.immediate_actions.is_empty() {
+            return Err(ProcessOutcome::Busy);
+        }
+        if p.locked {
+            return Err(ProcessOutcome::Locked);
+        }
+        if p.object_motions.iter().any(|motion| {
+            !self.objects.contains_key(&motion.cell)
+                || self.cell_types.as_ref().is_some_and(|types| {
+                    types[usize::from(motion.cell[0]) * 64 + usize::from(motion.cell[1])]
+                        != motion.raw_type
+                })
+        }) {
+            return Err(ProcessOutcome::Unsupported);
+        }
+        let mut staged = self.clone();
+        let process = staged.processes.get_mut(&id).expect("checked process");
+        let actions = process.immediate_actions.clone();
+        let changes = process.lock_changes.clone();
+        let animations = process.animations.clone();
+        process.phase = Phase::Opening;
+        process.start_hazard(id, &mut staged.effects);
+        staged.effects.extend(
+            animations
+                .into_iter()
+                .map(|object_id| ProcessEffect::PlayAnimation { object_id }),
+        );
+        for (target, locked) in changes {
+            if let Some(p) = staged.processes.get_mut(&target) {
+                p.locked = locked;
+                if locked {
+                    p.stop_hazard(target, &mut staged.effects);
+                }
+            }
+        }
+        Ok(PreparedProcess {
+            runtime: self,
+            staged,
+            actions,
+            object_sync_complete: false,
+            ambient_sync_complete: false,
+            scheduled: None,
+            event: ProcessEvent {
+                process_id: id,
+                outcome: ProcessOutcome::Accepted,
+            },
         })
     }
 
@@ -1807,6 +1930,7 @@ impl ProcessRuntime {
             actions: Vec::new(),
             object_sync_complete: false,
             ambient_sync_complete: false,
+            scheduled: None,
             event,
         })
     }
@@ -3252,9 +3376,8 @@ mod tests {
     }
 
     #[test]
-    fn staged_actions_reject_delay_malformed_and_unhandled_commands() {
+    fn staged_actions_reject_malformed_and_unhandled_commands() {
         for text in [
-            "StartDelay 2\n#action\nquake 1 1 2 2 0",
             "#action\nexplode 1 1\nquake 1 1 64 2 0",
             "#action\nexplode 1 1\nchange 1 1 100",
             "#action\nquake 1 1 2 2 1\nambient 1 1 2 2 32",

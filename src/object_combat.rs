@@ -18,7 +18,7 @@ fn target_radius(def: &crate::objects::ObjectDefinition) -> f32 {
     if def.collision_radius > 0 {
         (def.collision_radius as f32 / UNITS_PER_TILE).clamp(DEFAULT_RADIUS, MAX_RADIUS)
     } else {
-        DEFAULT_RADIUS
+        0.0
     }
 }
 
@@ -225,6 +225,7 @@ impl ObjectCombat {
         let mut nearest = None;
         for target in &self.targets {
             if !target.shootable
+                || target.radius <= 0.0
                 || !target.difficulty_enabled
                 || !target.enabled
                 || target.destroyed
@@ -483,6 +484,34 @@ mod tests {
             .raycast([0.0, 0.0], [f32::NAN, 0.0], 2.0, 0.0)
             .is_none());
         assert!(!combat.set_position([2, 2], [f32::INFINITY, 0.0]));
+    }
+    #[test]
+    fn zero_radius_linked_target_is_not_a_ray_hit_until_replaced() {
+        use crate::object_states::{ObjectAction, ObjectStates};
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition(0, 400), definition(64, 600)],
+        };
+        let objects = [instance(0, [1, 1], [1.0, 0.0], 7)];
+        let script = Script::parse("#links\ndestroy 1 1 8\n#end\n");
+        let mut states = ObjectStates::new(&objects, &defs).unwrap();
+        let mut combat = ObjectCombat::new(&objects, &defs, &script, Difficulty::Normal);
+        assert_eq!(combat.raycast([0.0, 0.0], [1.0, 0.0], 2.0, 0.2), None);
+        let transitions = states
+            .apply_batch(&[ObjectAction::Change {
+                cell: [1, 1],
+                raw_type: 164,
+            }])
+            .unwrap();
+        assert!(combat.apply_transitions(&transitions, &defs));
+        assert_eq!(
+            combat
+                .raycast([0.0, 0.0], [1.0, 0.0], 2.0, 0.0)
+                .unwrap()
+                .cell,
+            [1, 1]
+        );
+        assert!(combat.apply_hit([1, 1], 600).unwrap().destroyed);
     }
     #[test]
     fn skips_unlinked_decorations() {

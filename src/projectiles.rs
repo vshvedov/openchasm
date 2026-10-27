@@ -9,7 +9,8 @@ use crate::map::UNITS_PER_TILE;
 use crate::object_combat::ObjectCombat;
 use crate::world::{Wall, World};
 
-const DEFAULT_SPEED: f32 = 6.0; // tiles per second: provisional
+const DEFAULT_SPEED: f32 = 10.0; // tiles per second
+const FAST_SPEED: f32 = 20.0;
 const DEFAULT_LIFETIME: f32 = 10.0; // seconds: provisional
 const PLAYER_RADIUS: f32 = 0.18; // matches the preview movement collision
 const MAX_PROJECTILES: usize = 4096;
@@ -197,14 +198,21 @@ impl ProjectileSystem {
         let next = self.next_id.checked_add(1).ok_or(SpawnError::IdExhausted)?;
         let id = self.next_id;
         self.next_id = next;
+        // Fast is the eleventh numeric rocket field. Short synthetic/custom
+        // rows retain the ordinary speed until that field is supplied.
+        let speed = if rocket.raw_fields.get(10).copied().unwrap_or(0) != 0 {
+            FAST_SPEED
+        } else {
+            DEFAULT_SPEED
+        };
         self.projectiles.push(Projectile {
             id,
             owner: launch.owner,
             rocket_id: launch.rocket_id,
             position: launch.origin,
             velocity: [
-                DEFAULT_SPEED * launch.direction[0] / magnitude,
-                DEFAULT_SPEED * launch.direction[1] / magnitude,
+                speed * launch.direction[0] / magnitude,
+                speed * launch.direction[1] / magnitude,
             ],
             radius: (collision_radius as f32 / UNITS_PER_TILE).clamp(0.0, 2.0),
             damage: rocket.power,
@@ -360,6 +368,21 @@ mod tests {
         assert!(system.active().is_empty());
     }
     #[test]
+    fn fast_flag_selects_the_authored_projectile_speed() {
+        let (mut rockets, ..) = setup();
+        rockets.0[0].raw_fields.resize(11, 0);
+        let mut system = ProjectileSystem::new();
+        system
+            .spawn(launch(Owner::Player, [0., 0.], [0., 2.]), &rockets)
+            .unwrap();
+        assert_eq!(system.active()[0].velocity, [0., DEFAULT_SPEED]);
+        rockets.0[0].raw_fields[10] = 1;
+        system
+            .spawn(launch(Owner::Player, [0., 0.], [0., 2.]), &rockets)
+            .unwrap();
+        assert_eq!(system.active()[1].velocity, [0., FAST_SPEED]);
+    }
+    #[test]
     fn moves_over_time_then_hits_nearest_actor() {
         let (rockets, defs, actors, world) = setup();
         let mut system = ProjectileSystem::new();
@@ -369,7 +392,7 @@ mod tests {
         assert!(system
             .tick(0.1, &world, &actors, &defs, |_| true)
             .is_empty());
-        assert!((system.active()[0].position[0] - 0.6).abs() < 1e-5);
+        assert!((system.active()[0].position[0] - 1.0).abs() < 1e-5);
         let event = system.tick(0.5, &world, &actors, &defs, |_| true)[0];
         assert_eq!(event.target, ImpactTarget::Actor { source_index: 0 });
         assert_eq!(event.damage, 40);
@@ -422,7 +445,7 @@ mod tests {
             .unwrap();
         let event = system.tick(15.0, &world, &actors, &defs, |_| true)[0];
         assert_eq!(event.target, ImpactTarget::Expired);
-        assert!((event.position[0] - 60.0).abs() < 0.001);
+        assert!((event.position[0] - 100.0).abs() < 0.001);
         assert_eq!(event.damage, 0);
         assert!(system.active().is_empty());
     }

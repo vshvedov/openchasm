@@ -1,6 +1,6 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
 use crate::audio::Audio;
-use crate::object_render::ObjectScene;
+use crate::object_render::{ActorAnimationMode, ObjectScene};
 use crate::planes::PlaneRenderer;
 use crate::texture::CelImage;
 use crate::weapon_render::{WeaponPose, WeaponRenderer};
@@ -241,16 +241,23 @@ pub fn run(
                 audio.play(21 + session.selected_weapon as u8);
             }
             for actor in &session.actors.actors {
-                let visible = !matches!(
-                    session.ai.mode(actor.source_index),
-                    Some(Mode::Inactive | Mode::Dead)
-                );
+                let mode = session
+                    .ai
+                    .mode(actor.source_index)
+                    .unwrap_or(Mode::Inactive);
+                let animation = match mode {
+                    Mode::Inactive | Mode::Idle => ActorAnimationMode::Idle,
+                    Mode::Chasing => ActorAnimationMode::Run,
+                    Mode::Attacking => ActorAnimationMode::Attack,
+                    Mode::Dead => ActorAnimationMode::Death,
+                };
                 objects.set_actor_pose(
                     actor.source_index,
                     actor.position,
                     actor.angle_radians,
-                    visible,
+                    mode != Mode::Inactive,
                 );
+                objects.set_actor_animation(actor.source_index, animation, STEP);
             }
             accumulator -= STEP;
         }

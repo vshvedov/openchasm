@@ -1,11 +1,11 @@
 //! CPU renderer for original 3O map objects.
 //!
 //! The viewer's camera is intentionally shared with its wall projection. Meshes
-//! and instances are immutable here; gameplay movement and animation are not
-//! simulated by this module.
+//! gameplay and actor state remain owned by the simulation. The caller supplies
+//! actor animation mode and elapsed fixed time for presentation.
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::content::ResourceSet;
-use crate::model::{Model, SKIN_WIDTH};
+use crate::model::{Animation, Model, Vertex as ModelVertex, SKIN_WIDTH};
 use crate::objects::{self, ObjectDefinitions};
 use crate::texture::Palette;
 use crate::world::Player;
@@ -15,12 +15,37 @@ const MODEL_SCALE: f32 = 1.0 / 2048.0;
 const NEAR: f32 = 0.05;
 const CAMERA_HEIGHT: f32 = 1.0;
 const CAMERA_PLANE: f32 = 0.66;
+const ACTOR_ANIMATION_FPS: f64 = 18.0;
+
+/// Provisional mapping from simulation behavior to CAR animation slots.
+#[allow(dead_code)] // Modes are supplied by the viewer once integrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorAnimationMode {
+    Idle,
+    Run,
+    Attack,
+    Death,
+}
+impl ActorAnimationMode {
+    fn preferred_slots(self) -> &'static [usize] {
+        match self {
+            Self::Idle => &[2, 3, 0],
+            Self::Run => &[0, 2, 3],
+            Self::Attack => &[6, 7, 8, 5, 2, 0],
+            Self::Death => &[16, 17, 2, 0],
+        }
+    }
+    fn looping(self) -> bool {
+        self != Self::Death
+    }
+}
 
 struct Mesh {
     model: Model,
     radius: f32,
     /// CAR texture coordinates use 8 fractional bits unlike 3O.
     car_uv: bool,
+    animations: [Option<Animation>; 20],
 }
 
 struct Instance {
@@ -29,7 +54,40 @@ struct Instance {
     angle: f32,
     cell: Option<[usize; 2]>,
     actor_source_index: Option<usize>,
+    animation_mode: ActorAnimationMode,
+    animation_seconds: f64,
     visible: bool,
+}
+
+/// Choose a pose from the available slot list. Missing slots use the base mesh.
+fn actor_vertices(mesh: &Mesh, mode: ActorAnimationMode, seconds: f64) -> &[ModelVertex] {
+    let animation = mode.preferred_slots().iter().find_map(|&slot| {
+        mesh.animations[slot]
+            .as_ref()
+            .filter(|a| !a.frames.is_empty())
+    });
+    let Some(animation) = animation else {
+        return &mesh.model.vertices;
+    };
+    let count = animation.frames.len();
+    let frame = seconds.max(0.0) * ACTOR_ANIMATION_FPS;
+    let index = if mode.looping() {
+        frame.rem_euclid(count as f64) as usize
+    } else {
+        frame.min((count - 1) as f64) as usize
+    };
+    &animation.frames[index]
+}
+
+fn vertex_radius(vertices: &[ModelVertex]) -> f32 {
+    vertices
+        .iter()
+        .map(|vertex| {
+            let x = f32::from(vertex.position[0]) * MODEL_SCALE;
+            let y = f32::from(vertex.position[1]) * MODEL_SCALE;
+            (x * x + y * y).sqrt()
+        })
+        .fold(0.0_f32, f32::max)
 }
 
 /// A deduplicated collection of static object meshes and placements.
@@ -205,20 +263,13 @@ impl ObjectScene {
             let mesh_index = *cache.entry(path.clone()).or_insert_with(|| {
                 match resources.read(&path).and_then(|bytes| Model::parse(&bytes)) {
                     Ok(model) => {
-                        let radius = model
-                            .vertices
-                            .iter()
-                            .map(|vertex| {
-                                let x = f32::from(vertex.position[0]) * MODEL_SCALE;
-                                let y = f32::from(vertex.position[1]) * MODEL_SCALE;
-                                (x * x + y * y).sqrt()
-                            })
-                            .fold(0.0_f32, f32::max);
+                        let radius = vertex_radius(&model.vertices);
                         let index = meshes.len();
                         meshes.push(Mesh {
                             model,
                             radius,
                             car_uv: false,
+                            animations: std::array::from_fn(|_| None),
                         });
                         Some(index)
                     }
@@ -235,6 +286,8 @@ impl ObjectScene {
                     angle: instance.angle_radians,
                     cell: Some(instance.grid_cell),
                     actor_source_index: None,
+                    animation_mode: ActorAnimationMode::Idle,
+                    animation_seconds: 0.0,
                     visible: true,
                 });
             }
@@ -277,27 +330,22 @@ impl ObjectScene {
                     .and_then(|data| crate::monster::Monster::parse(&data))
                 {
                     Ok(car) => {
-                        let mut model = car.model;
-                        // Use the first available animation frame as a static preview.
-                        if let Some(animation) = car.animations.iter().flatten().next() {
-                            if animation.matches_model(&model) {
-                                model.vertices.clone_from(&animation.frames[0]);
+                        let model = car.model;
+                        let animations = car.animations;
+                        // Bounds include all animation frames so limbs do not
+                        // disappear at the edge of the frustum while moving.
+                        let mut radius = vertex_radius(&model.vertices);
+                        for animation in animations.iter().flatten() {
+                            for frame in &animation.frames {
+                                radius = radius.max(vertex_radius(frame));
                             }
                         }
-                        let radius = model
-                            .vertices
-                            .iter()
-                            .map(|vertex| {
-                                let x = f32::from(vertex.position[0]) * MODEL_SCALE;
-                                let y = f32::from(vertex.position[1]) * MODEL_SCALE;
-                                (x * x + y * y).sqrt()
-                            })
-                            .fold(0.0_f32, f32::max);
                         let index = self.meshes.len();
                         self.meshes.push(Mesh {
                             model,
                             radius,
                             car_uv: true,
+                            animations,
                         });
                         Some(index)
                     }
@@ -314,6 +362,8 @@ impl ObjectScene {
                     angle: actor.angle_radians,
                     cell: None,
                     actor_source_index: Some(actor.source_index),
+                    animation_mode: ActorAnimationMode::Idle,
+                    animation_seconds: 0.0,
                     visible: true,
                 });
             }
@@ -344,6 +394,35 @@ impl ObjectScene {
         } else {
             false
         }
+    }
+
+    /// Update an actor's presentation timer once per simulation tick. When the
+    /// supplied mode changes its animation starts from frame zero. Invalid or
+    /// negative deltas are rejected without changing the instance.
+    #[allow(dead_code)] // Called by the viewer once integrated.
+    pub fn set_actor_animation(
+        &mut self,
+        source_index: usize,
+        mode: ActorAnimationMode,
+        delta_seconds: f32,
+    ) -> bool {
+        if !delta_seconds.is_finite() || delta_seconds < 0.0 {
+            return false;
+        }
+        let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.actor_source_index == Some(source_index))
+        else {
+            return false;
+        };
+        if instance.animation_mode != mode {
+            instance.animation_mode = mode;
+            instance.animation_seconds = 0.0;
+        } else {
+            instance.animation_seconds += f64::from(delta_seconds);
+        }
+        true
     }
 
     /// Hide or restore an individual placement without changing shared meshes.
@@ -397,6 +476,11 @@ impl ObjectScene {
                 continue;
             }
             let (sin, cos) = instance.angle.sin_cos();
+            let pose_vertices = if mesh.car_uv {
+                actor_vertices(mesh, instance.animation_mode, instance.animation_seconds)
+            } else {
+                &mesh.model.vertices
+            };
             for polygon in &mesh.model.polygons {
                 // The default pose shows intact body/head/hands, excluding
                 // detached parts and attack-only effects.
@@ -406,7 +490,7 @@ impl ObjectScene {
                 let count = polygon.vertex_count();
                 let mut vertices = Vec::with_capacity(count);
                 for corner in 0..count {
-                    let p = mesh.model.vertices[polygon.vertices[corner] as usize].position;
+                    let p = pose_vertices[polygon.vertices[corner] as usize].position;
                     let x = f32::from(p[0]) * MODEL_SCALE;
                     let y = f32::from(p[1]) * MODEL_SCALE;
                     let world_x = dx + x * cos - y * sin;
@@ -443,6 +527,66 @@ impl ObjectScene {
 mod tests {
     use super::*;
     #[test]
+    fn actor_animation_selects_slots_loops_and_clamps_death() {
+        let vertex = |x| ModelVertex {
+            position: [x, 0, 0],
+        };
+        let mut animations: [Option<Animation>; 20] = std::array::from_fn(|_| None);
+        let frames = |values: &[i16]| Animation {
+            vertex_count: 1,
+            frames: values.iter().map(|&v| vec![vertex(v)]).collect(),
+        };
+        animations[0] = Some(frames(&[0, 1, 2]));
+        animations[2] = Some(frames(&[10, 11]));
+        animations[16] = Some(frames(&[20, 21]));
+        let mesh = Mesh {
+            model: Model {
+                vertices: vec![vertex(-1)],
+                polygons: vec![],
+                skin_height: 0,
+                skin_indices: vec![],
+            },
+            radius: 1.0,
+            car_uv: true,
+            animations,
+        };
+        let x = |mode, time| actor_vertices(&mesh, mode, time)[0].position[0];
+        assert_eq!(x(ActorAnimationMode::Idle, 0.0), 10);
+        assert_eq!(x(ActorAnimationMode::Idle, 1.0 / ACTOR_ANIMATION_FPS), 11);
+        assert_eq!(x(ActorAnimationMode::Run, 3.0 / ACTOR_ANIMATION_FPS), 0);
+        assert_eq!(x(ActorAnimationMode::Attack, 0.0), 10); // idle fallback
+        assert_eq!(x(ActorAnimationMode::Death, 100.0), 21); // hold last frame
+    }
+    #[test]
+    fn actor_timers_are_independent_and_reset_on_mode_change() {
+        let instance = |id| Instance {
+            mesh: 0,
+            position: [0.0, 0.0],
+            angle: 0.0,
+            cell: None,
+            actor_source_index: Some(id),
+            animation_mode: ActorAnimationMode::Idle,
+            animation_seconds: 0.0,
+            visible: true,
+        };
+        let mut scene = ObjectScene {
+            meshes: vec![],
+            instances: vec![instance(7), instance(8)],
+            palette: [0; 256],
+        };
+        assert!(scene.set_actor_animation(7, ActorAnimationMode::Idle, 0.25));
+        assert_eq!(scene.instances[0].animation_seconds, 0.25);
+        assert_eq!(scene.instances[1].animation_seconds, 0.0);
+        assert!(scene.set_actor_animation(7, ActorAnimationMode::Run, 0.25));
+        assert_eq!(scene.instances[0].animation_seconds, 0.0);
+        assert!(scene.set_actor_animation(7, ActorAnimationMode::Run, 0.25));
+        assert_eq!(scene.instances[0].animation_seconds, 0.25);
+        assert!(!scene.set_actor_animation(7, ActorAnimationMode::Attack, f32::NAN));
+        assert_eq!(scene.instances[0].animation_mode, ActorAnimationMode::Run);
+        assert!(!scene.set_actor_animation(9, ActorAnimationMode::Attack, 0.0));
+    }
+
+    #[test]
     fn visibility_changes_one_placement_without_hiding_shared_mesh() {
         let mut scene = ObjectScene {
             meshes: Vec::new(),
@@ -453,6 +597,8 @@ mod tests {
                     angle: 0.0,
                     cell: Some([1, 2]),
                     actor_source_index: None,
+                    animation_mode: ActorAnimationMode::Idle,
+                    animation_seconds: 0.0,
                     visible: true,
                 },
                 Instance {
@@ -461,6 +607,8 @@ mod tests {
                     angle: 0.0,
                     cell: Some([3, 4]),
                     actor_source_index: None,
+                    animation_mode: ActorAnimationMode::Idle,
+                    animation_seconds: 0.0,
                     visible: true,
                 },
             ],
@@ -539,7 +687,10 @@ mod tests {
         assert_eq!(scene.meshes.len(), 1);
         assert_eq!(scene.instances.len(), 2);
         assert!(scene.meshes[0].car_uv);
-        assert_eq!(scene.meshes[0].model.vertices[0].position[1], -512);
+        assert_eq!(
+            actor_vertices(&scene.meshes[0], ActorAnimationMode::Idle, 0.0)[0].position[1],
+            -512
+        );
         scene.palette[1] = 0xffffff;
         let mut frame = vec![0; 64 * 64];
         let mut depth = vec![f32::INFINITY; 64 * 64];

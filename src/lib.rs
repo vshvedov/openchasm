@@ -17,6 +17,7 @@ pub mod ai;
 pub mod ambient;
 pub mod ambient_definitions;
 pub mod combat;
+pub mod dynamic_light;
 pub mod explosives;
 pub mod game;
 pub mod hazards;

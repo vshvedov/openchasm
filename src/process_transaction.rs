@@ -2,6 +2,7 @@
 //!
 //! The host must validate collision clearance and synchronize presentation
 //! resources and emitted transitions when committing.
+use crate::ambient::{AmbientGrid, InvalidAmbientRegion};
 use crate::object_combat::ObjectCombat;
 use crate::object_states::{ObjectStateError, ObjectStates, ObjectTransition};
 use crate::objects::ObjectDefinitions;
@@ -33,6 +34,8 @@ pub enum TransactionError {
     CombatRejected { cell: [usize; 2] },
     PresentationUnavailable { cell: [usize; 2], raw_type: u8 },
     Quake(QuakeError),
+    AmbientUnavailable,
+    Ambient(InvalidAmbientRegion),
     CollisionNotClear { cell: [usize; 2] },
     PoseMismatch { cell: [usize; 2] },
     RuntimeObject(RuntimeObjectSyncError),
@@ -48,10 +51,36 @@ pub struct ProcessTransaction<'a> {
     staged_states: ObjectStates,
     staged_combat: ObjectCombat,
     staged_quake: QuakeField,
+    ambient: Option<&'a mut AmbientGrid>,
+    staged_ambient: Option<AmbientGrid>,
     transitions: Vec<ObjectTransition>,
 }
 impl<'a> ProcessTransaction<'a> {
     pub fn prepare(
+        process: PreparedProcess<'a>,
+        states: &'a mut ObjectStates,
+        combat: &'a mut ObjectCombat,
+        quake: &'a mut QuakeField,
+        definitions: &ObjectDefinitions,
+        manifest: &PresentationManifest,
+        is_clear: impl FnMut([usize; 2], [f32; 2], f32) -> bool,
+    ) -> Result<Self, TransactionError> {
+        Self::prepare_with_ambient(
+            process,
+            states,
+            combat,
+            quake,
+            definitions,
+            manifest,
+            is_clear,
+            None,
+        )
+    }
+
+    /// Stage ambient updates alongside object and quake changes. Missing ambient
+    /// capability rejects any process that contains an ambient action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_ambient(
         mut process: PreparedProcess<'a>,
         states: &'a mut ObjectStates,
         combat: &'a mut ObjectCombat,
@@ -59,10 +88,12 @@ impl<'a> ProcessTransaction<'a> {
         definitions: &ObjectDefinitions,
         manifest: &PresentationManifest,
         mut is_clear: impl FnMut([usize; 2], [f32; 2], f32) -> bool,
+        ambient: Option<&'a mut AmbientGrid>,
     ) -> Result<Self, TransactionError> {
         let mut staged_states = states.clone();
         let mut staged_combat = combat.clone();
         let mut staged_quake = quake.clone();
+        let mut staged_ambient = ambient.as_deref().cloned();
         let mut transitions = Vec::new();
         let mut runtime_transitions = Vec::new();
         for action in process.actions() {
@@ -119,11 +150,19 @@ impl<'a> ProcessTransaction<'a> {
                 ImmediateAction::Quake(zone) => staged_quake
                     .apply_batch(&[zone])
                     .map_err(TransactionError::Quake)?,
+                ImmediateAction::Ambient(region) => staged_ambient
+                    .as_mut()
+                    .ok_or(TransactionError::AmbientUnavailable)?
+                    .apply(&[region])
+                    .map_err(TransactionError::Ambient)?,
             }
         }
         process
             .stage_object_transitions(&runtime_transitions)
             .map_err(TransactionError::RuntimeObject)?;
+        if staged_ambient.is_some() {
+            process.mark_ambient_staged();
+        }
         Ok(Self {
             process,
             object_states: states,
@@ -132,6 +171,8 @@ impl<'a> ProcessTransaction<'a> {
             staged_states,
             staged_combat,
             staged_quake,
+            ambient,
+            staged_ambient,
             transitions,
         })
     }
@@ -145,6 +186,9 @@ impl<'a> ProcessTransaction<'a> {
         *self.object_states = self.staged_states;
         *self.object_combat = self.staged_combat;
         *self.quake_field = self.staged_quake;
+        if let (Some(ambient), Some(staged)) = (self.ambient, self.staged_ambient) {
+            *ambient = staged;
+        }
         Ok(self.process.commit())
     }
 }

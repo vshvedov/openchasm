@@ -5,6 +5,7 @@
 //! state-changing actions are disabled in full. Movement timing, use range, and
 //! behavior in the presence of blockers are placeholders, not verified
 //! against the original game.
+use crate::ambient::AmbientRegion;
 use crate::object_states::ObjectAction;
 use crate::process::{Process, Script};
 use crate::quake::QuakeZone;
@@ -345,6 +346,7 @@ type Activation = (Vec<(u16, bool)>, Vec<u16>);
 pub enum ImmediateAction {
     Object(ObjectAction),
     Quake(QuakeZone),
+    Ambient(AmbientRegion),
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +525,30 @@ impl RuntimeProcess {
                 })();
                 if let Some(object) = parsed {
                     immediate_actions.push(ImmediateAction::Object(object));
+                    continue;
+                }
+                supported = false;
+                break;
+            }
+            if immediate_enabled && action.name == "ambient" {
+                let parsed = (|| {
+                    if action.arguments.len() != 5 {
+                        return None;
+                    }
+                    let values: Vec<i16> = action
+                        .arguments
+                        .iter()
+                        .map(|v| v.parse().ok())
+                        .collect::<Option<_>>()?;
+                    let sound_id = u8::try_from(values[4]).ok().filter(|id| *id < 32)?;
+                    Some(AmbientRegion {
+                        min_cell: [values[0], values[1]],
+                        max_cell: [values[2], values[3]],
+                        sound_id,
+                    })
+                })();
+                if let Some(region) = parsed {
+                    immediate_actions.push(ImmediateAction::Ambient(region));
                     continue;
                 }
                 supported = false;
@@ -1286,9 +1312,13 @@ pub struct PreparedProcess<'a> {
     staged: ProcessRuntime,
     actions: Vec<ImmediateAction>,
     object_sync_complete: bool,
+    ambient_sync_complete: bool,
     event: ProcessEvent,
 }
 impl PreparedProcess<'_> {
+    pub(crate) fn mark_ambient_staged(&mut self) {
+        self.ambient_sync_complete = true;
+    }
     pub fn actions(&self) -> &[ImmediateAction] {
         &self.actions
     }
@@ -1365,6 +1395,17 @@ impl PreparedProcess<'_> {
         Ok(())
     }
     pub fn commit(self) -> ProcessEvent {
+        if !self.ambient_sync_complete
+            && self
+                .actions
+                .iter()
+                .any(|action| matches!(action, ImmediateAction::Ambient(_)))
+        {
+            return ProcessEvent {
+                process_id: self.event.process_id,
+                outcome: ProcessOutcome::Unsupported,
+            };
+        }
         if !self.object_sync_complete
             && self
                 .actions
@@ -1724,6 +1765,7 @@ impl ProcessRuntime {
             staged,
             actions,
             object_sync_complete: false,
+            ambient_sync_complete: false,
             event,
         })
     }
@@ -1764,6 +1806,7 @@ impl ProcessRuntime {
             staged,
             actions: Vec::new(),
             object_sync_complete: false,
+            ambient_sync_complete: false,
             event,
         })
     }
@@ -3214,7 +3257,7 @@ mod tests {
             "StartDelay 2\n#action\nquake 1 1 2 2 0",
             "#action\nexplode 1 1\nquake 1 1 64 2 0",
             "#action\nexplode 1 1\nchange 1 1 100",
-            "#action\nquake 1 1 2 2 1\nambient 1 1 2 2 1",
+            "#action\nquake 1 1 2 2 1\nambient 1 1 2 2 32",
         ] {
             let script =
                 Script::parse(&format!("#proc1\n{text}\n#end\n#links\nlink 0 0 1\n#end\n"));

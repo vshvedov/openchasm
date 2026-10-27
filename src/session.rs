@@ -1,6 +1,7 @@
 //! Fixed-tick game session: simulation state independent of presentation and transport.
 use crate::actors::{ActorDefinitions, ActorMapping, ActorState};
 use crate::ai::{ActorCollisionSides, EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
+use crate::ambient::AmbientGrid;
 use crate::combat::{
     self, Combat, EnemyShotContext, EnemyShotHit, EnemyShotTarget, FireResult, RocketDefinitions,
     ShotContext, ShotImpact,
@@ -277,6 +278,7 @@ pub struct Session {
     pub mission: Option<MissionState>,
     pub hazards: Hazards,
     pub wind: WindField,
+    ambient: Option<AmbientGrid>,
     pending_wind_errors: Vec<WindError>,
     /// Absolute offsets in original script units, indexed by wall index.
     pub wall_elevations: Vec<f32>,
@@ -328,6 +330,7 @@ impl Session {
             mission: None,
             hazards: Hazards::default(),
             wind: WindField::new(),
+            ambient: None,
             pending_wind_errors: Vec::new(),
             combat: Combat::new(),
             rockets: setup.rockets,
@@ -368,6 +371,14 @@ impl Session {
     /// The host must present teleport events and keep floor geometry in sync.
     pub fn set_teleports(&mut self, definitions: Vec<Teleport>, policy: RearmPolicy) {
         self.teleports = Some((definitions, TeleportState::new(policy)));
+    }
+    /// Install an authoritative ambient map before taking the restart snapshot.
+    pub fn set_ambient_grid(&mut self, grid: AmbientGrid) {
+        self.ambient = Some(grid);
+    }
+    /// The presentation layer can sample the current sound ID at a cell.
+    pub fn ambient_grid(&self) -> Option<&AmbientGrid> {
+        self.ambient.as_ref()
     }
     /// Enable the documented addon boss rule only for an explicitly selected
     /// addon-to-remaster actor mapping. Configure before the restart snapshot.
@@ -483,7 +494,7 @@ impl Session {
                 Some((actor.position, radius))
             })
             .collect();
-        let transaction = ProcessTransaction::prepare(
+        let transaction = ProcessTransaction::prepare_with_ambient(
             prepared,
             &mut scripted.states,
             combat,
@@ -498,6 +509,7 @@ impl Session {
                         .iter()
                         .all(|(p, r)| p.iter().all(|v| v.is_finite()) && distance(*p) >= radius + r)
             },
+            self.ambient.as_mut(),
         )
         .map_err(|_| (ProcessOutcome::Unsupported, true))?;
         let transitions = transaction.transitions().to_vec();
@@ -526,6 +538,7 @@ impl Session {
         let saved_processes = self.processes.clone();
         let saved_scripted = self.scripted_objects.clone();
         let saved_objects = self.objects.clone();
+        let saved_ambient = self.ambient.clone();
         let replacement_start = events.object_transitions.len();
         let quake_start = events.quake_changes.len();
         let mut attempts = Vec::new();
@@ -544,6 +557,7 @@ impl Session {
                     self.processes = saved_processes;
                     self.scripted_objects = saved_scripted;
                     self.objects = saved_objects;
+                    self.ambient = saved_ambient;
                     events.object_transitions.truncate(replacement_start);
                     events.quake_changes.truncate(quake_start);
                     return (Vec::new(), false);
@@ -1314,6 +1328,7 @@ impl Session {
                     self.processes.clone(),
                     self.objects.clone(),
                     self.scripted_objects.clone(),
+                    self.ambient.clone(),
                 ))
             }
         } else {
@@ -1360,11 +1375,12 @@ impl Session {
             }
         }
         if pickup_failed {
-            if let Some((game, processes, objects, scripted)) = pickup_backup {
+            if let Some((game, processes, objects, scripted, ambient)) = pickup_backup {
                 self.game = game;
                 self.processes = processes;
                 self.objects = objects;
                 self.scripted_objects = scripted;
+                self.ambient = ambient;
             }
             events.pickups.clear();
             events.object_transitions.clear();
@@ -1405,6 +1421,7 @@ impl Session {
         if input.fire {
             let object_before_hit = self.scripted_objects.as_ref().and(self.objects.clone());
             let scripted_before_hit = self.scripted_objects.clone();
+            let ambient_before_hit = self.ambient.clone();
             let processes_before_hit = self
                 .scripted_objects
                 .as_ref()
@@ -1484,6 +1501,7 @@ impl Session {
                             } else {
                                 self.objects = object_before_hit;
                                 self.scripted_objects = scripted_before_hit;
+                                self.ambient = ambient_before_hit;
                                 if let Some(processes) = processes_before_hit {
                                     self.processes = processes;
                                 }
@@ -1806,6 +1824,7 @@ impl Session {
                     let object_before_hit =
                         self.scripted_objects.as_ref().and(self.objects.clone());
                     let scripted_before_hit = self.scripted_objects.clone();
+                    let ambient_before_hit = self.ambient.clone();
                     let processes_before_hit = self
                         .scripted_objects
                         .as_ref()
@@ -1829,6 +1848,7 @@ impl Session {
                                     } else {
                                         self.objects = object_before_hit;
                                         self.scripted_objects = scripted_before_hit;
+                                        self.ambient = ambient_before_hit;
                                         if let Some(processes) = processes_before_hit {
                                             self.processes = processes;
                                         }
@@ -1971,6 +1991,79 @@ mod tests {
         });
         session.set_mission(MissionPlan::parse(&script, text));
         session
+    }
+
+    fn ambient_session(text: &str) -> Session {
+        use crate::process_runtime::ProcessCapabilities;
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        let cells = [0; 4096];
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![],
+        };
+        let states = ObjectStates::new(&[], &defs).unwrap();
+        session.set_objects(ObjectCombat::new(&[], &defs, &script, Difficulty::Normal));
+        session.set_scripted_objects(ScriptedObjects::new(
+            states,
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        let map = crate::map::Map::parse(&vec![0; 0x27005]).unwrap();
+        session.set_ambient_grid(AmbientGrid::from_map(&map));
+        session
+    }
+
+    #[test]
+    fn staged_ambient_requires_capability_and_preserves_action_order() {
+        let text = "#proc1\n#action\nambient 0 0 2 2 5\nambient 1 1 3 3 7\n#end\n#links\nlink 0 0 1\n#end\n";
+        let mut session = ambient_session(text);
+        let mut no_grid = session.clone();
+        no_grid.ambient = None;
+        assert!(no_grid
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .is_err());
+        let mut direct = session.processes.clone();
+        assert_eq!(
+            direct
+                .prepare_at("link", [0, 0], 1)
+                .unwrap()
+                .commit()
+                .outcome,
+            ProcessOutcome::Unsupported
+        );
+        let event = session
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .unwrap();
+        assert_eq!(event.outcome, ProcessOutcome::Accepted);
+        assert_eq!(session.ambient_grid().unwrap().cell([0, 0]), Some(5));
+        assert_eq!(session.ambient_grid().unwrap().cell([1, 1]), Some(7));
+        assert_eq!(session.ambient_grid().unwrap().cell([3, 3]), Some(7));
+        assert_eq!(session.ambient_grid().unwrap().cell([4, 4]), Some(0));
+    }
+
+    #[test]
+    fn failed_multi_destroy_rolls_back_ambient_with_other_processes() {
+        let text = "#proc1\n#action\nambient 0 0 2 2 7\nunlock 3\n#end\n#proc2\n#action\nchange 3 0 163\n#end\n#proc3\nlock\nonmessage 1\n#end\n#links\ndestroy 1 1 1\ndestroy 1 1 2\nlink 0 0 3\n#end\n";
+        let mut session = ambient_session(text);
+        let before = session.ambient_grid().unwrap().clone();
+        let (_, accepted) = session.activate_destroy([1, 1], &mut SessionEvents::default());
+        assert!(!accepted);
+        assert_eq!(session.ambient_grid().unwrap(), &before);
+        assert_eq!(
+            session.processes.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
     }
 
     fn height_combat_fixture() -> Session {

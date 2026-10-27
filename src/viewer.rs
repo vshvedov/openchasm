@@ -108,6 +108,26 @@ fn fire_feedback(result: Option<FireResult>) -> Option<&'static str> {
     }
 }
 
+struct FrameClock {
+    last: Instant,
+}
+impl FrameClock {
+    fn sample(&mut self, now: Instant, focused: bool) -> f32 {
+        let elapsed = now
+            .saturating_duration_since(self.last)
+            .min(Duration::from_millis(100));
+        self.last = now;
+        if focused {
+            elapsed.as_secs_f32()
+        } else {
+            0.0
+        }
+    }
+    fn rebase(&mut self, now: Instant) {
+        self.last = now;
+    }
+}
+
 struct ViewerTexture {
     width: usize,
     height: usize,
@@ -331,6 +351,46 @@ enum CheckpointCommand {
     Load,
 }
 
+fn sync_actor_scene(
+    objects: &mut ObjectScene,
+    session: &Session,
+    delta_seconds: f32,
+    warned_actor_clips: &mut HashSet<usize>,
+) {
+    for actor in &session.actors.actors {
+        let mode = session
+            .ai
+            .mode(actor.source_index)
+            .unwrap_or(Mode::Inactive);
+        let animation = match mode {
+            Mode::Inactive | Mode::Idle => ActorAnimationMode::Idle,
+            Mode::Chasing => ActorAnimationMode::Run,
+            Mode::Attacking => ActorAnimationMode::Attack,
+            Mode::Dead => ActorAnimationMode::Death,
+        };
+        objects.set_actor_pose(
+            actor.source_index,
+            actor.position,
+            actor.angle_radians,
+            mode != Mode::Inactive,
+        );
+        objects.set_actor_animation(actor.source_index, animation, delta_seconds);
+        let attack_frame = session
+            .ai
+            .attack_animation(actor.source_index)
+            .map(|phase| (phase.slot, phase.frame));
+        if !objects.set_actor_attack_frame(actor.source_index, attack_frame)
+            && attack_frame.is_some()
+            && warned_actor_clips.insert(actor.source_index)
+        {
+            eprintln!(
+                "actor {} attack animation is unavailable or inconsistent with simulation metadata",
+                actor.source_index
+            );
+        }
+    }
+}
+
 pub struct ClientFeedback {
     pub session: Session,
     pub audio: Audio,
@@ -357,6 +417,7 @@ pub fn run(
     } = feedback;
     let difficulty_mask = crate::difficulty_mask(difficulty);
     let initial_session = session.clone();
+    let mut warned_actor_clips = HashSet::new();
     if let Some(targets) = &session.objects {
         for (cell, visible) in targets.visibility() {
             objects.set_visible(cell, visible);
@@ -366,6 +427,8 @@ pub fn run(
     for cell in session.game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
+    sync_actor_scene(&mut objects, &session, 0.0, &mut warned_actor_clips);
+    let initial_scene = objects.snapshot();
     let textures: Vec<Option<ViewerTexture>> = textures
         .into_iter()
         .map(|item| item.map(ViewerTexture::from))
@@ -395,11 +458,12 @@ pub fn run(
         ..RelativeLook::default()
     };
     let mut held = HashSet::new();
-    let mut warned_actor_clips = HashSet::new();
     let mut mouse_fire = false;
     let mut frame = vec![0; WIDTH * HEIGHT];
     let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
-    let mut last = Instant::now();
+    let mut frame_clock = FrameClock {
+        last: Instant::now(),
+    };
     let mut accumulator = 0.0f32;
     let mut animation_tick = 0_u64;
     let mut pending_interact = false;
@@ -528,16 +592,12 @@ pub fn run(
         if !running {
             break;
         }
-        let now = Instant::now();
+        let elapsed = frame_clock.sample(Instant::now(), look.focused);
         if look.focused {
-            accumulator += now
-                .duration_since(last)
-                .min(Duration::from_millis(100))
-                .as_secs_f32();
+            accumulator += elapsed;
         } else {
             accumulator = 0.0;
         }
-        last = now;
         let key = |code| if held.contains(&code) { 1.0 } else { 0.0 };
         let movement = Input {
             forward: key(Scancode::W) - key(Scancode::S),
@@ -549,24 +609,8 @@ pub fn run(
             if let Some(renderer) = &mut explosion_renderer {
                 renderer.clear();
             }
-            objects.reset_level_objects();
-            objects.reset_object_animations();
-            for pose in session.processes.objects() {
-                objects.set_pose(
-                    [usize::from(pose.cell[0]), usize::from(pose.cell[1])],
-                    pose.position,
-                    pose.angle_radians,
-                    pose.elevation_raw,
-                );
-            }
-            if let Some(targets) = &session.objects {
-                for (cell, visible) in targets.visibility() {
-                    objects.set_visible(cell, visible);
-                }
-            }
-            restore_level_visibility(&mut objects, &session, difficulty_mask);
-            for (cell, visible) in session.game.pickups.visibility() {
-                objects.set_visible(cell, visible);
+            if !objects.restore(&initial_scene) {
+                return Err("initial scene snapshot no longer matches the level".into());
             }
             pending_interact = false;
             pending_jump = false;
@@ -590,6 +634,7 @@ pub fn run(
                         completed,
                         shot_feedback,
                     });
+                    frame_clock.rebase(Instant::now());
                     checkpoint_notice = Some(("QUICKSAVED (MEMORY ONLY)", 2.0));
                 }
                 CheckpointCommand::Load => {
@@ -613,6 +658,7 @@ pub fn run(
                             pending_weapon = None;
                             look.pending_dx = 0;
                             accumulator = 0.0;
+                            frame_clock.rebase(Instant::now());
                             advance_requested = false;
                             checkpoint_notice = Some(("QUICKLOADED", 2.0));
                         } else {
@@ -778,35 +824,7 @@ pub fn run(
                 shoot_ticks = 12;
                 audio.play(21 + session.selected_weapon as u8);
             }
-            for actor in &session.actors.actors {
-                let mode = session
-                    .ai
-                    .mode(actor.source_index)
-                    .unwrap_or(Mode::Inactive);
-                let animation = match mode {
-                    Mode::Inactive | Mode::Idle => ActorAnimationMode::Idle,
-                    Mode::Chasing => ActorAnimationMode::Run,
-                    Mode::Attacking => ActorAnimationMode::Attack,
-                    Mode::Dead => ActorAnimationMode::Death,
-                };
-                objects.set_actor_pose(
-                    actor.source_index,
-                    actor.position,
-                    actor.angle_radians,
-                    mode != Mode::Inactive,
-                );
-                objects.set_actor_animation(actor.source_index, animation, STEP);
-                let attack_frame = session
-                    .ai
-                    .attack_animation(actor.source_index)
-                    .map(|phase| (phase.slot, phase.frame));
-                if !objects.set_actor_attack_frame(actor.source_index, attack_frame)
-                    && attack_frame.is_some()
-                    && warned_actor_clips.insert(actor.source_index)
-                {
-                    eprintln!("actor {} attack animation is unavailable or inconsistent with simulation metadata", actor.source_index);
-                }
-            }
+            sync_actor_scene(&mut objects, &session, STEP, &mut warned_actor_clips);
             accumulator -= STEP;
         }
         let quake_power = session
@@ -1226,5 +1244,16 @@ mod tests {
         );
         assert_eq!(fire_feedback(Some(FireResult::CoolingDown)), None);
         assert_eq!(fire_feedback(None), None);
+    }
+    #[test]
+    fn frame_clock_excludes_checkpoint_copy_time() {
+        let start = Instant::now();
+        let mut clock = FrameClock { last: start };
+        assert!((clock.sample(start + Duration::from_millis(10), true) - 0.01).abs() < 0.00001);
+        // A slow save/load took 250ms; rebase before the next frame.
+        clock.rebase(start + Duration::from_millis(260));
+        assert!((clock.sample(start + Duration::from_millis(276), true) - 0.016).abs() < 0.00001);
+        assert_eq!(clock.sample(start + Duration::from_millis(300), false), 0.0);
+        assert!((clock.sample(start + Duration::from_millis(310), true) - 0.01).abs() < 0.00001);
     }
 }

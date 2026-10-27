@@ -1096,7 +1096,8 @@ impl ObjectScene {
     }
 
     /// Restore a same-scene checkpoint atomically after verifying identities
-    /// and mesh references. Returns false without changes for another scene.
+    /// and mesh references. Returns false without changes when these checks
+    /// fail; snapshots must still only be used with their originating scene.
     pub fn restore(&mut self, snapshot: &ObjectSceneSnapshot) -> bool {
         if snapshot.instances.len() != self.instances.len()
             || !snapshot
@@ -2462,5 +2463,27 @@ mod tests {
         other.instances[0].cell = Some([5, 5]);
         assert!(!other.restore(&saved));
         assert_eq!(other.instances[0].cell, Some([5, 5]));
+
+        // Restart uses the initial scene snapshot before a subsequent quicksave;
+        // actor presentation must be back at spawn without waiting for a tick.
+        let mut actor_scene = gltf_scene(255);
+        actor_scene.instances[0].cell = None;
+        actor_scene.instances[0].actor_source_index = Some(3);
+        let initial_scene = actor_scene.snapshot();
+        actor_scene.instances[0].position = [8.0, 9.0];
+        actor_scene.instances[0].visible = false;
+        actor_scene.instances[0].animation_mode = ActorAnimationMode::Death;
+        actor_scene.instances[0].animation_seconds = 4.0;
+        actor_scene.instances[0].attack_frame = Some((5, 3));
+        assert!(actor_scene.restore(&initial_scene));
+        let restarted_checkpoint = actor_scene.snapshot();
+        actor_scene.instances[0].position = [7.0, 7.0];
+        assert!(actor_scene.restore(&restarted_checkpoint));
+        let actor = &actor_scene.instances[0];
+        assert_eq!(actor.position, [2.0, 0.0]);
+        assert!(actor.visible);
+        assert_eq!(actor.animation_mode, ActorAnimationMode::Idle);
+        assert_eq!(actor.animation_seconds, 0.0);
+        assert_eq!(actor.attack_frame, None);
     }
 }

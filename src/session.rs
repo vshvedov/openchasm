@@ -23,7 +23,7 @@ use crate::quake::{QuakeField, QuakeZone};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
 use crate::wind::{WindError, WindField};
 use crate::world::{CollisionCircle, Input, World};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub struct LevelSetup {
     pub world: World,
@@ -1136,17 +1136,34 @@ impl Session {
                 .saturating_add(self.apply_player_damage(attack.damage));
         }
         let pre_tick_projectiles = self.explosions_enabled.then(|| self.projectiles.clone());
-        let mut rejected_impacts = Vec::new();
-        events.projectile_impacts = self.projectiles.tick_with_objects(
-            DT,
-            &self.world,
-            &self.actors,
-            &self.actor_definitions,
-            self.objects.as_ref(),
-            |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
-        );
-        for index in 0..events.projectile_impacts.len() {
-            let impact = events.projectile_impacts[index];
+        let mut frozen = BTreeSet::new();
+        let mut elapsed = 0.0_f32;
+        loop {
+            let remaining = (DT - elapsed).max(0.0);
+            let candidate = self.projectiles.trace_next(
+                remaining,
+                crate::projectiles::TraceContext {
+                    world: &self.world,
+                    actors: &self.actors,
+                    definitions: &self.actor_definitions,
+                    objects: self.objects.as_ref(),
+                },
+                |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
+                &frozen,
+            );
+            let Some(mut impact) = candidate else {
+                self.projectiles.advance_traced(remaining, &frozen);
+                break;
+            };
+            if !self.projectiles.advance_traced(impact.time, &frozen) {
+                break;
+            }
+            elapsed = (elapsed + impact.time).min(DT);
+            impact.time = elapsed;
+            if self.projectiles.take(impact.projectile_id).is_none() {
+                break;
+            }
+            events.projectile_impacts.push(impact);
             let height = self
                 .projectile_heights
                 .remove(&impact.projectile_id)
@@ -1180,7 +1197,8 @@ impl Session {
                         .restore_impact(snapshot, impact.projectile_id)
                 }) {
                     self.projectile_heights.insert(impact.projectile_id, height);
-                    rejected_impacts.push(impact.projectile_id);
+                    events.projectile_impacts.pop();
+                    frozen.insert(impact.projectile_id);
                 }
                 continue;
             }
@@ -1254,9 +1272,6 @@ impl Session {
                 _ => {}
             }
         }
-        events
-            .projectile_impacts
-            .retain(|impact| !rejected_impacts.contains(&impact.projectile_id));
         if let Some(mission) = &mut self.mission {
             for attempt in attempts {
                 match attempt.outcome {
@@ -3302,6 +3317,23 @@ mod tests {
             select_weapon: Some(5),
             ..Default::default()
         });
+        session.rockets.0.push(RocketDefinition {
+            model_name: "arrow.3o".into(),
+            power: 10,
+            raw_fields: vec![1, 0, 120, 0, 10, 0],
+        });
+        let independent = session
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Player,
+                    rocket_id: 1,
+                    origin: [5.0, 5.0],
+                    direction: [1.0, 0.0],
+                },
+                &session.rockets,
+            )
+            .unwrap();
         for _ in 0..15 {
             let events = session.step(SessionInput::default());
             assert!(events.projectile_impacts.is_empty());
@@ -3309,9 +3341,16 @@ mod tests {
         }
         assert_eq!(
             session.projectiles.active().len(),
-            1,
-            "failed staged contact must retry"
+            2,
+            "failed staged contact must retry while the other projectile advances"
         );
+        let other = session
+            .projectiles
+            .active()
+            .iter()
+            .find(|p| p.id == independent)
+            .unwrap();
+        assert!((other.position[0] - 7.5).abs() < 1e-4);
         assert_eq!(session.game.inventory.health, 100);
         assert_eq!(session.processes.cell_type([2, 0]), Some(164));
         session
@@ -3333,6 +3372,69 @@ mod tests {
             .iter()
             .any(|d| d.target == TargetId::Object { cell: [2, 0] }));
         assert!(!events.object_hits.iter().any(|(cell, _)| *cell == [2, 0]));
-        assert!(session.projectiles.active().is_empty());
+        assert_eq!(session.projectiles.active().len(), 1);
+        assert_eq!(session.projectiles.active()[0].id, independent);
+    }
+    #[test]
+    fn chronological_projectiles_retrace_after_first_kills_actor() {
+        let mut session = mission_session("");
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 0,
+            actor_radius: 0,
+            speed: 0,
+            rotation_speed: 0,
+            health: 10,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        let placement = Monster {
+            position: [256, 128],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [1.0, 0.5],
+            angle_radians: 0.0,
+            health: 10,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "arrow.3o".into(),
+            power: 20,
+            raw_fields: vec![1, 0, 120, 0, 20, 0],
+        }]);
+        let spawn = |origin| Launch {
+            owner: Owner::Player,
+            rocket_id: 0,
+            origin,
+            direction: [1.0, 0.0],
+        };
+        session
+            .projectiles
+            .spawn(spawn([0.9, 0.5]), &session.rockets)
+            .unwrap();
+        session
+            .projectiles
+            .spawn(spawn([0.8, 0.5]), &session.rockets)
+            .unwrap();
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.projectile_impacts.len(), 1);
+        assert_eq!(events.projectile_impacts[0].projectile_id, 0);
+        assert_eq!(
+            events.projectile_impacts[0].target,
+            ImpactTarget::Actor { source_index: 7 }
+        );
+        assert_eq!(session.actors.actors[0].health, 0);
+        assert_eq!(session.projectiles.active().len(), 1);
+        assert_eq!(session.projectiles.active()[0].id, 1);
+        assert!((session.projectiles.active()[0].position[0] - (0.8 + 10.0 / 60.0)).abs() < 1e-5);
     }
 }

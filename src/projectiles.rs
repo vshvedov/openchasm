@@ -8,6 +8,7 @@ use crate::combat::RocketDefinitions;
 use crate::map::UNITS_PER_TILE;
 use crate::object_combat::ObjectCombat;
 use crate::world::{Wall, World};
+use std::collections::BTreeSet;
 
 const DEFAULT_SPEED: f32 = 10.0; // tiles per second
 const FAST_SPEED: f32 = 20.0;
@@ -73,6 +74,14 @@ pub struct Impact {
     pub damage: i32,
     /// Seconds after the beginning of the supplied tick.
     pub time: f32,
+}
+
+/// State sampled when tracing the next projectile event.
+pub struct TraceContext<'a> {
+    pub world: &'a World,
+    pub actors: &'a ActorState,
+    pub definitions: &'a ActorDefinitions,
+    pub objects: Option<&'a ObjectCombat>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -180,6 +189,81 @@ impl ProjectileSystem {
         };
         self.projectiles.push(projectile.clone());
         true
+    }
+
+    /// Predict the next impact from current state without changing it. The
+    /// host must retrace after committing any world or actor state change.
+    pub fn trace_next<F>(
+        &self,
+        horizon: f32,
+        context: TraceContext<'_>,
+        blocks_shots: F,
+        frozen: &BTreeSet<u64>,
+    ) -> Option<Impact>
+    where
+        F: Fn(&Wall) -> bool,
+    {
+        if !horizon.is_finite() || horizon < 0.0 {
+            return None;
+        }
+        let mut probe = self.clone();
+        probe
+            .projectiles
+            .retain(|projectile| !frozen.contains(&projectile.id));
+        // A tiny positive horizon allows same-time overlaps and expiry to be
+        // considered at the end of the tick without moving past that end.
+        let probe_horizon = if horizon == 0.0 {
+            f32::MIN_POSITIVE
+        } else {
+            horizon
+        };
+        probe
+            .tick_with_objects(
+                probe_horizon,
+                context.world,
+                context.actors,
+                context.definitions,
+                context.objects,
+                blocks_shots,
+            )
+            .into_iter()
+            .find(|impact| horizon > 0.0 || impact.time == 0.0)
+    }
+    /// Advance all unfrozen projectiles by a previously traced safe interval.
+    /// On invalid input no projectile is modified.
+    pub fn advance_traced(&mut self, dt: f32, frozen: &BTreeSet<u64>) -> bool {
+        if !dt.is_finite() || dt < 0.0 {
+            return false;
+        }
+        if self
+            .projectiles
+            .iter()
+            .filter(|p| !frozen.contains(&p.id))
+            .any(|p| {
+                dt > p.remaining + 1e-6
+                    || !p
+                        .position
+                        .iter()
+                        .zip(p.velocity)
+                        .all(|(x, v)| (x + v * dt).is_finite())
+            })
+        {
+            return false;
+        }
+        for p in self
+            .projectiles
+            .iter_mut()
+            .filter(|p| !frozen.contains(&p.id))
+        {
+            p.position = add_scaled(p.position, p.velocity, dt);
+            p.remaining = (p.remaining - dt).max(0.0);
+        }
+        true
+    }
+    /// Remove one resolved candidate without affecting the ID generator.
+    pub fn take(&mut self, id: u64) -> Option<Projectile> {
+        let index = self.projectiles.iter().position(|p| p.id == id)?;
+        Some(self.projectiles.remove(index))
     }
 
     /// Only non-instant, positive-power rocket definitions can be spawned.
@@ -306,7 +390,7 @@ impl ProjectileSystem {
                 }
             }
             let length = delta[0].hypot(delta[1]);
-            if let Some(hit) = objects.and_then(|objects| objects.raycast(origin, delta, length, projectile.radius)) {
+            if let Some(hit) = objects.and_then(|objects| objects.raycast(origin, projectile.velocity, length, projectile.radius)) {
                 let t = if length > 1e-8 { hit.distance / length } else { 0.0 };
                 if nearest.is_none_or(|(best, _)| t < best) { nearest = Some((t, ImpactTarget::Object { cell: hit.cell })); }
             }
@@ -512,5 +596,75 @@ mod tests {
         assert_eq!(events[0].projectile_id, nearer);
         assert_eq!(events[1].projectile_id, farther);
         assert!(events[0].time < events[1].time);
+    }
+    #[test]
+    fn chronological_zero_time_ties_and_expiry_are_stable() {
+        let (rockets, defs, actors, mut world) = setup();
+        world.walls.push(wall(0.0));
+        let mut system = ProjectileSystem::new();
+        for _ in 0..2 {
+            system
+                .spawn(launch(Owner::Player, [0.0, 0.0], [1.0, 0.0]), &rockets)
+                .unwrap();
+        }
+        for p in &mut system.projectiles {
+            p.remaining = 0.0;
+        }
+        let frozen = BTreeSet::new();
+        let first = system
+            .trace_next(
+                0.0,
+                TraceContext {
+                    world: &world,
+                    actors: &actors,
+                    definitions: &defs,
+                    objects: None,
+                },
+                |_| true,
+                &frozen,
+            )
+            .unwrap();
+        assert_eq!(
+            (first.projectile_id, first.target, first.time),
+            (0, ImpactTarget::Wall { wall_index: 0 }, 0.0)
+        );
+        assert!(system.advance_traced(0.0, &frozen));
+        system.take(first.projectile_id).unwrap();
+        let second = system
+            .trace_next(
+                0.0,
+                TraceContext {
+                    world: &world,
+                    actors: &actors,
+                    definitions: &defs,
+                    objects: None,
+                },
+                |_| true,
+                &frozen,
+            )
+            .unwrap();
+        assert_eq!(
+            (second.projectile_id, second.target),
+            (1, ImpactTarget::Wall { wall_index: 0 })
+        );
+    }
+    #[test]
+    fn traced_motion_preserves_distance_and_freezes_selected_ids() {
+        let (rockets, ..) = setup();
+        let mut system = ProjectileSystem::new();
+        system
+            .spawn(launch(Owner::Player, [0.0, 0.0], [1.0, 0.0]), &rockets)
+            .unwrap();
+        system
+            .spawn(launch(Owner::Player, [0.0, 2.0], [1.0, 0.0]), &rockets)
+            .unwrap();
+        let frozen = BTreeSet::from([0]);
+        assert!(system.advance_traced(0.01, &frozen));
+        assert!(system.advance_traced(0.01, &frozen));
+        assert_eq!(system.active()[0].position, [0.0, 0.0]);
+        assert!((system.active()[1].position[0] - 0.2).abs() < 1e-6);
+        let snapshot = system.clone();
+        assert!(!system.advance_traced(f32::NAN, &frozen));
+        assert_eq!(system.active(), snapshot.active());
     }
 }

@@ -31,16 +31,33 @@ pub struct Image {
 pub struct Primitive {
     pub name: String,
     pub positions: Vec<[f32; 3]>,
+    /// Authored unit normals, absent when the asset requests flat shading.
+    pub normals: Option<Vec<[f32; 3]>>,
     pub uv: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     /// glTF position *deltas*, ordered as the game's successive frames.
     pub morph_deltas: Vec<Vec<[f32; 3]>>,
+    /// Optional normal deltas, in the same frame order as position deltas.
+    pub morph_normal_deltas: Vec<Option<Vec<[f32; 3]>>>,
     /// Column-major accumulated glTF scene node transform.
     pub node_transform: [[f32; 4]; 4],
     pub texture: Option<usize>,
     pub transparent: bool,
 }
 impl Primitive {
+    /// glTF morph normals are deltas; normalize only after adding and transforming.
+    pub fn frame_normal(&self, frame: usize, index: usize) -> Option<[f32; 3]> {
+        let base = *self.normals.as_ref()?.get(index)?;
+        let delta = frame
+            .checked_sub(1)
+            .and_then(|frame| self.morph_normal_deltas.get(frame))
+            .and_then(Option::as_ref)
+            .and_then(|values| values.get(index))
+            .copied()
+            .unwrap_or([0.0; 3]);
+        Some(std::array::from_fn(|axis| base[axis] + delta[axis]))
+    }
+
     /// Frame zero is the base mesh; frame n > 0 applies morph target n - 1.
     pub fn frame_positions(&self, frame: usize) -> Option<Vec<[f32; 3]>> {
         if frame == 0 {
@@ -326,6 +343,30 @@ impl GltfModel {
                 total_vec3 = total_vec3
                     .checked_add(positions.len())
                     .ok_or_else(|| invalid("glTF vertex count overflow"))?;
+                let normals = if let Some(accessor) = primitive.get(&gltf::Semantic::Normals) {
+                    if accessor.count() != vertex_count {
+                        return Err(invalid("invalid glTF normal count"));
+                    }
+                    total_vec3 = total_vec3
+                        .checked_add(vertex_count)
+                        .filter(|&n| n <= MAX_VEC3_VALUES)
+                        .ok_or_else(|| invalid("glTF exceeds geometry limit"))?;
+                    let values: Vec<_> = reader
+                        .read_normals()
+                        .ok_or_else(|| invalid("invalid glTF normal accessor"))?
+                        .collect();
+                    if values.len() != vertex_count
+                        || values.iter().any(|n| {
+                            !n.iter().all(|v| v.is_finite())
+                                || n.iter().map(|v| v * v).sum::<f32>() <= 0.0
+                        })
+                    {
+                        return Err(invalid("invalid glTF normals"));
+                    }
+                    Some(values)
+                } else {
+                    None
+                };
                 let uv: Vec<_> = reader
                     .read_tex_coords(0)
                     .ok_or_else(|| invalid("missing or invalid glTF UVs"))?
@@ -347,7 +388,8 @@ impl GltfModel {
                     return Err(invalid("invalid glTF triangle indices"));
                 }
                 let mut morph_deltas = Vec::new();
-                for (target, (position_delta, _, _)) in
+                let mut morph_normal_deltas = Vec::new();
+                for (target, (position_delta, normal_delta, _)) in
                     primitive.morph_targets().zip(reader.read_morph_targets())
                 {
                     if target.positions().is_some() && position_delta.is_none() {
@@ -376,6 +418,29 @@ impl GltfModel {
                         return Err(invalid("glTF exceeds geometry limit"));
                     }
                     morph_deltas.push(values);
+                    let normal_values = if let Some(accessor) = target.normals() {
+                        if normals.is_none() || accessor.count() != vertex_count {
+                            return Err(invalid(
+                                "invalid glTF morph normal count or missing base normals",
+                            ));
+                        }
+                        total_vec3 = total_vec3
+                            .checked_add(vertex_count)
+                            .filter(|&n| n <= MAX_VEC3_VALUES)
+                            .ok_or_else(|| invalid("glTF exceeds geometry limit"))?;
+                        let values: Vec<_> = normal_delta
+                            .ok_or_else(|| invalid("invalid glTF morph normal accessor"))?
+                            .collect();
+                        if values.len() != vertex_count
+                            || values.iter().flatten().any(|v| !v.is_finite())
+                        {
+                            return Err(invalid("invalid glTF morph normals"));
+                        }
+                        Some(values)
+                    } else {
+                        None
+                    };
+                    morph_normal_deltas.push(normal_values);
                 }
                 frame_count = frame_count.max(1 + morph_deltas.len());
                 let texture = primitive
@@ -387,9 +452,11 @@ impl GltfModel {
                 primitives.push(Primitive {
                     name: name.clone(),
                     positions,
+                    normals,
                     uv,
                     indices,
                     morph_deltas,
+                    morph_normal_deltas,
                     node_transform: transform,
                     texture,
                     transparent: name.ends_with(" transparent"),
@@ -476,6 +543,92 @@ mod tests {
         assert_eq!(model.primitives[0].texture, Some(0));
         assert_eq!(model.images[0].rgba, [255, 0, 128, 64]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    fn normal_fixture(normal: [f32; 3], delta: [f32; 3]) -> serde_json::Value {
+        let (json, _) = fixture(false);
+        let mut json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let mut bytes = Vec::new();
+        for vector in [normal, delta] {
+            for _ in 0..3 {
+                for value in vector {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        json["buffers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "byteLength": 72, "uri": format!("data:application/octet-stream;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes))
+            }));
+        for offset in [0, 36] {
+            let view = json["bufferViews"].as_array().unwrap().len();
+            json["bufferViews"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "buffer": 1, "byteOffset": offset, "byteLength": 36
+                }));
+            json["accessors"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "bufferView": view, "componentType": 5126, "count": 3, "type": "VEC3"
+                }));
+        }
+        json["meshes"][0]["primitives"][0]["attributes"]["NORMAL"] = 4.into();
+        json["meshes"][0]["primitives"][0]["targets"][0]["NORMAL"] = 5.into();
+        json
+    }
+    fn load_normal_fixture(json: &serde_json::Value) -> io::Result<GltfModel> {
+        let dir = tempdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fixture.gltf"), serde_json::to_vec(json).unwrap()).unwrap();
+        let mut source = ResourceSet::open(&dir).unwrap();
+        let result = GltfModel::load(&mut source, "fixture.gltf");
+        std::fs::remove_dir_all(dir).unwrap();
+        result
+    }
+    #[test]
+    fn imports_normal_deltas_in_matching_morph_frame() {
+        let json = normal_fixture([0.0, 0.0, 1.0], [1.0, 0.0, -1.0]);
+        let model = load_normal_fixture(&json).unwrap();
+        let primitive = &model.primitives[0];
+        assert_eq!(primitive.frame_normal(0, 1), Some([0.0, 0.0, 1.0]));
+        assert_eq!(primitive.frame_normal(1, 1), Some([1.0, 0.0, 0.0]));
+        let mut no_delta = json;
+        no_delta["meshes"][0]["primitives"][0]["targets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("NORMAL");
+        let model = load_normal_fixture(&no_delta).unwrap();
+        assert_eq!(
+            model.primitives[0].frame_normal(1, 1),
+            Some([0.0, 0.0, 1.0])
+        );
+    }
+    #[test]
+    fn rejects_invalid_base_and_morph_normals() {
+        for (normal, delta) in [
+            ([0.0; 3], [0.0; 3]),
+            ([f32::NAN, 0.0, 1.0], [0.0; 3]),
+            ([0.0, 0.0, 1.0], [f32::INFINITY, 0.0, 0.0]),
+        ] {
+            assert!(load_normal_fixture(&normal_fixture(normal, delta)).is_err());
+        }
+        let good = normal_fixture([0.0, 0.0, 1.0], [0.0; 3]);
+        for accessor in [4, 5] {
+            let mut json = good.clone();
+            json["accessors"][accessor]["count"] = 2.into();
+            assert!(load_normal_fixture(&json).is_err());
+        }
+        let mut missing_base = good;
+        missing_base["meshes"][0]["primitives"][0]["attributes"]
+            .as_object_mut()
+            .unwrap()
+            .remove("NORMAL");
+        assert!(load_normal_fixture(&missing_base).is_err());
     }
     #[test]
     fn rejects_bad_indices_and_unsafe_resources() {

@@ -55,3 +55,13 @@ reduced final texture presentation to approximately 0.8 ms on this Linux box
 same uncapped preset checks showed roughly 57 FPS legacy, 44 FPS remaster HDR,
 and 34 FPS enhanced. This targets scaling/blit overhead, not a GPU world
 renderer, and still needs physical runtime validation on macOS/Windows.
+
+## Directional static lighting cost
+
+The first generated-lighting integration measured about 33.4 FPS at the same
+level-one spawn (plane 11.6 ms, wall 5.8 ms, model 4.3 ms, post 6.0 ms), compared
+with about 44 FPS for HDR using the former scalar field. This is an additional
+CPU fidelity cost and remains a performance target. All 19 installed maps build
+finite fields without skipping sources; release construction was 21 ms for
+MAP01 and 5–44 ms across the maps. Moving geometry requires refreshed shadows,
+so rebuild scheduling must avoid adding that construction time to every frame.

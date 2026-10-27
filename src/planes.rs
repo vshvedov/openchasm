@@ -77,7 +77,7 @@ impl PlaneRenderer {
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
-        self.render_inner::<u32, false>(frame, None, width, height, camera, lights);
+        self.render_inner::<u32, false>(frame, None, width, height, camera, lights, None);
     }
 
     /// Paint planes and write perpendicular depths for actual geometry only.
@@ -91,10 +91,11 @@ impl PlaneRenderer {
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
-        self.render_inner::<u32, false>(frame, Some(depth), width, height, camera, lights);
+        self.render_inner::<u32, false>(frame, Some(depth), width, height, camera, lights, None);
     }
 
     /// Render plane colors into either the legacy or linear-HDR target.
+    #[cfg(test)]
     pub fn render_to<C: RenderPixel>(
         &self,
         frame: &mut [C],
@@ -104,9 +105,24 @@ impl PlaneRenderer {
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
-        self.render_inner::<C, false>(frame, Some(depth), width, height, camera, lights);
+        self.render_inner::<C, false>(frame, Some(depth), width, height, camera, lights, None);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_remaster<C: RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+        remaster: Option<(&crate::remaster_light::RemasterLightMap, f32)>,
+    ) {
+        self.render_inner::<C, false>(frame, Some(depth), width, height, camera, lights, remaster);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_inner<C: RenderPixel, const USE_REFERENCE_FLOOR: bool>(
         &self,
         frame: &mut [C],
@@ -115,6 +131,7 @@ impl PlaneRenderer {
         height: usize,
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+        remaster: Option<(&crate::remaster_light::RemasterLightMap, f32)>,
     ) {
         let position = camera.player.position;
         if !camera.eye_height.is_finite()
@@ -217,7 +234,17 @@ impl PlaneRenderer {
                         + ty * FLOOR_TEXTURE_SIDE
                         + tx];
                 let light = lights.map_or(0.0, |lights| lights.sample([world_x, world_y]));
-                let static_light = self.static_light.sample([world_x, world_y]).unwrap_or(1.0);
+                let static_light = if let Some((map, fade)) = remaster {
+                    let dx = world_x - position[0];
+                    let dy = world_y - position[1];
+                    let distance = (dx * dx + dy * dy + plane_height * plane_height).sqrt();
+                    map.sample(
+                        [world_x, world_y],
+                        [0.0, 0.0, if ceiling { -1.0 } else { 1.0 }],
+                    ) * crate::remaster_light::distance_multiplier(distance, fade)
+                } else {
+                    self.static_light.sample([world_x, world_y]).unwrap_or(1.0)
+                };
                 if let Some(buffer) = depth.as_deref_mut() {
                     buffer[y * width + x] = distance;
                 }
@@ -344,6 +371,7 @@ mod tests {
                 83,
                 camera,
                 None,
+                None,
             );
             renderer.render_inner::<u32, true>(
                 &mut reference,
@@ -351,6 +379,7 @@ mod tests {
                 127,
                 83,
                 camera,
+                None,
                 None,
             );
             assert_eq!(legacy, reference);
@@ -366,6 +395,7 @@ mod tests {
                 83,
                 camera,
                 None,
+                None,
             );
             renderer.render_inner::<LinearRgb, true>(
                 &mut reference_hdr,
@@ -373,6 +403,7 @@ mod tests {
                 127,
                 83,
                 camera,
+                None,
                 None,
             );
             assert_eq!(hdr, reference_hdr);

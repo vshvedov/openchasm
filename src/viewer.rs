@@ -14,6 +14,7 @@ use crate::object_render::{
 };
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
+use crate::remaster_light::{LightingError, RemasterLightMap, ShadowTexture};
 use crate::texture::CelImage;
 use crate::weapon_render::{WeaponAnimationClock, WeaponPose, WeaponRenderer};
 use crate::world::{Input, World};
@@ -485,6 +486,7 @@ struct RenderWorld<'a> {
     pitch: f32,
     mines: &'a [openchasm::explosives::Mine],
     lights: Option<&'a openchasm::dynamic_light::DynamicLightSampler>,
+    remaster: Option<(&'a RemasterLightMap, f32)>,
 }
 
 // Authored quake power has no documented unit. Scale linearly up to a small
@@ -601,7 +603,15 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
     };
     depth.fill(f32::INFINITY);
     if let Some(planes) = planes {
-        planes.render_to(frame, depth, WIDTH, HEIGHT, camera, scene.lights);
+        planes.render_with_remaster(
+            frame,
+            depth,
+            WIDTH,
+            HEIGHT,
+            camera,
+            scene.lights,
+            scene.remaster,
+        );
     } else {
         for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
             row.fill(C::from_srgb8(
@@ -662,6 +672,18 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
                 })
                 .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
             let light = scene.lights.map_or(0.0, |lights| lights.sample(point));
+            let remaster = scene.remaster.map(|(map, fade)| {
+                let wall = &world.walls[index];
+                let mut normal = [wall.a[1] - wall.b[1], wall.b[0] - wall.a[0]];
+                if texture >= 86
+                    && normal[0] * (camera.player.position[0] - point[0])
+                        + normal[1] * (camera.player.position[1] - point[1])
+                        < 0.0
+                {
+                    normal = normal.map(|v| -v);
+                }
+                (map.sample_wall(point, normal), fade)
+            });
             let lighting = attenuation * (1.0 + light);
             let color = C::shade_srgb8(
                 ((75 + texture * 37 % 110) << 16)
@@ -680,9 +702,21 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
                         as usize)
                         .min(image.height - 1);
                     let rgb = image.pixels[ty * image.width + tx];
-                    if (87..=119).contains(&texture) && rgb >> 24 == 0 {
+                    if rgb >> 24 < 128 {
                         continue;
                     }
+                    let lighting = remaster.map_or(lighting, |(static_light, fade)| {
+                        let slope = (camera.horizon(HEIGHT) - (y as f32 + 0.5))
+                            / CameraView::focal_length(HEIGHT);
+                        let camera_distance = distance
+                            * (direction[0] * direction[0]
+                                + direction[1] * direction[1]
+                                + slope * slope)
+                                .sqrt();
+                        static_light
+                            * crate::remaster_light::distance_multiplier(camera_distance, fade)
+                            * (1.0 + light)
+                    });
                     C::shade_srgb8(rgb, lighting)
                 } else {
                     color
@@ -695,7 +729,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
     timings.wall = profile_elapsed(started);
     let started = profile_start(profile);
     if let Some(objects) = objects {
-        objects.render_deferred(
+        objects.render_deferred_with_remaster(
             frame,
             depth,
             WIDTH,
@@ -705,6 +739,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
             scene.lights,
             planes.map(PlaneRenderer::static_light),
             transparency,
+            scene.remaster,
         );
     }
     timings.model = profile_elapsed(started);
@@ -778,10 +813,15 @@ impl FrameScene<'_> {
             self.weapon_id,
             self.weapon_pose,
             self.weapon_frame,
-            self.planes
-                .static_light()
-                .sample(self.camera.player.position)
-                .unwrap_or(1.0),
+            self.world.remaster.map_or_else(
+                || {
+                    self.planes
+                        .static_light()
+                        .sample(self.camera.player.position)
+                        .unwrap_or(1.0)
+                },
+                |(map, _)| map.sample(self.camera.player.position, [0.0, 0.0, 1.0]),
+            ),
         );
         timings.weapon = profile_elapsed(started);
         timings
@@ -926,7 +966,83 @@ fn sync_actor_scene(
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct LightingGeometry {
+    a: [f32; 2],
+    b: [f32; 2],
+    texture: u8,
+    cell: Option<[u8; 2]>,
+    elevation: f32,
+}
+impl LightingGeometry {
+    fn from_wall(wall: &crate::world::Wall, elevation: f32) -> Self {
+        Self {
+            a: wall.a,
+            b: wall.b,
+            texture: wall.texture,
+            cell: wall.cell,
+            elevation,
+        }
+    }
+}
+#[derive(Default)]
+struct LightingCache {
+    map: Option<RemasterLightMap>,
+    geometry: Option<Vec<LightingGeometry>>,
+}
+impl LightingCache {
+    fn update(
+        &mut self,
+        map: &crate::map::Map,
+        world: &World,
+        elevations: &[f32],
+        textures: &[Option<ViewerTexture>],
+    ) -> Result<(), LightingError> {
+        let current = || {
+            world.walls.iter().enumerate().map(|(index, wall)| {
+                LightingGeometry::from_wall(wall, elevations.get(index).copied().unwrap_or(0.0))
+            })
+        };
+        if self
+            .geometry
+            .as_ref()
+            .is_some_and(|previous| previous.iter().copied().eq(current()))
+        {
+            return Ok(());
+        }
+        self.geometry = Some(current().collect());
+        let elevations: Vec<_> = elevations.iter().map(|value| value / 64.0).collect();
+        let textures: Vec<_> = textures
+            .iter()
+            .map(|texture| {
+                texture.as_ref().map(|texture| ShadowTexture {
+                    width: texture.width,
+                    height: texture.height,
+                    pixels: &texture.pixels,
+                })
+            })
+            .collect();
+        match RemasterLightMap::build(map, world, &elevations, &textures) {
+            Ok(field) => {
+                if field.skipped_sources() != 0 {
+                    eprintln!(
+                        "ignored {} malformed static light sources",
+                        field.skipped_sources()
+                    );
+                }
+                self.map = Some(field);
+                Ok(())
+            }
+            Err(error) => {
+                self.map = None;
+                Err(error)
+            }
+        }
+    }
+}
+
 pub struct ClientFeedback {
+    pub map: crate::map::Map,
     pub session: Session,
     pub audio: Audio,
     pub weapon_overlay: WeaponRenderer,
@@ -950,6 +1066,7 @@ pub fn run(
     label: &str,
 ) -> Result<Option<openchasm::inventory::Inventory>, Box<dyn Error>> {
     let ClientFeedback {
+        map,
         mut session,
         mut audio,
         weapon_overlay,
@@ -1020,6 +1137,7 @@ pub fn run(
     let mut hdr_frame = vec![LinearRgb::default(); WIDTH * HEIGHT];
     let mut rgb_transparency = Translucency::new(WIDTH * HEIGHT);
     let mut hdr_transparency = Translucency::new(WIDTH * HEIGHT);
+    let mut remaster_lighting = LightingCache::default();
     let mut bloom = crate::bloom::Bloom::new(WIDTH, HEIGHT)?;
     let settings_store = match SettingsStore::for_sdl() {
         Ok(store) => Some(store),
@@ -1896,6 +2014,15 @@ pub fn run(
             continue;
         }
         let simulation_time = std::mem::take(&mut pending_simulation_time);
+        if graphics.uses_hdr() {
+            if let Err(error) =
+                remaster_lighting.update(&map, &session.world, &session.wall_elevations, &textures)
+            {
+                eprintln!("remaster lighting unavailable: {error}");
+                console.push(&format!("Remaster lighting unavailable: {error}"));
+                checkpoint_notice = Some(("REMASTER LIGHTING UNAVAILABLE", 4.0));
+            }
+        }
         let render_started = Instant::now();
         audio.update_ambient(session.ambient_grid(), session.world.player.position, 0.0);
         let quake_power = session
@@ -1940,6 +2067,15 @@ pub fn run(
                 pitch: camera.pitch,
                 mines: session.mines(),
                 lights: dynamic_lights.as_ref(),
+                remaster: graphics
+                    .uses_hdr()
+                    .then(|| {
+                        remaster_lighting
+                            .map
+                            .as_ref()
+                            .map(|map| (map, if graphics.tone_mapping { 10.0 } else { 5.0 }))
+                    })
+                    .flatten(),
             },
             textures: &textures,
             planes: &planes,
@@ -2365,6 +2501,7 @@ mod tests {
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             };
             let mut old_frame = vec![0; WIDTH * HEIGHT];
             let mut old_depth = vec![0.0; old_frame.len()];
@@ -2396,6 +2533,66 @@ mod tests {
             );
             assert_eq!(old_frame, new_frame, "colors differ at pitch {pitch}");
             assert_eq!(old_depth, new_depth, "depth differs at pitch {pitch}");
+        }
+    }
+
+    #[test]
+    fn every_wall_material_uses_the_authored_alpha_cutoff() {
+        let wall = |distance, texture| Wall {
+            a: [distance, -2.0],
+            b: [distance, 2.0],
+            texture,
+            blocks_movement: true,
+            cell: None,
+        };
+        for texture in [1usize, 85, 86, 87, 119] {
+            for alpha in [0u32, 127, 128, 255] {
+                let world = World {
+                    walls: vec![wall(1.0, texture as u8), wall(2.0, 2)],
+                    player: Player {
+                        position: [0.0, 0.0],
+                        angle: 0.0,
+                    },
+                };
+                let mut textures: Vec<Option<ViewerTexture>> = (0..120).map(|_| None).collect();
+                textures[texture] = Some(ViewerTexture {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![alpha << 24 | 0xff0000],
+                });
+                textures[2] = Some(ViewerTexture {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0xff0000ff],
+                });
+                let mut frame = vec![0; WIDTH * HEIGHT];
+                let mut depth = vec![f32::INFINITY; frame.len()];
+                render(
+                    &mut frame,
+                    &mut depth,
+                    RenderWorld {
+                        world: &world,
+                        elevations: &[],
+                        eye_height: 1.0,
+                        pitch: 0.0,
+                        yaw_offset: 0.0,
+                        mines: &[],
+                        lights: None,
+                        remaster: None,
+                    },
+                    &textures,
+                    None,
+                    None,
+                );
+                let pixel = frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
+                if alpha < 128 {
+                    assert_eq!(pixel & 0xff0000, 0);
+                    assert_ne!(pixel & 255, 0);
+                } else {
+                    assert_ne!(pixel & 0xff0000, 0);
+                    assert_eq!(pixel & 255, 0);
+                }
+            }
         }
     }
 
@@ -2439,6 +2636,7 @@ mod tests {
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &textures,
             None,
@@ -2493,6 +2691,7 @@ mod tests {
             yaw_offset: 0.0,
             mines: &[],
             lights,
+            remaster: None,
         };
         render(&mut base, &mut base_depth, scene(None), &[], None, None);
         render(
@@ -2533,6 +2732,7 @@ mod tests {
             pitch,
             mines: &[],
             lights: None,
+            remaster: None,
         };
         render(&mut frame, &mut depth, scene(0.0), &[], None, None);
         let top = |depth: &[f32]| {
@@ -2590,6 +2790,7 @@ mod tests {
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &[],
             None,
@@ -2607,6 +2808,7 @@ mod tests {
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &[],
             None,
@@ -2642,6 +2844,7 @@ mod tests {
                 pitch: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &[],
             None,
@@ -2701,6 +2904,7 @@ mod tests {
             pitch: 0.0,
             mines: &[],
             lights: None,
+            remaster: None,
         };
         render(
             &mut frame,
@@ -2755,7 +2959,7 @@ mod tests {
             Some(ViewerTexture {
                 width: 1,
                 height: 1,
-                pixels: vec![0xff0000],
+                pixels: vec![0xffff0000],
             }),
         ];
         let mut frame = vec![0; WIDTH * HEIGHT];
@@ -2771,6 +2975,7 @@ mod tests {
                 pitch: 0.2_f32.atan(),
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &textures,
             Some(&planes),
@@ -2818,6 +3023,7 @@ mod tests {
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &textures,
             None,
@@ -2845,7 +3051,7 @@ mod tests {
             Some(ViewerTexture {
                 width: 1,
                 height: 1,
-                pixels: vec![0xff0000],
+                pixels: vec![0xffff0000],
             }),
         ];
         let mut frame = vec![0; WIDTH * HEIGHT];
@@ -2861,6 +3067,7 @@ mod tests {
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
+                remaster: None,
             },
             &textures,
             None,

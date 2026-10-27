@@ -208,6 +208,52 @@ fn transform_gltf(matrix: [[f32; 4]; 4], pos: [f32; 3]) -> [f32; 3] {
     })
 }
 
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn normalized(n: [f32; 3]) -> Option<[f32; 3]> {
+    let length = n[0].hypot(n[1]).hypot(n[2]);
+    (length.is_finite() && length > 0.0).then(|| n.map(|v| v / length))
+}
+/// Column-major inverse transpose; translation must not affect normals.
+/// Singular transforms use geometric face normals at the rendering call site.
+fn normal_matrix(matrix: [[f32; 4]; 4]) -> Option<[[f32; 3]; 3]> {
+    let columns: [[f32; 3]; 3] =
+        std::array::from_fn(|i| [matrix[i][0], matrix[i][1], matrix[i][2]]);
+    let cofactor = [
+        cross(columns[1], columns[2]),
+        cross(columns[2], columns[0]),
+        cross(columns[0], columns[1]),
+    ];
+    let determinant: f32 = (0..3).map(|i| columns[0][i] * cofactor[0][i]).sum();
+    if !determinant.is_finite() || determinant == 0.0 {
+        return None;
+    }
+    let result = cofactor.map(|column| column.map(|value| value / determinant));
+    result
+        .iter()
+        .flatten()
+        .all(|v| v.is_finite())
+        .then_some(result)
+}
+fn transform_normal(
+    matrix: [[f32; 3]; 3],
+    normal: [f32; 3],
+    sin: f32,
+    cos: f32,
+) -> Option<[f32; 3]> {
+    let n: [f32; 3] = std::array::from_fn(|row| {
+        (0..3)
+            .map(|column| matrix[column][row] * normal[column])
+            .sum()
+    });
+    normalized([n[0] * cos - n[1] * sin, n[0] * sin + n[1] * cos, n[2]])
+}
+
 fn gltf_radius(model: &GltfModel) -> f32 {
     let mut radius = 0.0_f32;
     for primitive in &model.primitives {
@@ -273,6 +319,7 @@ struct Vertex {
     up: f32,
     depth: f32,
     uv: [f32; 2],
+    normal: [f32; 3],
 }
 impl Vertex {
     fn interpolate(self, next: Self, t: f32) -> Self {
@@ -282,8 +329,35 @@ impl Vertex {
             up: mix(self.up, next.up),
             depth: mix(self.depth, next.depth),
             uv: [mix(self.uv[0], next.uv[0]), mix(self.uv[1], next.uv[1])],
+            normal: std::array::from_fn(|i| mix(self.normal[i], next.normal[i])),
         }
     }
+}
+
+/// Facet fallback for assets without usable normals. CAR/3O smoothing is not
+/// established; this is an explicit modern-rendering approximation.
+fn facet_normal(vertices: &[Vertex], camera: CameraView) -> [f32; 3] {
+    let [forward_x, forward_y] = camera.player.forward();
+    let [right_x, right_y] = camera.player.right();
+    let difference = |a: Vertex, b: Vertex| {
+        let side = a.side - b.side;
+        let depth = a.depth - b.depth;
+        [
+            side * right_x + depth * forward_x,
+            side * right_y + depth * forward_y,
+            a.up - b.up,
+        ]
+    };
+    vertices
+        .get(1)
+        .zip(vertices.get(2))
+        .and_then(|(&b, &c)| {
+            normalized(cross(
+                difference(b, vertices[0]),
+                difference(c, vertices[0]),
+            ))
+        })
+        .unwrap_or([0.0, 0.0, 1.0])
 }
 
 /// Clips a polygon to the near plane before perspective division.
@@ -315,6 +389,7 @@ struct ScreenVertex {
     inv_depth: f32,
     u_over_depth: f32,
     v_over_depth: f32,
+    normal_over_depth: [f32; 3],
 }
 fn project(v: Vertex, width: usize, height: usize, horizon: f32) -> ScreenVertex {
     let inv_depth = v.depth.recip();
@@ -324,6 +399,7 @@ fn project(v: Vertex, width: usize, height: usize, horizon: f32) -> ScreenVertex
         inv_depth,
         u_over_depth: v.uv[0] * inv_depth,
         v_over_depth: v.uv[1] * inv_depth,
+        normal_over_depth: v.normal.map(|n| n * inv_depth),
     }
 }
 fn edge(a: ScreenVertex, b: ScreenVertex, x: f32, y: f32) -> f32 {
@@ -456,8 +532,41 @@ struct Raster<'a, C: RenderPixel> {
     translucent: Option<Translucency<C>>,
     instance_light: f32,
     instance_static_light: Option<f32>,
+    remaster_light: Option<(&'a crate::remaster_light::RemasterLightMap, f32, CameraView)>,
 }
 impl<C: RenderPixel> Raster<'_, C> {
+    fn attenuation(
+        &self,
+        triangle: [ScreenVertex; 3],
+        weights: [f32; 3],
+        distance: f32,
+        px: f32,
+        py: f32,
+    ) -> f32 {
+        let Some((light, fade, camera)) = self.remaster_light else {
+            return self
+                .instance_static_light
+                .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
+        };
+        let normal = std::array::from_fn(|axis| {
+            (0..3)
+                .map(|i| weights[i] * triangle[i].normal_over_depth[axis])
+                .sum::<f32>()
+                * distance
+        });
+        let focal = CameraView::focal_length(self.height);
+        let side = (px - self.width as f32 * 0.5) * distance / focal;
+        let up = (camera.horizon(self.height) - py) * distance / focal;
+        let forward = camera.player.forward();
+        let right = camera.player.right();
+        let position = std::array::from_fn(|i| {
+            camera.player.position[i] + forward[i] * distance + right[i] * side
+        });
+        // The original per-instance model lightmap shift remains untraced.
+        // Actual world XY is a documented approximation, without wall bias.
+        light.sample(position, normal)
+            * crate::remaster_light::distance_multiplier(distance.hypot(side).hypot(up), fade)
+    }
     fn put(&mut self, pixel: usize, distance: f32, rgb: C, alpha: u8) {
         if alpha == 255 {
             self.frame[pixel] = rgb;
@@ -517,9 +626,7 @@ impl<C: RenderPixel> Raster<'_, C> {
                     continue;
                 }
                 let rgb = self.palette[index as usize];
-                let attenuation = self
-                    .instance_static_light
-                    .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
+                let attenuation = self.attenuation(triangle, [w0, w1, w2], distance, px, py);
                 let rgb = C::shade_srgb8(rgb, attenuation * (1.0 + self.instance_light));
                 // Both legacy translucent flag bits use provisional half alpha.
                 self.put(
@@ -589,9 +696,7 @@ impl<C: RenderPixel> Raster<'_, C> {
                 if rgba[3] == 0 {
                     continue;
                 }
-                let attenuation = self
-                    .instance_static_light
-                    .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0));
+                let attenuation = self.attenuation(triangle, [w0, w1, w2], distance, px, py);
                 let source =
                     u32::from(rgba[0]) << 16 | u32::from(rgba[1]) << 8 | u32::from(rgba[2]);
                 let rgb = C::shade_srgb8(source, attenuation * (1.0 + self.instance_light));
@@ -661,6 +766,9 @@ fn draw_gltf<C: RenderPixel>(
             .checked_sub(1)
             .and_then(|i| primitive.morph_deltas.get(i));
         let image = primitive.texture.and_then(|i| model.images.get(i));
+        let normals = raster
+            .remaster_light
+            .and_then(|_| normal_matrix(primitive.node_transform));
         for indices in primitive.indices.chunks(3) {
             let mut vertices = Vec::with_capacity(3);
             for &index in indices {
@@ -684,7 +792,22 @@ fn draw_gltf<C: RenderPixel>(
                     up: p[2] + instance.elevation - camera.eye_height,
                     depth: wx * forward_x + wy * forward_y,
                     uv: primitive.uv[i],
+                    normal: normals
+                        .and_then(|matrix| {
+                            primitive
+                                .frame_normal(frame, i)
+                                .and_then(|n| transform_normal(matrix, n, sin, cos))
+                        })
+                        .unwrap_or([0.0; 3]),
                 });
+            }
+            if raster.remaster_light.is_some() {
+                let facet = facet_normal(&vertices, camera);
+                for vertex in &mut vertices {
+                    if vertex.normal == [0.0; 3] {
+                        vertex.normal = facet;
+                    }
+                }
             }
             let clipped = clip_near(&vertices);
             if clipped.len() < 3 {
@@ -1523,6 +1646,38 @@ impl ObjectScene {
         static_light: Option<&crate::map::StaticLightMap>,
         transparency: &mut Translucency<C>,
     ) {
+        self.render_deferred_with_remaster(
+            frame,
+            depth,
+            width,
+            height,
+            camera,
+            mines,
+            lights,
+            static_light,
+            transparency,
+            None,
+        );
+    }
+
+    /// Optional remaster lighting uses authored normals and per-fragment world
+    /// positions. Tuple's second value is distance fade F (10 with tone mapping,
+    /// 5 without at default setting). Original model lookup shift and legacy
+    /// mesh smoothing remain approximations; None preserves the legacy path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_deferred_with_remaster<C: RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        mines: &[openchasm::explosives::Mine],
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+        static_light: Option<&crate::map::StaticLightMap>,
+        transparency: &mut Translucency<C>,
+        remaster_light: Option<(&crate::remaster_light::RemasterLightMap, f32)>,
+    ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
@@ -1544,6 +1699,7 @@ impl ObjectScene {
             translucent: Some(std::mem::replace(transparency, Translucency::new(0))),
             instance_light: 0.0,
             instance_static_light: None,
+            remaster_light: remaster_light.map(|(light, fade)| (light, fade, camera)),
         };
         let mine_instances: Vec<_> = self
             .mine_mesh
@@ -1629,7 +1785,14 @@ impl ObjectScene {
                         up: f32::from(p[2]) * MODEL_SCALE + instance.elevation - camera.eye_height,
                         depth: world_x * forward_x + world_y * forward_y,
                         uv: texture_uv(polygon, corner, mesh.car_uv),
+                        normal: [0.0; 3],
                     });
+                }
+                if raster.remaster_light.is_some() {
+                    let facet = facet_normal(&vertices, camera);
+                    for vertex in &mut vertices {
+                        vertex.normal = facet;
+                    }
                 }
                 let clipped = clip_near(&vertices);
                 if clipped.len() < 3 {
@@ -1656,6 +1819,138 @@ impl ObjectScene {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn gltf_normal_transform_preserves_perpendicularity_and_reflection() {
+        // Nonuniform scale and shear make applying the position matrix wrong.
+        let matrix = [
+            [2.0, 0.0, 0.0, 0.0],
+            [1.0, 3.0, 0.0, 0.0],
+            [0.0, 1.0, 0.5, 0.0],
+            [10.0, 20.0, 30.0, 1.0],
+        ];
+        let (sin, cos) = 0.7f32.sin_cos();
+        let normal =
+            transform_normal(normal_matrix(matrix).unwrap(), [1.0, 1.0, 1.0], sin, cos).unwrap();
+        for tangent in [[1.0, -1.0, 0.0], [0.0, 1.0, -1.0]] {
+            let p = transform_gltf(matrix, tangent);
+            let p = std::array::from_fn::<_, 3, _>(|i| p[i] - matrix[3][i]);
+            let rotated = [p[0] * cos - p[1] * sin, p[0] * sin + p[1] * cos, p[2]];
+            let dot: f32 = (0..3).map(|i| normal[i] * rotated[i]).sum();
+            assert!(dot.abs() < 1e-5);
+        }
+        let reflected = [
+            [-2.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        assert_eq!(
+            transform_normal(normal_matrix(reflected).unwrap(), [1.0, 0.0, 0.0], 0.0, 1.0),
+            Some([-1.0, 0.0, 0.0])
+        );
+        let mut singular = matrix;
+        singular[0] = [0.0; 4];
+        assert!(normal_matrix(singular).is_none());
+    }
+
+    #[test]
+    fn normals_survive_clipping_and_perspective_interpolation() {
+        let a = Vertex {
+            side: 0.0,
+            up: 0.0,
+            depth: 0.0,
+            uv: [0.0; 2],
+            normal: [1.0, 0.0, 0.0],
+        };
+        let b = Vertex {
+            depth: 1.0,
+            normal: [0.0, 1.0, 0.0],
+            ..a
+        };
+        let c = Vertex {
+            side: 1.0,
+            depth: 2.0,
+            normal: [0.0, 0.0, 1.0],
+            ..a
+        };
+        let clipped = clip_near(&[a, b, c]);
+        let edge_ab = clipped
+            .iter()
+            .find(|v| (v.depth - NEAR).abs() < 1e-5 && v.side == 0.0)
+            .unwrap();
+        assert_eq!(edge_ab.normal, [1.0 - NEAR, NEAR, 0.0]);
+        let projected = [project(b, 64, 64, 32.0), project(c, 64, 64, 32.0)];
+        let inverse_depth = (projected[0].inv_depth + projected[1].inv_depth) * 0.5;
+        let interpolated: [f32; 3] = std::array::from_fn(|i| {
+            (projected[0].normal_over_depth[i] + projected[1].normal_over_depth[i]) * 0.5
+                / inverse_depth
+        });
+        assert!((interpolated[1] - 2.0 / 3.0).abs() < 1e-6);
+        assert!((interpolated[2] - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remaster_authored_normals_change_shading_without_geometry_or_alpha_changes() {
+        let mut data = vec![0; 0x27001 + 4];
+        data[0x25001..0x26001].fill(15);
+        let mut map = crate::map::Map::parse(&data).unwrap();
+        map.lights.push(crate::map::Light {
+            position: [4 * 256, 0],
+            power: 128,
+            inner_radius: 0,
+            outer_radius: 4 * 256,
+            brightness: 0,
+        });
+        let world = crate::world::World {
+            walls: vec![],
+            player: Player {
+                position: [0.0; 2],
+                angle: 0.0,
+            },
+        };
+        let light = crate::remaster_light::RemasterLightMap::build(&map, &world, &[], &[]).unwrap();
+        let camera = CameraView {
+            player: world.player,
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut scene = gltf_scene(128);
+        let mut render = |normal| {
+            scene.meshes[0].gltf.as_mut().unwrap().primitives[0].normals = Some(vec![normal; 3]);
+            let mut frame = vec![crate::color_pipeline::LinearRgb::default(); 64 * 64];
+            let mut depth = vec![f32::INFINITY; frame.len()];
+            let mut transparency = Translucency::new(frame.len());
+            scene.render_deferred_with_remaster(
+                &mut frame,
+                &mut depth,
+                64,
+                64,
+                camera,
+                &[],
+                None,
+                None,
+                &mut transparency,
+                Some((&light, 10.0)),
+            );
+            transparency.composite(&mut frame, &depth);
+            (
+                frame,
+                depth,
+                transparency
+                    .fragments
+                    .iter()
+                    .map(|f| (f.depth, f.alpha))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (toward, depth_a, fragments_a) = render([1.0, 0.0, 0.0]);
+        let (away, depth_b, fragments_b) = render([-1.0, 0.0, 0.0]);
+        assert_ne!(toward, away);
+        assert_eq!(depth_a, depth_b);
+        assert_eq!(fragments_a, fragments_b);
+        assert!(!fragments_a.is_empty());
+    }
+
     #[test]
     fn map01_landmark_projects_right_of_player_spawn() {
         let mut scene = gltf_scene(255);
@@ -1711,6 +2006,7 @@ pub(crate) mod tests {
                         up,
                         depth: 4.0,
                         uv: [0.0; 2],
+                        normal: [0.0; 3],
                     },
                     width,
                     height,
@@ -1741,6 +2037,7 @@ pub(crate) mod tests {
             up: 2.0,
             depth: 4.0,
             uv: [0.0, 0.0],
+            normal: [0.0; 3],
         };
         let projected = project(point, 640, 400, camera.horizon(400));
         assert!((projected.y - 200.0).abs() < 0.001);
@@ -1935,9 +2232,11 @@ pub(crate) mod tests {
         let primitive = crate::gltf_model::Primitive {
             name: "triangle".into(),
             positions: vec![[0.0, -0.5, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.5]],
+            normals: None,
             uv: vec![[0.0, 0.0]; 3],
             indices: vec![0, 1, 2],
             morph_deltas: vec![vec![[0.0, 0.4, 0.0]; 3]],
+            morph_normal_deltas: vec![None],
             node_transform: [
                 [1., 0., 0., 0.],
                 [0., 1., 0., 0.],
@@ -2887,6 +3186,7 @@ pub(crate) mod tests {
             up: 0.0,
             depth,
             uv: [depth, 0.0],
+            normal: [0.0; 3],
         };
         let out = clip_near(&[vertex(-1.0), vertex(1.0), vertex(2.0)]);
         assert_eq!(out.len(), 4);
@@ -2916,6 +3216,7 @@ pub(crate) mod tests {
             inv_depth: 1.0 / z,
             u_over_depth: 0.0,
             v_over_depth: 0.0,
+            normal_over_depth: [0.0; 3],
         };
         let triangle = [
             make(0.0, 0.0, 3.0),
@@ -2931,6 +3232,7 @@ pub(crate) mod tests {
             translucent: None,
             instance_light: 0.0,
             instance_static_light: None,
+            remaster_light: None,
         };
         raster.triangle(triangle, &model, 0);
         assert_eq!(raster.frame[0], 0x123456);
@@ -2955,6 +3257,7 @@ pub(crate) mod tests {
             inv_depth: depth.recip(),
             u_over_depth: 0.0,
             v_over_depth: 0.0,
+            normal_over_depth: [0.0; 3],
         };
         let tri = |a, b, c| {
             [
@@ -2991,6 +3294,7 @@ pub(crate) mod tests {
                 translucent: None,
                 instance_light: 0.0,
                 instance_static_light: None,
+                remaster_light: None,
             };
             // The two surfaces cross: their order reverses across the triangle.
             let draws = [(tri(1.0, 4.0, 1.0), &red), (tri(4.0, 1.0, 4.0), &blue)];
@@ -3038,6 +3342,7 @@ pub(crate) mod tests {
             translucent: None,
             instance_light: 0.0,
             instance_static_light: None,
+            remaster_light: None,
         };
         raster.put(0, 3.0, 0xff0000, 128);
         raster.put(0, 1.0, 0x0000ff, 255);

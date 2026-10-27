@@ -32,13 +32,13 @@ The component-wise ACES curve is `clamp(x*(2.51*x+0.03)/(x*(2.43*x+0.59)+0.14), 
 
 Evidence anchors: gamma shader registration `0x140055140`, uniform setup `0x14018c370`, material creation `0x1401885fc`, scene target `0x14018896a`, format mapping `0x1401ff120`, swapchain format selection `0x14007bd13`. Weapon calls `0x14018bea5`/`0x14018bf16` precede gamma `0x14018bf58`; the later HUD draw is `0x1400075a8`.
 
-Applying ACES directly to already shaded RGB bytes would be incorrect. The software renderer now has a linear HDR colour path and final post-process for this chain. Material decoding, lighting and alpha blending retain HDR values; the world and weapon share post-processing, while the HUD remains in display space. Current authored light sampling is still not equivalent to the full remaster lighting system. Damage feedback remains a provisional display-space tint.
+Applying ACES directly to already shaded RGB bytes would be incorrect. The software renderer now has a linear HDR colour path and final post-process for this chain. Material decoding, lighting and alpha blending retain HDR values; the world and weapon share post-processing, while the HUD remains in display space. The default generated-lighting path now follows verified source, ambient, directional response and shadow formulas, with explicit precision/filtering and model-lookup limits. See [lighting evidence](remaster-lighting.md). Damage feedback remains a provisional display-space tint.
 
 ## Light data distinction
 
 The original conversion helper uses `trunc((35 - raw) * 255 / 35)` for supported fine raw light values 0–35. The separate 64×64 ambient field is converted and remapped; verified examples are raw 0→255, 5→177, 10→102 and 15→25. Ambient is sampled as linear `R8_UNORM` and added to a separate HD lightmap in the wall shader. That HD lightmap is generated from map light-source records. The role of the fine 256×256 authored field in active HD rendering has not yet been proven.
 
-Consequently the current independent-reference conversion `(255 - 6*raw) * 1.3/255` is provisional. Replacing only that scalar with the fine-field helper is insufficient to reproduce the remaster's ambient, generated lighting, distance response, shadows and HDR output.
+The independent-reference conversion `(255 - 6*raw) * 1.3/255` remains confined to the Legacy comparison path and provisional projectile lighting. Remaster/enhanced world surfaces use a separately generated 1024² directional field, nearest ambient, bilinear sampling, wall-normal lookup offsets and full-3D camera-distance response. Source/shadow generation and remaining approximations are documented in [lighting evidence](remaster-lighting.md). Weapon lighting still uses a scalar camera-position sample; exact weapon and transient-source shading remain to be reconciled.
 
 ## Selectable presentation
 

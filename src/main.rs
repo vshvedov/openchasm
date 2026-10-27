@@ -15,6 +15,7 @@ mod object_render;
 mod planes;
 mod projectile_render;
 mod projectile_trails;
+mod remaster_light;
 mod replacement_manifest;
 mod scene_restore;
 mod sky;
@@ -710,6 +711,7 @@ fn play(
             planes,
             object_scene,
             viewer::ClientFeedback {
+                map,
                 session,
                 audio,
                 weapon_overlay,

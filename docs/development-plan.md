@@ -6,7 +6,7 @@ The latest user priorities are the original game's look, enemy animation, blocke
 
 ## Faithful baseline
 
-- Calibrate lighting and palette/colour response against controlled original-game views. Executable analysis has now verified the 75-degree vertical world FOV, separate weapon FOV and sRGB/HDR/ACES chain. The projection defaults and linear HDR colour chain are implemented; generated lighting, shadows and distance response still need calibration.
+- Calibrate lighting and palette/colour response against controlled original-game views. Executable analysis has now verified the 75-degree vertical world FOV, separate weapon FOV and sRGB/HDR/ACES chain. The projection defaults and linear HDR colour chain are implemented; generated lighting, static shadows and distance response are implemented from executable evidence, while precision, sampling/coverage details, model coordinates and transient sources still need calibration.
 - Verify enemy run, idle, ranged, melee, pain and death behavior against owned animations; finish missing reactions and detached parts.
 - Extend first-map progression tests using the same height, wall-material and collision setup as the client. Controlled tests without enemies do not prove a full route.
 - Measure render, simulation and presentation time in release builds, then improve actual hot paths and frame pacing. Retain fixed authoritative ticks while improving presentation smoothness.

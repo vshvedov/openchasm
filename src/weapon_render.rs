@@ -4,12 +4,12 @@
 //! weapon ownership belong to the shared simulation. See docs/weapon-rendering.md.
 use crate::content::ResourceSet;
 use crate::model::{Animation, Model, SKIN_WIDTH};
+use crate::object_render::CameraView;
 use crate::texture::Palette;
 use std::io::{self, ErrorKind};
 
 const WEAPON_COUNT: usize = 8;
 const SCALE: f32 = 1.0 / 2048.0;
-const CAMERA_PLANE: f32 = 0.66;
 const NEAR: f32 = 0.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,7 +311,7 @@ struct Projected {
 fn project(v: Vertex, width: usize, height: usize) -> Projected {
     let inv_depth = v.depth.recip();
     Projected {
-        x: width as f32 * 0.5 * (1.0 + v.side * inv_depth / CAMERA_PLANE),
+        x: CameraView::project_x(width, height, v.side * inv_depth),
         y: height as f32 * 0.5 * (1.0 - v.up * inv_depth),
         inv_depth,
         u_over_depth: v.uv[0] * inv_depth,
@@ -449,6 +449,43 @@ mod tests {
         let mut clamped = vec![0; 64 * 64];
         renderer.render(&mut clamped, 64, 64, 0, WeaponPose::Idle, usize::MAX);
         assert_eq!(second, clamped);
+    }
+
+    #[test]
+    fn weapon_projection_uses_square_pixels_for_wide_and_tall_views() {
+        for (width, height) in [(640, 400), (400, 640)] {
+            let center = project(
+                Vertex {
+                    side: 0.0,
+                    up: 0.0,
+                    depth: 2.0,
+                    uv: [0.0; 2],
+                },
+                width,
+                height,
+            );
+            let side = project(
+                Vertex {
+                    side: 1.0,
+                    up: 0.0,
+                    depth: 2.0,
+                    uv: [0.0; 2],
+                },
+                width,
+                height,
+            );
+            let up = project(
+                Vertex {
+                    side: 0.0,
+                    up: 1.0,
+                    depth: 2.0,
+                    uv: [0.0; 2],
+                },
+                width,
+                height,
+            );
+            assert!(((side.x - center.x) - (center.y - up.y)).abs() < 1e-5);
+        }
     }
 
     #[test]

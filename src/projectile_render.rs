@@ -10,7 +10,6 @@ use openchasm::model::{Animation, Model, Vertex as ModelVertex, SKIN_WIDTH};
 use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
-const CAMERA_PLANE: f32 = 0.66;
 const NEAR: f32 = 0.05;
 
 /// A transient render snapshot supplied by the simulation. Coordinates are map
@@ -297,7 +296,7 @@ struct Projected {
 fn project(vertex: Vertex, width: usize, height: usize, horizon: f32) -> Projected {
     let inverse = vertex.depth.recip();
     Projected {
-        x: width as f32 * 0.5 * (1.0 + vertex.side * inverse / CAMERA_PLANE),
+        x: CameraView::project_x(width, height, vertex.side * inverse),
         y: horizon - height as f32 * 0.5 * vertex.up * inverse,
         inverse,
         u_inverse: vertex.uv[0] * inverse,
@@ -528,6 +527,65 @@ mod tests {
             palette,
         }
     }
+    #[test]
+    fn pitched_floor_depth_occludes_below_floor_projectile_but_not_open_tile() {
+        use crate::map::{Floors, Map};
+        use crate::planes::PlaneRenderer;
+        let make_planes = |floor_id: u8| {
+            let mut map_bytes = vec![0; 0x27001 + 4];
+            map_bytes[0x23001..0x24001].fill(63);
+            map_bytes[0x24001..0x25001].fill(floor_id);
+            let map = Map::parse(&map_bytes).unwrap();
+            let floors = Floors::parse(&vec![0; 64 + 64 * 64 * 86]).unwrap();
+            let palette = Palette::parse(&[0; 768]).unwrap();
+            PlaneRenderer::new(&map, &floors, &palette)
+        };
+        let camera = CameraView {
+            player: Player {
+                position: [16.5, 16.5],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: -0.5_f32.atan(),
+        };
+        let solid = make_planes(0);
+        let open = make_planes(63);
+        let renderer = renderer();
+        let mut shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [19.5, 16.5, 0.5],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        let mut frame = vec![0; 64 * 64];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        solid.render_with_depth(&mut frame, &mut depth, 64, 64, camera, None);
+        let baseline = frame.clone();
+        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        assert!(
+            frame != baseline,
+            "projectile above floor should be visible"
+        );
+        shot.position[2] = -0.5;
+        depth.fill(f32::INFINITY);
+        solid.render_with_depth(&mut frame, &mut depth, 64, 64, camera, None);
+        let baseline = frame.clone();
+        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        assert!(frame == baseline, "floor must hide projectile below it");
+        depth.fill(f32::INFINITY);
+        open.render_with_depth(&mut frame, &mut depth, 64, 64, camera, None);
+        let background = frame.clone();
+        renderer.render(&mut frame, &mut depth, 64, 64, camera, &[shot]);
+        assert!(
+            frame
+                .iter()
+                .zip(background)
+                .any(|(&pixel, old)| pixel != old && pixel & 0xff0000 != 0),
+            "open floor should reveal the same projectile"
+        );
+    }
+
     #[test]
     fn fullbright_projectile_keeps_color_and_obeys_depth() {
         let mut renderer = renderer();

@@ -18,7 +18,6 @@ const MAX_FRAMES: usize = 256;
 const MAX_SIDE: usize = 512;
 const MAX_PIXELS: usize = 8 * 1024 * 1024;
 const MAX_EFFECTS: usize = 256;
-const CAMERA_PLANE: f32 = 0.66;
 const NEAR: f32 = 0.05;
 const TICKS_PER_FRAME: u32 = 4; // 15 FPS at 60 simulation ticks/s.
 
@@ -289,9 +288,9 @@ impl ExplosionRenderer {
             let image = &self.sprite.frames
                 [(effect.age_ticks / TICKS_PER_FRAME) as usize % self.sprite.frames.len()];
             let size_factor = if self.half_size { 0.5 } else { 1.0 };
-            let scale_x = width as f32 * 0.5 * size_factor / (distance * CAMERA_PLANE * 64.0);
+            let scale_x = CameraView::focal_length(height) * size_factor / (distance * 64.0);
             let scale_y = height as f32 * 0.5 * size_factor / (distance * 64.0);
-            let center_x = width as f32 * 0.5 * (1.0 + side / (distance * CAMERA_PLANE));
+            let center_x = CameraView::project_x(width, height, side / distance);
             let center_y = camera.horizon(height)
                 - height as f32 * 0.5 * (effect.position[2] - camera.eye_height) / distance;
             let left = center_x - image.center as f32 * scale_x;
@@ -385,6 +384,37 @@ mod tests {
         renderer.clear();
         assert!(renderer.effects.is_empty());
     }
+    #[test]
+    fn sprite_pixels_remain_square_across_viewport_aspects() {
+        let mut renderer = renderer();
+        renderer.sprite.frames[0].pixels.fill(1);
+        assert!(renderer.spawn([0.125, 0.0, 1.0]));
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        for (width, height) in [(128, 64), (64, 128)] {
+            let mut frame = vec![0; width * height];
+            let depth = vec![f32::INFINITY; frame.len()];
+            renderer.render(&mut frame, &depth, width, height, camera);
+            let points: Vec<_> = frame
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c != 0)
+                .map(|(i, _)| (i % width, i / width))
+                .collect();
+            let min_x = points.iter().map(|p| p.0).min().unwrap();
+            let max_x = points.iter().map(|p| p.0).max().unwrap();
+            let min_y = points.iter().map(|p| p.1).min().unwrap();
+            let max_y = points.iter().map(|p| p.1).max().unwrap();
+            assert_eq!(max_x - min_x, max_y - min_y);
+        }
+    }
+
     #[test]
     fn moving_particles_apply_gravity_floor_bounce_and_expiry() {
         let mut renderer = renderer();

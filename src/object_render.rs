@@ -15,7 +15,6 @@ use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
 const NEAR: f32 = 0.05;
-const CAMERA_PLANE: f32 = 0.66;
 const ACTOR_ANIMATION_FPS: f64 = 18.0;
 const GLTF_OBJECT_FPS: f64 = 20.0;
 const GLTF_ACTOR_FPS: f64 = 1000.0 / 60.0;
@@ -68,6 +67,16 @@ pub struct CameraView {
     pub pitch: f32,
 }
 impl CameraView {
+    /// Provisional 90-degree vertical field of view and square output pixels.
+    pub fn focal_length(height: usize) -> f32 {
+        height as f32 * 0.5
+    }
+    pub fn half_width(width: usize, height: usize) -> f32 {
+        width as f32 / height as f32
+    }
+    pub fn project_x(width: usize, height: usize, side_over_depth: f32) -> f32 {
+        width as f32 * 0.5 + Self::focal_length(height) * side_over_depth
+    }
     pub fn horizon(self, height: usize) -> f32 {
         let limit = std::f32::consts::FRAC_PI_2 * 0.65;
         let pitch = if self.pitch.is_finite() {
@@ -301,7 +310,7 @@ struct ScreenVertex {
 fn project(v: Vertex, width: usize, height: usize, horizon: f32) -> ScreenVertex {
     let inv_depth = v.depth.recip();
     ScreenVertex {
-        x: width as f32 * 0.5 * (1.0 + v.side * inv_depth / CAMERA_PLANE),
+        x: CameraView::project_x(width, height, v.side * inv_depth),
         y: horizon - height as f32 * 0.5 * v.up * inv_depth,
         inv_depth,
         u_over_depth: v.uv[0] * inv_depth,
@@ -1456,8 +1465,10 @@ impl ObjectScene {
             let dy = instance.position[1] - player.position[1];
             let center_depth = dx * camera_cos + dy * camera_sin;
             let center_side = -dx * camera_sin + dy * camera_cos;
+            let half_width = CameraView::half_width(width, height);
             if center_depth + mesh.radius < NEAR
-                || center_side.abs() > center_depth.max(0.0) * CAMERA_PLANE + mesh.radius * 1.5
+                || center_side.abs()
+                    > center_depth.max(0.0) * half_width + mesh.radius * half_width.hypot(1.0)
             {
                 continue;
             }
@@ -1521,6 +1532,31 @@ impl ObjectScene {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn projection_preserves_square_geometry_at_multiple_aspects() {
+        for (width, height) in [(400, 400), (640, 400), (800, 400), (400, 800)] {
+            let projected = |side, up| {
+                project(
+                    Vertex {
+                        side,
+                        up,
+                        depth: 4.0,
+                        uv: [0.0; 2],
+                    },
+                    width,
+                    height,
+                    height as f32 / 2.0,
+                )
+            };
+            let center = projected(0.0, 0.0);
+            let right = projected(1.0, 0.0);
+            let top = projected(0.0, 1.0);
+            assert!(((right.x - center.x) - (center.y - top.y)).abs() < 1e-5);
+            let left_ray = CameraView::half_width(width, height);
+            assert!(CameraView::project_x(width, height, -left_ray).abs() < 1e-4);
+        }
+    }
+
     #[test]
     fn pitched_projection_matches_center_aim_slope() {
         let camera = CameraView {

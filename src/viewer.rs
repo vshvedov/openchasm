@@ -527,7 +527,8 @@ fn render(
     let mut hits = Vec::new();
     for x in 0..WIDTH {
         // Direction is unnormalized, so hit distance is perpendicular to camera plane.
-        let camera_x = (2.0 * x as f32 / WIDTH as f32 - 1.0) * 0.66;
+        let camera_x =
+            (2.0 * (x as f32 + 0.5) / WIDTH as f32 - 1.0) * CameraView::half_width(WIDTH, HEIGHT);
         let direction = [cos - sin * camera_x, sin + cos * camera_x];
         world.ray_hits(direction, &mut hits);
         for &(distance, index, along) in &hits {

@@ -110,7 +110,8 @@ impl PlaneRenderer {
         let (sin, cos) = angle.sin_cos();
         let projection = height as f32 / 2.0;
         let horizon = camera.horizon(height);
-        let camera_plane = [-sin * 0.66, cos * 0.66];
+        let half_width = CameraView::half_width(width, height);
+        let camera_plane = [-sin * half_width, cos * half_width];
         for (y, row) in frame.chunks_mut(width).enumerate() {
             let ceiling = (y as f32 + 0.5) < horizon;
             let background = if ceiling {
@@ -153,8 +154,8 @@ impl PlaneRenderer {
             ];
             let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
             for (x, pixel) in row.iter_mut().enumerate() {
-                let world_x = start[0] + increment[0] * x as f32;
-                let world_y = start[1] + increment[1] * x as f32;
+                let world_x = start[0] + increment[0] * (x as f32 + 0.5);
+                let world_y = start[1] + increment[1] * (x as f32 + 0.5);
                 if !(0.0..MAP_SIDE as f32).contains(&world_x)
                     || !(0.0..MAP_SIDE as f32).contains(&world_y)
                 {

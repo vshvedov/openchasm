@@ -222,6 +222,33 @@ fn teleport_failure_message(failure: openchasm::teleport::TeleportFailure) -> St
     }
 }
 
+// Return true only when this is a new continuous failure, for log deduplication.
+fn update_teleport_notice(
+    notice: &mut Option<(String, f32)>,
+    last_failure: &mut Option<openchasm::teleport::TeleportFailure>,
+    failure: Option<openchasm::teleport::TeleportFailure>,
+) -> bool {
+    if let Some((_, remaining)) = notice {
+        *remaining -= STEP;
+    }
+    if notice
+        .as_ref()
+        .is_some_and(|(_, remaining)| *remaining <= 0.0)
+    {
+        *notice = None;
+    }
+    let changed = failure.is_some() && failure != *last_failure;
+    if let Some(failure) = failure {
+        if changed || notice.is_none() {
+            *notice = Some((teleport_failure_message(failure), 3.0));
+        } else if let Some((_, remaining)) = notice {
+            *remaining = 3.0;
+        }
+    }
+    *last_failure = failure;
+    changed
+}
+
 struct FrameClock {
     last: Instant,
 }
@@ -847,24 +874,14 @@ pub fn run(
                 fired,
                 weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Shoot),
             );
-            if let Some((_, remaining)) = &mut teleport_notice {
-                *remaining -= STEP;
-            }
-            if teleport_notice
-                .as_ref()
-                .is_some_and(|(_, remaining)| *remaining <= 0.0)
-            {
-                teleport_notice = None;
-            }
-            if let Some(failure) = events.teleport_failure {
-                if Some(failure) != last_teleport_failure {
-                    let message = teleport_failure_message(failure);
+            if update_teleport_notice(
+                &mut teleport_notice,
+                &mut last_teleport_failure,
+                events.teleport_failure,
+            ) {
+                if let Some((message, _)) = &teleport_notice {
                     eprintln!("{message}");
-                    teleport_notice = Some((message, 3.0));
                 }
-                last_teleport_failure = Some(failure);
-            } else {
-                last_teleport_failure = None;
             }
             if let Some((_, remaining)) = &mut checkpoint_notice {
                 *remaining -= STEP;
@@ -1486,6 +1503,35 @@ mod tests {
             teleport_failure_message(TeleportFailure::InvalidDefinition { index: 1 }),
             "TELEPORT 2 INVALID"
         );
+    }
+    #[test]
+    fn blocked_teleport_notice_persists_and_deduplicates_across_snapshot() {
+        use openchasm::teleport::TeleportFailure;
+        let failure = Some(TeleportFailure::DestinationBlocked { index: 2 });
+        let mut notice = None;
+        let mut last = None;
+        assert!(update_teleport_notice(&mut notice, &mut last, failure));
+        for _ in 0..600 {
+            assert!(!update_teleport_notice(&mut notice, &mut last, failure));
+        }
+        assert_eq!(notice.as_ref().unwrap().0, "TELEPORT 3 DESTINATION BLOCKED");
+        let (mut restored_notice, mut restored_last) = (notice.clone(), last);
+        assert!(!update_teleport_notice(
+            &mut restored_notice,
+            &mut restored_last,
+            failure
+        ));
+        for _ in 0..181 {
+            assert!(!update_teleport_notice(&mut notice, &mut last, None));
+        }
+        assert!(notice.is_none());
+        assert!(update_teleport_notice(&mut notice, &mut last, failure));
+        assert!(update_teleport_notice(
+            &mut restored_notice,
+            &mut restored_last,
+            Some(TeleportFailure::DestinationBlocked { index: 3 }),
+        ));
+        assert_eq!(restored_notice.unwrap().0, "TELEPORT 4 DESTINATION BLOCKED");
     }
     #[test]
     fn restart_clears_movement_fire_yaw_and_time_without_releasing_capture() {

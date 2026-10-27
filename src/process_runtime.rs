@@ -1722,6 +1722,46 @@ impl ProcessRuntime {
         })
     }
 
+    /// Stage an unlinked, forced-unlock mission-only procedure. This narrow
+    /// entry point is for the addon boss rule; it never accepts actions that
+    /// require external object, presentation, or hazard synchronization.
+    pub fn prepare_forced_mission(
+        &mut self,
+        id: u16,
+    ) -> Result<PreparedProcess<'_>, ProcessOutcome> {
+        let process = self.processes.get(&id).ok_or(ProcessOutcome::Missing)?;
+        if !process.mission_effect
+            || !process.motions.is_empty()
+            || !process.object_motions.is_empty()
+            || !process.empty_motion_cells.is_empty()
+            || !process.lock_changes.is_empty()
+            || !process.cell_changes.is_empty()
+            || !process.animations.is_empty()
+            || !process.death_zones.is_empty()
+            || !process.wind_zones.is_empty()
+            || !process.immediate_actions.is_empty()
+        {
+            return Err(ProcessOutcome::Unsupported);
+        }
+        let mut staged = self.clone();
+        staged
+            .processes
+            .get_mut(&id)
+            .expect("checked process")
+            .locked = false;
+        let event = staged.trigger(id);
+        if event.outcome != ProcessOutcome::Accepted {
+            return Err(event.outcome);
+        }
+        Ok(PreparedProcess {
+            runtime: self,
+            staged,
+            actions: Vec::new(),
+            object_sync_complete: false,
+            event,
+        })
+    }
+
     /// Activate links of a given kind for a cell in script order.
     /// Destroy links first unlock the referenced process, as described in the
     /// bundled modding manual.
@@ -1899,6 +1939,36 @@ impl ProcessRuntime {
 mod tests {
     use super::*;
     use crate::world::{Player, Wall};
+
+    #[test]
+    fn forced_mission_stages_unlock_and_fails_closed() {
+        let script =
+            Script::parse("#proc30\nlock\nenddelay 13\n#action\n#end\n#links\nlink 1 0 30\n#end\n");
+        let mut runtime = ProcessRuntime::new(&script, &world());
+        drop(runtime.prepare_forced_mission(30).unwrap());
+        assert_eq!(
+            runtime.activate_at("link", [1, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        assert_eq!(
+            runtime.prepare_forced_mission(30).unwrap().commit().outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            runtime.activate_at("link", [1, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert!(matches!(
+            runtime.prepare_forced_mission(31),
+            Err(ProcessOutcome::Missing)
+        ));
+        let mixed = Script::parse("#proc30\nenddelay 13\n#action\nmove 1 0 256 0\n#end\n");
+        let mut runtime = ProcessRuntime::new(&mixed, &world());
+        assert!(matches!(
+            runtime.prepare_forced_mission(30),
+            Err(ProcessOutcome::Unsupported)
+        ));
+    }
 
     fn world() -> World {
         World {

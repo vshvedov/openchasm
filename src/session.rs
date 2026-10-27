@@ -1,5 +1,5 @@
 //! Fixed-tick game session: simulation state independent of presentation and transport.
-use crate::actors::{ActorDefinitions, ActorState};
+use crate::actors::{ActorDefinitions, ActorMapping, ActorState};
 use crate::ai::{ActorCollisionSides, EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{
     self, Combat, EnemyShotContext, EnemyShotHit, EnemyShotTarget, FireResult, RocketDefinitions,
@@ -190,6 +190,7 @@ pub struct Session {
     pub selected_weapon: usize,
     pub projectiles: ProjectileSystem,
     explosions_enabled: bool,
+    addon_boss_rule: bool,
     projectile_heights: BTreeMap<u64, f32>,
     mines_enabled: bool,
     mines: MineSystem,
@@ -239,6 +240,7 @@ impl Session {
             selected_weapon: 0,
             projectiles: ProjectileSystem::new(),
             explosions_enabled: false,
+            addon_boss_rule: false,
             projectile_heights: BTreeMap::new(),
             mines_enabled: false,
             mines: MineSystem::new(),
@@ -257,6 +259,11 @@ impl Session {
     /// The host must present teleport events and keep floor geometry in sync.
     pub fn set_teleports(&mut self, definitions: Vec<Teleport>, policy: RearmPolicy) {
         self.teleports = Some((definitions, TeleportState::new(policy)));
+    }
+    /// Enable the documented addon boss rule only for an explicitly selected
+    /// addon-to-remaster actor mapping. Configure before the restart snapshot.
+    pub fn set_addon_boss_rule(&mut self, mapping: ActorMapping) {
+        self.addon_boss_rule = mapping == ActorMapping::AddonToRemaster;
     }
 
     /// Choose the wall policy for player and wind-driven movement. Defaults to
@@ -1457,7 +1464,8 @@ impl Session {
                 .saturating_add(self.apply_player_damage(attack.damage));
         }
         let pre_tick_projectiles = (self.explosions_enabled
-            || self.game.protective_powerups.reflector_ticks_remaining > 0)
+            || self.game.protective_powerups.reflector_ticks_remaining > 0
+            || self.addon_boss_rule)
             .then(|| self.projectiles.clone());
         let mut frozen = BTreeSet::new();
         let mut elapsed = 0.0_f32;
@@ -1513,6 +1521,56 @@ impl Session {
                 }) {
                     self.projectile_heights.insert(impact.projectile_id, height);
                     events.projectile_impacts.pop();
+                    frozen.insert(impact.projectile_id);
+                }
+                continue;
+            }
+            let boss_hit = self.addon_boss_rule
+                && impact.rocket_id == 20
+                && matches!(projectile.reflected_from, Some(Owner::Enemy { .. }))
+                && matches!(impact.target, ImpactTarget::Actor { source_index } if self.actors.actors.iter().any(|actor| actor.source_index == source_index && actor.placement.id == 118 && actor.health > 0));
+            if boss_hit {
+                let valid_mission = self.mission.as_ref().is_some_and(|mission| {
+                    !mission.is_complete()
+                        && mission
+                            .plan
+                            .processes
+                            .get(&30)
+                            .is_some_and(|process| process.end_delay_seconds.is_some())
+                });
+                let accepted = valid_mission
+                    && self
+                        .processes
+                        .prepare_forced_mission(30)
+                        .is_ok_and(|prepared| {
+                            let event = prepared.commit();
+                            if event.outcome == ProcessOutcome::Accepted {
+                                attempts.push(event);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                if accepted {
+                    if let ImpactTarget::Actor { source_index } = impact.target {
+                        if let Some(actor) = self
+                            .actors
+                            .actors
+                            .iter_mut()
+                            .find(|actor| actor.source_index == source_index)
+                        {
+                            actor.health = 0;
+                        }
+                    }
+                } else if pre_tick_projectiles.as_ref().is_some_and(|snapshot| {
+                    self.projectiles
+                        .restore_impact(snapshot, impact.projectile_id)
+                }) {
+                    self.projectile_heights.insert(impact.projectile_id, height);
+                    events.projectile_impacts.pop();
+                    events
+                        .projectile_reflections
+                        .retain(|event| event.projectile_id != impact.projectile_id);
                     frozen.insert(impact.projectile_id);
                 }
                 continue;
@@ -1726,6 +1784,115 @@ mod tests {
         });
         session.set_mission(MissionPlan::parse(&script, text));
         session
+    }
+
+    fn addon_boss_fixture(script: &str, raw_id: u16, rocket: usize, reflected: bool) -> Session {
+        let mut session = mission_session(script);
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "wizard.car".into(),
+            wall_radius: 20,
+            actor_radius: 20,
+            speed: 0,
+            rotation_speed: 0,
+            health: 1000,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement: Monster {
+                position: [256, 128],
+                id: raw_id,
+                angle: 0,
+                flags: 7,
+            },
+            position: [1.0, 0.5],
+            angle_radians: 0.0,
+            health: 1000,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.rockets = RocketDefinitions(vec![
+            RocketDefinition {
+                model_name: "bomb.3o".into(),
+                power: 10,
+                raw_fields: vec![1, 0, 0, 10, 10, 0, 0, 0, 0, 0, 0],
+            };
+            21
+        ]);
+        let id = session
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: if reflected {
+                        Owner::Enemy { source_index: 7 }
+                    } else {
+                        Owner::Player
+                    },
+                    rocket_id: rocket,
+                    origin: [0.7, 0.5],
+                    direction: [1.0, 0.0],
+                },
+                &session.rockets,
+            )
+            .unwrap();
+        if reflected {
+            let shot = session.projectiles.take(id).unwrap();
+            assert!(session
+                .projectiles
+                .reflect_from_player(shot, session.world.player.position));
+        }
+        session
+    }
+
+    #[test]
+    fn addon_boss_requires_context_authored_id_and_actual_reflection() {
+        let script = "#proc30\nlock\nenddelay 13\n#action\n#end\n";
+        for (mapping, raw_id, rocket, reflected, should_kill) in [
+            (ActorMapping::AddonToRemaster, 118, 20, true, true),
+            (ActorMapping::Identity, 118, 20, true, false),
+            (ActorMapping::AddonToRemaster, 119, 20, true, false),
+            (ActorMapping::AddonToRemaster, 118, 19, true, false),
+            (ActorMapping::AddonToRemaster, 118, 20, false, false),
+        ] {
+            let mut session = addon_boss_fixture(script, raw_id, rocket, reflected);
+            session.set_addon_boss_rule(mapping);
+            for _ in 0..5 {
+                session.step(SessionInput::default());
+            }
+            assert_eq!(
+                session.actors.actors[0].health == 0,
+                should_kill,
+                "{mapping:?} {raw_id} {rocket} {reflected}"
+            );
+            assert_eq!(
+                session.mission.as_ref().unwrap().end_remaining().is_some(),
+                should_kill
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_addon_boss_trigger_retries_without_impact_or_kill() {
+        let bad = "#proc30\nlock\nenddelay 13\n#action\nunsupported 1\n#end\n";
+        let mut session = addon_boss_fixture(bad, 118, 20, true);
+        session.set_addon_boss_rule(ActorMapping::AddonToRemaster);
+        for _ in 0..5 {
+            let events = session.step(SessionInput::default());
+            assert!(events.projectile_impacts.is_empty());
+            assert_eq!(session.actors.actors[0].health, 1000);
+        }
+        assert_eq!(session.projectiles.active().len(), 1);
+        assert!(session.mission.as_ref().unwrap().end_remaining().is_none());
+        let good = Script::parse("#proc30\nlock\nenddelay 13\n#action\n#end\n");
+        session.processes = ProcessRuntime::new(&good, &session.world);
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.projectile_impacts.len(), 1);
+        assert_eq!(session.actors.actors[0].health, 0);
+        assert!(session.mission.as_ref().unwrap().end_remaining().is_some());
     }
     #[test]
     fn teleport_resets_vertical_and_dispatches_only_destination_floor() {

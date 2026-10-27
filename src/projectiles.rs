@@ -38,6 +38,8 @@ pub struct Launch {
 pub struct Projectile {
     pub id: u64,
     pub owner: Owner,
+    /// Original owner when actually redirected by a player reflector.
+    pub reflected_from: Option<Owner>,
     pub rocket_id: usize,
     pub position: [f32; 2],
     pub velocity: [f32; 2],
@@ -308,6 +310,7 @@ impl ProjectileSystem {
             ];
         }
         projectile.velocity = [outward[0] * speed, outward[1] * speed];
+        projectile.reflected_from = Some(projectile.owner);
         projectile.owner = Owner::Player;
         self.projectiles.push(projectile);
         true
@@ -360,6 +363,7 @@ impl ProjectileSystem {
         self.projectiles.push(Projectile {
             id,
             owner: launch.owner,
+            reflected_from: None,
             rocket_id: launch.rocket_id,
             position: launch.origin,
             velocity: [

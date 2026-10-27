@@ -15,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "echo",
     "version",
     "fps",
+    "showhelp",
     "maxfps",
     "status",
     "restart",
@@ -32,6 +33,7 @@ const COMMANDS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
     Fps(Option<bool>),
+    HelpOverlay(Option<bool>),
     /// Frames per second cap; zero means uncapped, None queries.
     MaxFps(Option<u32>),
     Status,
@@ -226,7 +228,7 @@ impl Console {
         let args: Vec<_> = parts.collect();
         match command.as_str() {
             "help" | "cmdlist" if args.is_empty() => self
-                .push("help cmdlist clear echo version fps maxfps status restart quit sensitivity options graphics tonemap gamma brightness saturation bloom"),
+                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity options graphics tonemap gamma brightness saturation bloom"),
             "clear" if args.is_empty() => self.lines.clear(),
             "echo" => self.push(
                 trimmed
@@ -245,6 +247,12 @@ impl Console {
                     return Some(Command::Fps(Some(false)))
                 }
                 _ => self.push("usage: fps [on|off|1|0]"),
+            },
+            "showhelp" => match args.as_slice() {
+                [] => return Some(Command::HelpOverlay(None)),
+                [v] if v.eq_ignore_ascii_case("on") || *v == "1" => return Some(Command::HelpOverlay(Some(true))),
+                [v] if v.eq_ignore_ascii_case("off") || *v == "0" => return Some(Command::HelpOverlay(Some(false))),
+                _ => self.push("usage: showhelp [on|off|1|0]"),
             },
             "maxfps" => match args.as_slice() {
                 [] => return Some(Command::MaxFps(None)),
@@ -419,6 +427,11 @@ mod tests {
         let mut c = Console::default();
         assert_eq!(submit(&mut c, "fps on"), Some(Command::Fps(Some(true))));
         assert_eq!(submit(&mut c, "fps"), Some(Command::Fps(None)));
+        assert_eq!(
+            submit(&mut c, "showhelp on"),
+            Some(Command::HelpOverlay(Some(true)))
+        );
+        assert_eq!(submit(&mut c, "showhelp"), Some(Command::HelpOverlay(None)));
         assert_eq!(
             submit(&mut c, "graphics enhanced"),
             Some(Command::Graphics(Some(

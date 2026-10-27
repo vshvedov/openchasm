@@ -41,3 +41,8 @@ reported and ignored by the host.
 - `tonemap [on|off|1|0]` controls tone mapping.
 - `gamma [0.05..16]`, `brightness [0..16]`, `saturation [0..16]` and
   `bloom [0..1]` query or set those controls. Values must be finite.
+
+The original graphical status bar is loaded from the selected content. The large
+development control overlay is hidden by default; `showhelp on` displays it and
+`showhelp off` hides it again. This preference is saved with graphics settings.
+Missing HUD assets fall back to the text status display.

@@ -1086,6 +1086,7 @@ impl LightingCache {
 }
 
 pub struct ClientFeedback {
+    pub hud: Option<crate::hud::Hud>,
     pub map: crate::map::Map,
     pub session: Session,
     pub audio: Audio,
@@ -1110,6 +1111,7 @@ pub fn run(
     label: &str,
 ) -> Result<Option<openchasm::inventory::Inventory>, Box<dyn Error>> {
     let ClientFeedback {
+        hud,
         map,
         mut session,
         mut audio,
@@ -1401,6 +1403,17 @@ pub fn run(
                                 graphics_changed = true;
                             }
                             console.push(&format!("fps {}", if show_fps { "on" } else { "off" }));
+                        }
+                        Command::HelpOverlay(value) => {
+                            if let Some(value) = value {
+                                graphics.show_help = value;
+                                graphics_changed = true;
+                            }
+                            console.push(if graphics.show_help {
+                                "showhelp on"
+                            } else {
+                                "showhelp off"
+                            });
                         }
                         Command::MaxFps(value) => {
                             if let Some(value) = value {
@@ -2159,7 +2172,9 @@ pub fn run(
         }
         apply_damage_tint(&mut frame, damage_feedback.flash);
         minimap.draw(&mut frame, WIDTH, HEIGHT, &session.world);
-        draw_header(&mut frame, label);
+        if graphics.show_help {
+            draw_header(&mut frame, label);
+        }
         let cx = WIDTH / 2;
         let cy = HEIGHT / 2;
         for offset in -3isize..=3 {
@@ -2167,21 +2182,50 @@ pub fn run(
             frame[(cy as isize + offset) as usize * WIDTH + cx] = 0xffffff;
         }
         let inventory = &session.game.inventory;
-        text(
-            &mut frame,
-            8,
-            HEIGHT - 18,
-            &format!(
-                "HEALTH {}  ARMOR {}  WEAPON {}  AMMO {}  KEYS {}{}{}",
-                inventory.health,
-                inventory.armor,
-                session.selected_weapon + 1,
-                inventory.ammo[session.selected_weapon],
-                if inventory.keys[0] { "R" } else { "-" },
-                if inventory.keys[1] { "G" } else { "-" },
-                if inventory.keys[2] { "B" } else { "-" }
-            ),
-        );
+        let hud_top = if let Some(hud) = &hud {
+            hud.render(
+                &mut frame,
+                WIDTH,
+                HEIGHT,
+                crate::hud::HudState {
+                    health: u32::from(inventory.health),
+                    armor: u32::from(inventory.armor),
+                    ammo: u32::from(inventory.ammo[session.selected_weapon]),
+                    weapon: session.selected_weapon,
+                },
+            );
+            if inventory.keys.iter().any(|key| *key) {
+                text(
+                    &mut frame,
+                    WIDTH - 96,
+                    HEIGHT - 76,
+                    &format!(
+                        "KEYS {}{}{}",
+                        if inventory.keys[0] { "R" } else { "-" },
+                        if inventory.keys[1] { "G" } else { "-" },
+                        if inventory.keys[2] { "B" } else { "-" }
+                    ),
+                );
+            }
+            HEIGHT - 64
+        } else {
+            text(
+                &mut frame,
+                8,
+                HEIGHT - 18,
+                &format!(
+                    "HEALTH {}  ARMOR {}  WEAPON {}  AMMO {}  KEYS {}{}{}",
+                    inventory.health,
+                    inventory.armor,
+                    session.selected_weapon + 1,
+                    inventory.ammo[session.selected_weapon],
+                    if inventory.keys[0] { "R" } else { "-" },
+                    if inventory.keys[1] { "G" } else { "-" },
+                    if inventory.keys[2] { "B" } else { "-" }
+                ),
+            );
+            HEIGHT
+        };
         let effects = &session.game.protective_powerups;
         let status = powerup_status(
             inventory.invisibility_ticks_remaining,
@@ -2189,10 +2233,15 @@ pub fn run(
             effects.chojin_ticks_remaining,
         );
         if !status.is_empty() {
-            text(&mut frame, 8, HEIGHT - 30, &status);
+            text(&mut frame, 8, hud_top.saturating_sub(12), &status);
         }
         if reflection_ticks > 0 {
-            text(&mut frame, WIDTH / 2, HEIGHT - 42, "PROJECTILE REFLECTED");
+            text(
+                &mut frame,
+                WIDTH / 2,
+                hud_top.saturating_sub(24),
+                "PROJECTILE REFLECTED",
+            );
         }
         if let Some((lines, _)) = &current_message {
             for (row, line) in lines.iter().enumerate().take(6) {
@@ -2200,13 +2249,13 @@ pub fn run(
             }
         }
         if let Some((message, _)) = &teleport_notice {
-            text(&mut frame, 8, HEIGHT - 78, message);
+            text(&mut frame, 8, hud_top.saturating_sub(48), message);
         }
         if let Some((message, _)) = checkpoint_notice {
-            text(&mut frame, 8, HEIGHT - 54, message);
+            text(&mut frame, 8, hud_top.saturating_sub(36), message);
         }
         if let Some((message, _)) = shot_feedback {
-            text(&mut frame, 8, HEIGHT - 42, message);
+            text(&mut frame, 8, hud_top.saturating_sub(24), message);
         }
         if completed {
             text(

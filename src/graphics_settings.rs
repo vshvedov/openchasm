@@ -53,6 +53,8 @@ pub struct GraphicsSettings {
     pub saturation: f32,
     pub bloom: f32,
     pub show_fps: bool,
+    #[serde(default)]
+    pub show_help: bool,
     /// Zero means uncapped.
     pub max_fps: u32,
     pub sensitivity: f32,
@@ -68,6 +70,7 @@ impl Default for GraphicsSettings {
             saturation: 1.0,
             bloom: 0.0,
             show_fps: true,
+            show_help: false,
             max_fps: 60,
             sensitivity: 0.002,
         }
@@ -415,6 +418,19 @@ mod tests {
         assert!(settings.validate().is_ok());
         settings.gamma = f32::NAN;
         assert!(settings.validate().is_err());
+    }
+    #[test]
+    fn pre_hud_preferences_keep_their_saved_values() {
+        let settings = GraphicsSettings {
+            max_fps: 144,
+            gamma: 1.2,
+            ..GraphicsSettings::default()
+        };
+        let mut old = serde_json::to_value(&settings).unwrap();
+        old.as_object_mut().unwrap().remove("show_help");
+        let restored: GraphicsSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(restored, settings);
+        assert!(!restored.show_help);
     }
     #[test]
     fn store_roundtrips_and_invalid_write_preserves_existing_file() {

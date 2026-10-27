@@ -8,6 +8,7 @@ mod explosion_render;
 mod frame_stats;
 mod gltf_model;
 mod graphics_settings;
+mod hud;
 mod impact_render;
 mod launcher;
 mod lighting_worker;
@@ -484,6 +485,13 @@ fn play(
         let world = make_world(&map, &graphics)?;
         let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
         let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
+        let hud = match hud::Hud::load(resources) {
+            Ok(hud) => Some(hud),
+            Err(error) => {
+                eprintln!("graphical HUD unavailable: {error}");
+                None
+            }
+        };
         let mut planes = planes::PlaneRenderer::new(&map, &floors, &palette);
         if let Some(sky) = sky::Sky::load(resources, &resource, &palette) {
             planes.set_sky(sky);
@@ -712,6 +720,7 @@ fn play(
             planes,
             object_scene,
             viewer::ClientFeedback {
+                hud,
                 map,
                 session,
                 audio,

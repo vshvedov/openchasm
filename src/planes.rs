@@ -77,7 +77,7 @@ impl PlaneRenderer {
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
-        self.render_inner(frame, None, width, height, camera, lights);
+        self.render_inner::<u32, false>(frame, None, width, height, camera, lights);
     }
 
     /// Paint planes and write perpendicular depths for actual geometry only.
@@ -91,7 +91,7 @@ impl PlaneRenderer {
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
-        self.render_inner(frame, Some(depth), width, height, camera, lights);
+        self.render_inner::<u32, false>(frame, Some(depth), width, height, camera, lights);
     }
 
     /// Render plane colors into either the legacy or linear-HDR target.
@@ -104,10 +104,10 @@ impl PlaneRenderer {
         camera: CameraView,
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
-        self.render_inner(frame, Some(depth), width, height, camera, lights);
+        self.render_inner::<C, false>(frame, Some(depth), width, height, camera, lights);
     }
 
-    fn render_inner<C: RenderPixel>(
+    fn render_inner<C: RenderPixel, const USE_REFERENCE_FLOOR: bool>(
         &self,
         frame: &mut [C],
         mut depth: Option<&mut [f32]>,
@@ -188,8 +188,18 @@ impl PlaneRenderer {
                     paint_sky(x, pixel);
                     continue;
                 }
-                let tile_x = world_x.floor() as usize;
-                let tile_y = world_y.floor() as usize;
+                // Intersections have already been checked inside [0, MAP_SIDE),
+                // where truncating to usize is exactly equivalent to floor.
+                let tile_x = if USE_REFERENCE_FLOOR {
+                    world_x.floor() as usize
+                } else {
+                    world_x as usize
+                };
+                let tile_y = if USE_REFERENCE_FLOOR {
+                    world_y.floor() as usize
+                } else {
+                    world_y as usize
+                };
                 let cell = tile_x * MAP_SIDE + tile_y;
                 let id = if ceiling {
                     self.ceiling_ids[cell]
@@ -241,6 +251,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-mode plane rendering benchmark"]
+    fn benchmark_plane_rendering() {
+        use std::{hint::black_box, time::Instant};
+        let (map, floors, palette) = fixtures(0, 0);
+        let renderer = PlaneRenderer::new(&map, &floors, &palette);
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [16.5, 16.5],
+                angle: 0.63,
+            },
+            eye_height: 0.75,
+            pitch: 0.12,
+        };
+        let mut frame = vec![crate::color_pipeline::LinearRgb::default(); 640 * 400];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        let started = Instant::now();
+        for _ in 0..80 {
+            renderer.render_to(
+                black_box(&mut frame),
+                black_box(&mut depth),
+                640,
+                400,
+                camera,
+                None,
+            );
+        }
+        eprintln!(
+            "plane benchmark: {:.3}ms per frame",
+            started.elapsed().as_secs_f64() * 1000.0 / 80.0
+        );
+        black_box(frame);
+    }
+
+    #[test]
     fn installed_map_contains_spatially_varying_authored_light() {
         let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
         let path = explicit
@@ -265,6 +309,75 @@ mod tests {
         assert!(minimum >= 0.0 && maximum <= 1.3 && maximum - minimum > 0.5);
         assert!(light.sample([-1.0, 0.0]).is_none());
         assert!(light.wall_sample([64, 0], 0.5).is_none());
+    }
+
+    #[test]
+    fn truncation_matches_floor_reference_for_scene_color_and_depth() {
+        use crate::color_pipeline::LinearRgb;
+        let (map, floors, palette) = fixtures(0, 1);
+        let mut renderer = PlaneRenderer::new(&map, &floors, &palette);
+        renderer.set_sky(Sky::solid(0x52749c));
+        // Include plane holes, neighboring textures, world edges, pitched views,
+        // and values very close to integer map and texture boundaries.
+        renderer.floor_ids[16 * 64 + 16] = SKY_TILE;
+        renderer.ceiling_ids[17 * 64 + 16] = EMPTY_TILE;
+        for (position, angle, pitch) in [
+            ([16.5, 16.5], 0.0, 0.0),
+            ([16.999_998, 16.000_002], std::f32::consts::FRAC_PI_4, 0.31),
+            ([0.000_001, 63.999_996], -1.57, -0.7),
+            ([32.0, 32.0], std::f32::consts::PI, 0.6),
+        ] {
+            let camera = CameraView {
+                player: crate::world::Player { position, angle },
+                eye_height: 0.75,
+                pitch,
+            };
+            let size = 127 * 83;
+            let mut legacy = vec![0u32; size];
+            let mut reference = legacy.clone();
+            let mut depth = vec![f32::INFINITY; size];
+            let mut reference_depth = depth.clone();
+            renderer.render_inner::<u32, false>(
+                &mut legacy,
+                Some(&mut depth),
+                127,
+                83,
+                camera,
+                None,
+            );
+            renderer.render_inner::<u32, true>(
+                &mut reference,
+                Some(&mut reference_depth),
+                127,
+                83,
+                camera,
+                None,
+            );
+            assert_eq!(legacy, reference);
+            assert_eq!(depth, reference_depth);
+            let mut hdr = vec![LinearRgb::default(); size];
+            let mut reference_hdr = hdr.clone();
+            depth.fill(f32::INFINITY);
+            reference_depth.fill(f32::INFINITY);
+            renderer.render_inner::<LinearRgb, false>(
+                &mut hdr,
+                Some(&mut depth),
+                127,
+                83,
+                camera,
+                None,
+            );
+            renderer.render_inner::<LinearRgb, true>(
+                &mut reference_hdr,
+                Some(&mut reference_depth),
+                127,
+                83,
+                camera,
+                None,
+            );
+            assert_eq!(hdr, reference_hdr);
+            assert_eq!(depth, reference_depth);
+        }
     }
 
     #[test]

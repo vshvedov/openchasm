@@ -17,6 +17,91 @@ const NEAR: f32 = 0.05;
 const CAMERA_PLANE: f32 = 0.66;
 const ACTOR_ANIMATION_FPS: f64 = 18.0;
 const GLTF_OBJECT_FPS: f64 = 20.0;
+const GLTF_ACTOR_FPS: f64 = 1000.0 / 60.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GltfClip {
+    first: usize,
+    count: usize,
+}
+
+/// Parse the remaster's `animation_id first_frame frame_count` table.
+fn parse_gltf_clips(bytes: &[u8], frames: usize) -> std::io::Result<[Option<GltfClip>; 20]> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "glTF animation table is not UTF-8",
+        )
+    })?;
+    let mut clips = [None; 20];
+    for line in text.lines() {
+        let line = line.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 3 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid glTF animation row",
+            ));
+        }
+        let values = fields
+            .iter()
+            .map(|v| v.parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid glTF animation value",
+                )
+            })?;
+        let (id, first, count) = (values[0], values[1], values[2]);
+        if id >= clips.len()
+            || count == 0
+            || first.checked_add(count).is_none_or(|end| end > frames)
+            || clips[id].is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid glTF animation range or duplicate",
+            ));
+        }
+        clips[id] = Some(GltfClip { first, count });
+    }
+    Ok(clips)
+}
+
+fn actor_gltf_frame(
+    clips: &[Option<GltfClip>; 20],
+    mode: ActorAnimationMode,
+    seconds: f64,
+) -> usize {
+    let Some(clip) = mode.preferred_slots().iter().find_map(|&slot| clips[slot]) else {
+        return 0;
+    };
+    let elapsed_frame = seconds.max(0.0) * GLTF_ACTOR_FPS;
+    let frame = if mode.looping() {
+        elapsed_frame.rem_euclid(clip.count as f64) as usize
+    } else {
+        elapsed_frame.min((clip.count - 1) as f64) as usize
+    };
+    clip.first + frame
+}
+
+fn intact_actor_primitive(name: &str, mode: ActorAnimationMode) -> bool {
+    let stem = name.strip_suffix(" transparent").unwrap_or(name);
+    if stem.ends_with(" removed") {
+        return false;
+    }
+    if stem.ends_with(" not shooting") {
+        return mode != ActorAnimationMode::Attack;
+    }
+    if stem.ends_with(" shooting") {
+        return mode == ActorAnimationMode::Attack;
+    }
+    true
+}
 
 /// Shared camera pose for all world-space renderers.
 #[derive(Clone, Copy)]
@@ -57,6 +142,7 @@ struct Mesh {
     /// None for original 3O/CAR geometry; glTF meshes use the original model
     /// field as an empty placeholder so existing actor behavior is unchanged.
     gltf: Option<GltfModel>,
+    gltf_actor_clips: [Option<GltfClip>; 20],
 }
 
 struct Instance {
@@ -357,8 +443,17 @@ impl Raster<'_> {
     }
 }
 
-fn draw_gltf(raster: &mut Raster<'_>, model: &GltfModel, instance: &Instance, camera: CameraView) {
-    let frame = if instance.object_animation_playing {
+fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: CameraView) {
+    let Some(model) = mesh.gltf.as_ref() else {
+        return;
+    };
+    let frame = if instance.actor_source_index.is_some() {
+        actor_gltf_frame(
+            &mesh.gltf_actor_clips,
+            instance.animation_mode,
+            instance.animation_seconds,
+        )
+    } else if instance.object_animation_playing {
         (instance.object_animation_seconds.max(0.0) * GLTF_OBJECT_FPS)
             .rem_euclid(model.frame_count as f64) as usize
     } else {
@@ -369,6 +464,11 @@ fn draw_gltf(raster: &mut Raster<'_>, model: &GltfModel, instance: &Instance, ca
     let dx = instance.position[0] - camera.player.position[0];
     let dy = instance.position[1] - camera.player.position[1];
     for primitive in &model.primitives {
+        if instance.actor_source_index.is_some()
+            && !intact_actor_primitive(&primitive.name, instance.animation_mode)
+        {
+            continue;
+        }
         let delta = frame
             .checked_sub(1)
             .and_then(|i| primitive.morph_deltas.get(i));
@@ -464,6 +564,7 @@ impl ObjectScene {
                                 car_uv: false,
                                 animations: std::array::from_fn(|_| None),
                                 gltf: Some(gltf),
+                                gltf_actor_clips: [None; 20],
                             });
                             return Some(index);
                         }
@@ -507,6 +608,7 @@ impl ObjectScene {
                             car_uv: false,
                             animations,
                             gltf: None,
+                            gltf_actor_clips: [None; 20],
                         });
                         Some(index)
                     }
@@ -570,11 +672,52 @@ impl ObjectScene {
             let Some(definition) = definitions.entries.get(actor.definition_index) else {
                 continue;
             };
-            let Some(path) = definition.car_path() else {
-                warnings.insert(format!("unsupported actor model {}", definition.model_name));
-                continue;
-            };
+            let car_path = definition.car_path();
+            let gltf_only = car_path.is_none();
+            let path = car_path.unwrap_or_else(|| {
+                format!(
+                    "monster/{}.gltf",
+                    definition.model_name.to_ascii_lowercase()
+                )
+            });
             let mesh_index = *cache.entry(path.clone()).or_insert_with(|| {
+                if gltf_only {
+                    match GltfModel::load(resources, &path) {
+                        Ok(gltf) => {
+                            let clip_path = format!("{path}.ani");
+                            let clips = match resources
+                                .read(&clip_path)
+                                .and_then(|data| parse_gltf_clips(&data, gltf.frame_count))
+                            {
+                                Ok(clips) => clips,
+                                Err(error) => {
+                                    warnings.insert(format!("{clip_path}: {error}"));
+                                    [None; 20]
+                                }
+                            };
+                            let radius = gltf_radius(&gltf);
+                            let index = self.meshes.len();
+                            self.meshes.push(Mesh {
+                                model: Model {
+                                    vertices: vec![],
+                                    polygons: vec![],
+                                    skin_height: 0,
+                                    skin_indices: vec![],
+                                },
+                                radius,
+                                car_uv: false,
+                                animations: std::array::from_fn(|_| None),
+                                gltf: Some(gltf),
+                                gltf_actor_clips: clips,
+                            });
+                            return Some(index);
+                        }
+                        Err(error) => {
+                            warnings.insert(format!("{path}: {error}"));
+                            return None;
+                        }
+                    }
+                }
                 match resources
                     .read(&path)
                     .and_then(|data| crate::monster::Monster::parse(&data))
@@ -597,6 +740,7 @@ impl ObjectScene {
                             car_uv: true,
                             animations,
                             gltf: None,
+                            gltf_actor_clips: [None; 20],
                         });
                         Some(index)
                     }
@@ -785,8 +929,8 @@ impl ObjectScene {
             {
                 continue;
             }
-            if let Some(gltf) = &mesh.gltf {
-                draw_gltf(&mut raster, gltf, instance, camera);
+            if mesh.gltf.is_some() {
+                draw_gltf(&mut raster, mesh, instance, camera);
                 continue;
             }
             let (sin, cos) = instance.angle.sin_cos();
@@ -881,6 +1025,7 @@ mod tests {
             car_uv: false,
             animations: std::array::from_fn(|_| None),
             gltf: Some(gltf),
+            gltf_actor_clips: [None; 20],
         };
         let instance = Instance {
             mesh: 0,
@@ -902,6 +1047,92 @@ mod tests {
             palette: [0; 256],
         }
     }
+    #[test]
+    fn parses_gltf_actor_clips_and_selects_mode_frames() {
+        let clips = parse_gltf_clips(b"0 0 2\n2 2 3\n16 5 2\n", 7).unwrap();
+        assert_eq!(actor_gltf_frame(&clips, ActorAnimationMode::Idle, 0.0), 2);
+        assert_eq!(actor_gltf_frame(&clips, ActorAnimationMode::Idle, 0.061), 3);
+        assert_eq!(actor_gltf_frame(&clips, ActorAnimationMode::Run, 0.0), 0);
+        assert_eq!(actor_gltf_frame(&clips, ActorAnimationMode::Death, 5.0), 6);
+        assert!(parse_gltf_clips(b"0 6 2\n", 7).is_err());
+        assert!(parse_gltf_clips(b"0 0 1\n0 1 1\n", 7).is_err());
+        assert!(intact_actor_primitive(
+            "faust hand left",
+            ActorAnimationMode::Idle
+        ));
+        assert!(!intact_actor_primitive(
+            "faust hand left removed",
+            ActorAnimationMode::Idle
+        ));
+        assert!(!intact_actor_primitive(
+            "faust shooting transparent",
+            ActorAnimationMode::Idle
+        ));
+        assert!(intact_actor_primitive(
+            "faust shooting transparent",
+            ActorAnimationMode::Attack
+        ));
+    }
+    #[test]
+    fn installed_faust_actor_is_visible_and_uses_original_animations() {
+        let path = std::path::Path::new("assets/csm.bin");
+        if !path.is_file() {
+            return;
+        }
+        let mut resources = ResourceSet::open(path).unwrap();
+        let map = crate::map::Map::parse(&resources.read("map/map.03").unwrap()).unwrap();
+        let defs = ActorDefinitions::parse(&resources.read("chasm.inf").unwrap()).unwrap();
+        let mut actors = ActorState::from_placements(&map.monsters, &defs);
+        actors
+            .actors
+            .retain(|a| defs.entries[a.definition_index].model_name == "faust");
+        assert!(!actors.actors.is_empty());
+        let mut scene = ObjectScene {
+            meshes: vec![],
+            instances: vec![],
+            palette: [0; 256],
+        };
+        scene.add_actors(&mut resources, &actors, &defs);
+        assert_eq!(scene.meshes.len(), 1); // shared mesh
+        assert_eq!(scene.instances.len(), actors.actors.len());
+        let mesh = &scene.meshes[0];
+        let model = mesh.gltf.as_ref().unwrap();
+        assert_eq!(model.frame_count, 281);
+        assert_eq!(
+            mesh.gltf_actor_clips[2],
+            Some(GltfClip {
+                first: 15,
+                count: 17
+            })
+        );
+        assert_eq!(
+            actor_gltf_frame(&mesh.gltf_actor_clips, ActorAnimationMode::Idle, 0.0),
+            15
+        );
+        assert_eq!(
+            actor_gltf_frame(&mesh.gltf_actor_clips, ActorAnimationMode::Run, 0.0),
+            0
+        );
+        assert_eq!(
+            actor_gltf_frame(&mesh.gltf_actor_clips, ActorAnimationMode::Death, 100.0),
+            256
+        );
+        // Render one real actor in isolation and confirm the decoded texture is visible.
+        let actor = &actors.actors[0];
+        scene.instances.truncate(1);
+        let camera = CameraView {
+            player: Player {
+                position: [actor.position[0] - 2.0, actor.position[1]],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+        };
+        let mut frame = vec![0; 160 * 100];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        scene.render(&mut frame, &mut depth, 160, 100, camera);
+        assert!(frame.iter().any(|&pixel| pixel != 0));
+    }
+
     #[test]
     fn gltf_depth_alpha_and_per_instance_animation() {
         let mut scene = gltf_scene(255);
@@ -1071,6 +1302,7 @@ mod tests {
             car_uv: true,
             animations,
             gltf: None,
+            gltf_actor_clips: [None; 20],
         };
         let x = |mode, time| actor_vertices(&mesh, mode, time)[0].position[0];
         assert_eq!(x(ActorAnimationMode::Idle, 0.0), 10);

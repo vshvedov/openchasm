@@ -89,6 +89,37 @@ pub struct EnemyAi {
     player_invisible: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttackPhaseSnapshot {
+    pub slot: u8,
+    pub frame_count: u32,
+    pub elapsed_ticks: u32,
+    pub fired: bool,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrainSnapshot {
+    pub source_index: u32,
+    pub mode: Mode,
+    pub last_seen: Option<[f32; 2]>,
+    pub cooldown: u16,
+    pub run_units: u64,
+    pub attack_phase: Option<AttackPhaseSnapshot>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnemyAiSnapshot {
+    pub brains: Vec<BrainSnapshot>,
+    pub player_invisible: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSnapshotError {
+    IndexOutOfRange,
+    CountMismatch,
+    DuplicateSource,
+    MissingSource,
+    InvalidState,
+    InvalidAttackClip,
+}
+
 fn sub(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
@@ -177,6 +208,107 @@ fn turn_toward(current: f32, target: f32, max_turn: f32) -> f32 {
 }
 
 impl EnemyAi {
+    pub fn snapshot(&self) -> Result<EnemyAiSnapshot, AiSnapshotError> {
+        let mut brains = Vec::with_capacity(self.brains.len());
+        for (&id, brain) in &self.brains {
+            let source_index = u32::try_from(id).map_err(|_| AiSnapshotError::IndexOutOfRange)?;
+            let attack_phase = brain.attack_phase.map(|p| AttackPhaseSnapshot {
+                slot: p.slot as u8,
+                frame_count: p.frame_count,
+                elapsed_ticks: p.elapsed_ticks,
+                fired: p.fired,
+            });
+            brains.push(BrainSnapshot {
+                source_index,
+                mode: brain.mode,
+                last_seen: brain.last_seen,
+                cooldown: brain.cooldown,
+                run_units: brain.run_units,
+                attack_phase,
+            });
+        }
+        Ok(EnemyAiSnapshot {
+            brains,
+            player_invisible: self.player_invisible,
+        })
+    }
+    /// Restore brains against loaded actor IDs and clip metadata. A live brain
+    /// with zero actor health is valid until the following simulation tick.
+    pub fn restore(
+        &mut self,
+        snapshot: &EnemyAiSnapshot,
+        actors: &ActorState,
+    ) -> Result<(), AiSnapshotError> {
+        if snapshot.brains.len() != self.brains.len() || actors.actors.len() != self.brains.len() {
+            return Err(AiSnapshotError::CountMismatch);
+        }
+        let actor_map: BTreeMap<_, _> = actors.actors.iter().map(|a| (a.source_index, a)).collect();
+        if actor_map.len() != actors.actors.len() {
+            return Err(AiSnapshotError::DuplicateSource);
+        }
+        let mut staged = BTreeMap::new();
+        for value in &snapshot.brains {
+            let id = value.source_index as usize;
+            if staged.contains_key(&id) {
+                return Err(AiSnapshotError::DuplicateSource);
+            }
+            let initial = self.brains.get(&id).ok_or(AiSnapshotError::MissingSource)?;
+            let actor = actor_map.get(&id).ok_or(AiSnapshotError::MissingSource)?;
+            if (initial.mode == Mode::Inactive) != (value.mode == Mode::Inactive)
+                || (value.mode == Mode::Dead && actor.health > 0)
+                || value.cooldown > ATTACK_COOLDOWN_TICKS
+                || value.run_units > 18_000_000
+                || value
+                    .last_seen
+                    .is_some_and(|p| !p.iter().all(|v| v.is_finite() && v.abs() <= 4096.0))
+            {
+                return Err(AiSnapshotError::InvalidState);
+            }
+            let attack_phase = if let Some(phase) = value.attack_phase {
+                let slot = usize::from(phase.slot);
+                let clip = self
+                    .clips
+                    .get(actor.definition_index)
+                    .and_then(Option::as_ref)
+                    .and_then(|set| set.clips.get(slot))
+                    .and_then(|clip| *clip)
+                    .ok_or(AiSnapshotError::InvalidAttackClip)?;
+                let frame = u64::from(phase.elapsed_ticks) * 5 / 18;
+                if !(5..=8).contains(&slot)
+                    || value.mode != Mode::Attacking
+                    || phase.frame_count != clip.frame_count
+                    || phase.frame_count == 0
+                    || u64::from(phase.elapsed_ticks) * 5 >= u64::from(phase.frame_count) * 18
+                    || (phase.elapsed_ticks > 0
+                        && phase.fired != (frame >= u64::from(phase.frame_count / 2)))
+                    || (phase.elapsed_ticks == 0 && phase.fired)
+                {
+                    return Err(AiSnapshotError::InvalidAttackClip);
+                }
+                Some(AttackPhase {
+                    slot,
+                    frame_count: phase.frame_count,
+                    elapsed_ticks: phase.elapsed_ticks,
+                    fired: phase.fired,
+                })
+            } else {
+                None
+            };
+            staged.insert(
+                id,
+                Brain {
+                    mode: value.mode,
+                    last_seen: value.last_seen,
+                    cooldown: value.cooldown,
+                    run_units: value.run_units,
+                    attack_phase,
+                },
+            );
+        }
+        self.brains = staged;
+        self.player_invisible = snapshot.player_invisible;
+        Ok(())
+    }
     /// Preserve disabled placements so their renderer can be hidden by source ID.
     pub fn new(actors: &ActorState, difficulty: Difficulty) -> Self {
         let mask = match difficulty {
@@ -667,6 +799,50 @@ mod tests {
     use crate::actors::ActorDefinitions;
     use crate::map::Monster;
     use crate::world::Player;
+
+    #[test]
+    fn ai_snapshot_validates_clips_and_continues_attack() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].speed = 0;
+        let clips = ActorClipSet::parse_gltf(b"0 0 1\n6 1 4\n", Some(5)).unwrap();
+        let mut source = EnemyAi::new(&state, Difficulty::Normal);
+        source.set_clip_metadata(vec![None, Some(clips.clone())]);
+        let w = world([0.5, 0.0], vec![]);
+        for _ in 0..30 {
+            source.tick(&mut state, &defs, &w);
+            if source.attack_animation(0).is_some() {
+                break;
+            }
+        }
+        assert!(source.attack_animation(0).is_some());
+        let snapshot = source.snapshot().unwrap();
+        let mut restored_state = state.clone();
+        let mut restored = EnemyAi::new(&restored_state, Difficulty::Normal);
+        restored.set_clip_metadata(vec![None, Some(clips)]);
+        restored.restore(&snapshot, &restored_state).unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                source.tick(&mut state, &defs, &w),
+                restored.tick(&mut restored_state, &defs, &w)
+            );
+        }
+        assert_eq!(source.snapshot().unwrap(), restored.snapshot().unwrap());
+        let before = restored.snapshot().unwrap();
+        let mut invalid = snapshot.clone();
+        invalid.brains[0].attack_phase.as_mut().unwrap().frame_count += 1;
+        assert_eq!(
+            restored.restore(&invalid, &restored_state),
+            Err(AiSnapshotError::InvalidAttackClip)
+        );
+        assert_eq!(restored.snapshot().unwrap(), before);
+        let mut transient = snapshot;
+        transient.brains[0].mode = Mode::Attacking;
+        restored_state.actors[0].health = 0;
+        assert!(
+            restored.restore(&transient, &restored_state).is_ok(),
+            "damage can precede AI death update"
+        );
+    }
 
     fn actor(health: i32, flags: u8) -> (ActorState, ActorDefinitions) {
         let defs = ActorDefinitions::parse(format!("[MONSTERS]\n2\nhero.car 100 100 10 5 100 0 0 0\njoker.car 52 190 10 5 {health} 20 -1 16\n").as_bytes()).unwrap();

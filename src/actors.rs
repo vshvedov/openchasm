@@ -4,6 +4,7 @@
 //! and unknown definition columns are preserved for later simulation work.
 use crate::map::{Monster as MapActor, UNITS_PER_TILE};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind};
 
 /// How authored map actor IDs resolve into a definition table.
@@ -194,7 +195,108 @@ pub struct ActorState {
     pub actors: Vec<Actor>,
     pub unresolved: Vec<UnresolvedActor>,
 }
+/// Mutable actor values keyed by authored placement identity. Definition and
+/// map placement data remain sourced from the content on restore.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorSnapshot {
+    pub source_index: u32,
+    pub authored_id: u16,
+    pub definition_index: u32,
+    pub position: [f32; 2],
+    pub angle_radians: f32,
+    pub health: i32,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorStateSnapshot {
+    pub actors: Vec<ActorSnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorSnapshotError {
+    IndexOutOfRange,
+    CountMismatch,
+    DuplicateSource,
+    MissingSource,
+    IdentityMismatch,
+    InvalidPosition,
+    InvalidHealth,
+    MissingDefinition,
+}
 impl ActorState {
+    pub fn snapshot(&self) -> Result<ActorStateSnapshot, ActorSnapshotError> {
+        let mut seen = BTreeSet::new();
+        let mut actors = Vec::with_capacity(self.actors.len());
+        for actor in &self.actors {
+            let source_index = u32::try_from(actor.source_index)
+                .map_err(|_| ActorSnapshotError::IndexOutOfRange)?;
+            if !seen.insert(source_index) {
+                return Err(ActorSnapshotError::DuplicateSource);
+            }
+            let definition_index = u32::try_from(actor.definition_index)
+                .map_err(|_| ActorSnapshotError::IndexOutOfRange)?;
+            actors.push(ActorSnapshot {
+                source_index,
+                authored_id: actor.placement.id,
+                definition_index,
+                position: actor.position,
+                angle_radians: actor.angle_radians,
+                health: actor.health,
+            });
+        }
+        Ok(ActorStateSnapshot { actors })
+    }
+    /// Validate the entire actor set against its reconstructed definitions
+    /// before mutating any actor. Disabled actors may legitimately have zero HP.
+    pub fn restore(
+        &mut self,
+        snapshot: &ActorStateSnapshot,
+        definitions: &ActorDefinitions,
+    ) -> Result<(), ActorSnapshotError> {
+        if snapshot.actors.len() != self.actors.len() {
+            return Err(ActorSnapshotError::CountMismatch);
+        }
+        let mut saved = BTreeMap::new();
+        for actor in &snapshot.actors {
+            if saved.insert(actor.source_index, actor).is_some() {
+                return Err(ActorSnapshotError::DuplicateSource);
+            }
+            if !actor.angle_radians.is_finite()
+                || !actor
+                    .position
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= 4096.0)
+            {
+                return Err(ActorSnapshotError::InvalidPosition);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for actor in &self.actors {
+            let id = u32::try_from(actor.source_index)
+                .map_err(|_| ActorSnapshotError::IndexOutOfRange)?;
+            if !seen.insert(id) {
+                return Err(ActorSnapshotError::DuplicateSource);
+            }
+            let saved = saved.get(&id).ok_or(ActorSnapshotError::MissingSource)?;
+            if saved.authored_id != actor.placement.id
+                || usize::try_from(saved.definition_index).ok() != Some(actor.definition_index)
+            {
+                return Err(ActorSnapshotError::IdentityMismatch);
+            }
+            let def = definitions
+                .entries
+                .get(actor.definition_index)
+                .ok_or(ActorSnapshotError::MissingDefinition)?;
+            if saved.health < 0 || saved.health > def.health.max(0) {
+                return Err(ActorSnapshotError::InvalidHealth);
+            }
+        }
+        for actor in &mut self.actors {
+            let value = saved[&(actor.source_index as u32)];
+            actor.position = value.position;
+            actor.angle_radians = value.angle_radians;
+            actor.health = value.health;
+        }
+        Ok(())
+    }
     pub fn from_placements(placements: &[MapActor], definitions: &ActorDefinitions) -> Self {
         Self::from_placements_with_mapping(placements, definitions, ActorMapping::Identity)
     }
@@ -244,6 +346,46 @@ impl ActorState {
 mod tests {
     use super::*;
     const TABLE: &str = "[MONSTERS]\n2 labels\nhero.car 100 100 10 5 100 0 0 0\njoker.car 52 190 10 5 100 20 -1 16 extra ; comment\n[OTHER]\n";
+    #[test]
+    fn actor_snapshot_uses_source_identity_and_restores_atomically() {
+        let defs = ActorDefinitions::parse(TABLE.as_bytes()).unwrap();
+        let placement = |id, x| MapActor {
+            position: [x, 128],
+            id,
+            angle: 0,
+            flags: 7,
+        };
+        let placements = [placement(101, 128), placement(101, 256)];
+        let mut source = ActorState::from_placements(&placements, &defs);
+        source.actors[0].position = [3.0, 4.0];
+        source.actors[1].health = 0;
+        let mut snapshot = source.snapshot().unwrap();
+        snapshot.actors.reverse();
+        let mut restored = ActorState::from_placements(&placements, &defs);
+        restored.restore(&snapshot, &defs).unwrap();
+        assert_eq!(restored, source);
+        let before = restored.clone();
+        snapshot.actors[0].authored_id = 118;
+        assert_eq!(
+            restored.restore(&snapshot, &defs),
+            Err(ActorSnapshotError::IdentityMismatch)
+        );
+        assert_eq!(restored, before);
+        snapshot = source.snapshot().unwrap();
+        snapshot.actors[0].health = 101;
+        assert_eq!(
+            restored.restore(&snapshot, &defs),
+            Err(ActorSnapshotError::InvalidHealth)
+        );
+        assert_eq!(restored, before);
+        snapshot = source.snapshot().unwrap();
+        snapshot.actors[1].position[0] = f32::NAN;
+        assert_eq!(
+            restored.restore(&snapshot, &defs),
+            Err(ActorSnapshotError::InvalidPosition)
+        );
+        assert_eq!(restored, before);
+    }
     #[test]
     fn addon_mapping_is_explicit_and_retains_raw_placements() {
         let mut defs = ActorDefinitions::parse(TABLE.as_bytes()).unwrap();

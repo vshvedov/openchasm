@@ -250,7 +250,71 @@ pub struct MissionState {
     end_remaining: Option<f32>,
     completed: bool,
 }
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissionSnapshot {
+    pub first_messages_shown: Vec<u16>,
+    pub end_remaining: Option<f32>,
+    pub completed: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionSnapshotError {
+    DuplicateProcess,
+    InvalidProcess,
+    InvalidTimer,
+}
 impl MissionState {
+    pub fn snapshot(&self) -> MissionSnapshot {
+        MissionSnapshot {
+            first_messages_shown: self.first_messages_shown.iter().copied().collect(),
+            end_remaining: self.end_remaining,
+            completed: self.completed,
+        }
+    }
+    /// Mission messages and timers are validated against the loaded plan.
+    pub fn restore(&mut self, snapshot: &MissionSnapshot) -> Result<(), MissionSnapshotError> {
+        if snapshot.completed && snapshot.end_remaining.is_some()
+            || snapshot
+                .end_remaining
+                .is_some_and(|t| !t.is_finite() || t <= 0.0)
+        {
+            return Err(MissionSnapshotError::InvalidTimer);
+        }
+        let mut shown = BTreeSet::new();
+        for id in &snapshot.first_messages_shown {
+            if !shown.insert(*id) {
+                return Err(MissionSnapshotError::DuplicateProcess);
+            }
+            let valid = self
+                .plan
+                .processes
+                .get(id)
+                .and_then(|p| p.first_message)
+                .is_some_and(|message| self.plan.messages.contains_key(&message));
+            if !valid {
+                return Err(MissionSnapshotError::InvalidProcess);
+            }
+        }
+        let max_delay = self
+            .plan
+            .processes
+            .values()
+            .filter_map(|p| p.end_delay_seconds)
+            .filter(|delay| delay.is_finite() && *delay > 0.0)
+            .fold(None, |max: Option<f32>, delay| {
+                Some(max.map_or(delay, |m| m.max(delay)))
+            });
+        if (snapshot.completed || snapshot.end_remaining.is_some()) && max_delay.is_none()
+            || snapshot
+                .end_remaining
+                .is_some_and(|remaining| max_delay.is_none_or(|max| remaining > max))
+        {
+            return Err(MissionSnapshotError::InvalidTimer);
+        }
+        self.first_messages_shown = shown;
+        self.end_remaining = snapshot.end_remaining;
+        self.completed = snapshot.completed;
+        Ok(())
+    }
     pub fn new(plan: MissionPlan) -> Self {
         Self {
             plan,
@@ -325,6 +389,35 @@ impl MissionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mission_snapshot_preserves_message_once_and_timer() {
+        let script = "#mess1\nDelay 1\nTextA: 0 0 \"Hello\"\n#end\n#proc1\nFirstMessage 1\nEndDelay 2\n#end\n";
+        let plan = plan(script);
+        let mut state = MissionState::new(plan.clone());
+        assert_eq!(state.attempt(1, true), vec![MissionEvent::ShowMessage(1)]);
+        state.advance(0.5);
+        let saved = state.snapshot();
+        let mut restored = MissionState::new(plan);
+        restored.restore(&saved).unwrap();
+        assert!(restored.attempt(1, true).is_empty());
+        assert_eq!(state.advance(1.5), restored.advance(1.5));
+        assert!(restored.is_complete());
+        let before = restored.snapshot();
+        let mut invalid = saved.clone();
+        invalid.end_remaining = Some(f32::NAN);
+        assert_eq!(
+            restored.restore(&invalid),
+            Err(MissionSnapshotError::InvalidTimer)
+        );
+        assert_eq!(restored.snapshot(), before);
+        invalid = saved;
+        invalid.first_messages_shown.push(99);
+        assert_eq!(
+            restored.restore(&invalid),
+            Err(MissionSnapshotError::InvalidProcess)
+        );
+        assert_eq!(restored.snapshot(), before);
+    }
     fn plan(text: &str) -> MissionPlan {
         MissionPlan::parse(&Script::parse(text), text)
     }

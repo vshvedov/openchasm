@@ -436,7 +436,7 @@ impl RuntimeProcess {
             }
             if action.name == "wind" {
                 let parsed = (|| {
-                    if !wind_enabled || action.arguments.len() != 6 {
+                    if !wind_enabled || !(6..=7).contains(&action.arguments.len()) {
                         return None;
                     }
                     let values: Vec<i32> = action
@@ -457,7 +457,13 @@ impl RuntimeProcess {
                     {
                         return None;
                     }
+                    let actor_only = match values.get(6).copied().unwrap_or(0) {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    };
                     Some(WindZone {
+                        actor_only,
                         min_cell: [x1, y1],
                         max_cell: [x2, y2],
                         direction: [values[4] as i16, values[5] as i16],
@@ -3029,7 +3035,8 @@ mod tests {
                 zones: vec![WindZone {
                     min_cell: [4, 4],
                     max_cell: [5, 5],
-                    direction: [-21, 0]
+                    direction: [-21, 0],
+                    actor_only: false,
                 }]
             }]
         );
@@ -3087,7 +3094,9 @@ mod tests {
     fn invalid_wind_disables_whole_process() {
         for action in [
             "wind 0 0 1 1 1",
-            "wind 0 0 1 1 1 2 1",
+            "wind 0 0 1 1 1 2 2",
+            "wind 0 0 1 1 1 2 bad",
+            "wind 0 0 1 1 1 2 1 0",
             "wind -1 0 1 1 1 2",
             "wind 0 0 64 1 1 2",
             "wind 2 0 1 1 1 2",

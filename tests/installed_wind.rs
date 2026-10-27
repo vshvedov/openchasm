@@ -67,7 +67,8 @@ fn level_12_floor_trigger_starts_authored_nonstop_wind() {
         &[WindZone {
             min_cell: [54, 54],
             max_cell: [58, 54],
-            direction: [0, 16]
+            direction: [0, 16],
+            actor_only: false,
         }]
     );
     let mut field = WindField::new();
@@ -84,4 +85,69 @@ fn level_12_floor_trigger_starts_authored_nonstop_wind() {
             .any(|event| matches!(event, ProcessEffect::WindDeactivated { process_id: 11 })));
     }
     assert!(field.is_active(11), "nonstop wind persists after opening");
+}
+
+#[test]
+fn level_12_process_26_authored_actor_only_wind() {
+    let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+    let path = explicit
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("assets/csm.bin"));
+    if !path.exists() && explicit.is_none() {
+        return;
+    }
+    let mut archive = archive::Archive::open(&path).unwrap();
+    let data = archive.read("map/process.12").unwrap();
+    let script = Script::parse(std::str::from_utf8(&data).unwrap());
+    let wind = script.processes[&26]
+        .actions
+        .iter()
+        .find(|action| action.name == "wind")
+        .unwrap();
+    assert_eq!(wind.arguments, ["34", "31", "34", "32", "10", "0", "1"]);
+    // Isolate the real authored command so other process 26 motions do not
+    // require a complete map and object scene in this wind-specific test.
+    let isolated = Script::parse(&format!(
+        "#proc26\n#action\nwind {}\nnonstop\n#end\n#links\nfloor 30 31 26\n#end\n",
+        wind.arguments.join(" ")
+    ));
+    let world = World {
+        walls: vec![],
+        player: Player {
+            position: [-100.0, -100.0],
+            angle: 0.0,
+        },
+    };
+    let mut runtime = ProcessRuntime::with_wind(
+        &isolated,
+        &world,
+        ProcessCapabilities::default(),
+        &[0; 4096],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.activate_at("floor", [30, 31])[0].outcome,
+        ProcessOutcome::Accepted
+    );
+    let effects = runtime.take_effects();
+    let zones = effects
+        .iter()
+        .find_map(|effect| match effect {
+            ProcessEffect::WindActivated {
+                process_id: 26,
+                zones,
+            } => Some(zones),
+            _ => None,
+        })
+        .unwrap();
+    assert!(zones[0].actor_only);
+    let mut field = WindField::new();
+    field.activate(26, zones).unwrap();
+    assert_eq!(field.displacement([34.5, 31.5], 1.0), Some([0.0, 0.0]));
+    assert_eq!(
+        field.actor_displacement([34.5, 31.5], 1.0),
+        Some([5.0, 0.0])
+    );
 }

@@ -1167,7 +1167,10 @@ impl Session {
             };
             let radius = (definition.wall_radius as f32 / 256.0).clamp(0.05, 2.0);
             let position = actor.position;
-            let displacement = self.wind.displacement(position, DT).unwrap_or([0.0, 0.0]);
+            let displacement = self
+                .wind
+                .actor_displacement(position, DT)
+                .unwrap_or([0.0, 0.0]);
             if displacement == [0.0, 0.0] {
                 continue;
             }
@@ -2688,6 +2691,7 @@ mod tests {
                     min_cell: [0, 0],
                     max_cell: [5, 5],
                     direction: [-64, 0],
+                    actor_only: false,
                 }],
             )
             .unwrap();
@@ -2744,6 +2748,7 @@ mod tests {
                     min_cell: [0, 0],
                     max_cell: [5, 5],
                     direction: [64, 0],
+                    actor_only: false,
                 }],
             )
             .unwrap();
@@ -2898,12 +2903,14 @@ mod tests {
                     min_cell: [0, 0],
                     max_cell: [5, 5],
                     direction: [64, 0],
+                    actor_only: true,
                 }],
             )
             .unwrap();
         for _ in 0..10 {
             session.step(SessionInput::default());
         }
+        assert_eq!(session.world.player.position, [5.5, 5.5]);
         let x = session.actors.actors[0].position[0];
         assert!(x > 1.7 && x <= 1.7501, "{x}");
         session.actors.actors[0].health = 0;
@@ -2962,6 +2969,7 @@ mod tests {
                     min_cell: [0, 0],
                     max_cell: [5, 5],
                     direction: [-64, 0],
+                    actor_only: false,
                 }],
             )
             .unwrap();

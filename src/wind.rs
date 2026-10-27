@@ -19,6 +19,8 @@ pub struct WindZone {
     pub max_cell: [u8; 2],
     /// Authored signed field components; not yet confirmed physical units.
     pub direction: [i16; 2],
+    /// The remaster skips player wind when the seventh argument is 1.
+    pub actor_only: bool,
 }
 impl WindZone {
     fn valid(&self) -> bool {
@@ -51,6 +53,7 @@ impl Error for WindError {}
 pub struct WindField {
     // x-major, as in the map structures; each cell is an authored vector.
     cells: Vec<[i16; 2]>,
+    actor_cells: Vec<[i16; 2]>,
     active: BTreeMap<u16, Vec<WindZone>>,
 }
 impl Default for WindField {
@@ -62,6 +65,7 @@ impl WindField {
     pub fn new() -> Self {
         Self {
             cells: vec![[0, 0]; SIDE * SIDE],
+            actor_cells: vec![[0, 0]; SIDE * SIDE],
             active: BTreeMap::new(),
         }
     }
@@ -104,7 +108,11 @@ impl WindField {
     fn write_zone(&mut self, zone: &WindZone, value: [i16; 2]) {
         for x in zone.min_cell[0]..=zone.max_cell[0] {
             for y in zone.min_cell[1]..=zone.max_cell[1] {
-                self.cells[usize::from(x) * SIDE + usize::from(y)] = value;
+                let index = usize::from(x) * SIDE + usize::from(y);
+                self.actor_cells[index] = value;
+                if !zone.actor_only {
+                    self.cells[index] = value;
+                }
             }
         }
     }
@@ -120,6 +128,15 @@ impl WindField {
     /// Reference behavior near boundaries is provisional: it truncates (x-.5)
     /// toward zero and ignores samples whose base cell is the last grid row.
     pub fn sample(&self, position: [f32; 2]) -> Option<[f32; 2]> {
+        Self::sample_grid(&self.cells, position)
+    }
+
+    /// Sample the field that affects actors, including actor-only zones.
+    pub fn sample_actor(&self, position: [f32; 2]) -> Option<[f32; 2]> {
+        Self::sample_grid(&self.actor_cells, position)
+    }
+
+    fn sample_grid(grid: &[[i16; 2]], position: [f32; 2]) -> Option<[f32; 2]> {
         if !position.iter().all(|x| x.is_finite()) {
             return None;
         }
@@ -144,10 +161,10 @@ impl WindField {
             fraction[0] * fraction[1],
         ];
         let cells = [
-            self.cells[x * SIDE + y],
-            self.cells[x * SIDE + y + 1],
-            self.cells[(x + 1) * SIDE + y],
-            self.cells[(x + 1) * SIDE + y + 1],
+            grid[x * SIDE + y],
+            grid[x * SIDE + y + 1],
+            grid[(x + 1) * SIDE + y],
+            grid[(x + 1) * SIDE + y + 1],
         ];
         let mut wind = [0.0; 2];
         for (cell, weight) in cells.iter().zip(weights) {
@@ -161,10 +178,18 @@ impl WindField {
     /// through entity/wall collision rather than directly teleporting an actor.
     /// Invalid time, coordinates or floating-point overflow return None.
     pub fn displacement(&self, position: [f32; 2], dt: f32) -> Option<[f32; 2]> {
+        Self::displacement_grid(&self.cells, position, dt)
+    }
+
+    pub fn actor_displacement(&self, position: [f32; 2], dt: f32) -> Option<[f32; 2]> {
+        Self::displacement_grid(&self.actor_cells, position, dt)
+    }
+
+    fn displacement_grid(grid: &[[i16; 2]], position: [f32; 2], dt: f32) -> Option<[f32; 2]> {
         if !dt.is_finite() || dt < 0.0 {
             return None;
         }
-        let wind = self.sample(position)?;
+        let wind = Self::sample_grid(grid, position)?;
         let result = [
             wind[0] * DISPLACEMENT_SCALE * dt,
             wind[1] * DISPLACEMENT_SCALE * dt,
@@ -181,6 +206,7 @@ mod tests {
             min_cell: min,
             max_cell: max,
             direction,
+            actor_only: false,
         }
     }
     #[test]
@@ -209,6 +235,34 @@ mod tests {
         assert_eq!(field.cell([3, 1]), Some([8, 0]));
         assert!(!field.deactivate(1));
         assert!(field.deactivate(2));
+    }
+    #[test]
+    fn actor_only_overlaps_do_not_change_player_cells() {
+        let mut field = WindField::new();
+        let regular = zone([1, 1], [1, 1], [4, 0]);
+        let actor_only = WindZone {
+            actor_only: true,
+            direction: [8, 0],
+            ..regular
+        };
+        field.activate(1, &[regular]).unwrap();
+        field.activate(2, &[actor_only]).unwrap();
+        assert_eq!(field.sample([1.5, 1.5]), Some([4.0, 0.0]));
+        assert_eq!(field.sample_actor([1.5, 1.5]), Some([8.0, 0.0]));
+        field.deactivate(2);
+        assert_eq!(field.sample([1.5, 1.5]), Some([4.0, 0.0]));
+        assert_eq!(field.sample_actor([1.5, 1.5]), Some([0.0, 0.0]));
+        field.activate(2, &[actor_only]).unwrap();
+        field.deactivate(1);
+        assert_eq!(field.sample([1.5, 1.5]), Some([0.0, 0.0]));
+        assert_eq!(field.sample_actor([1.5, 1.5]), Some([0.0, 0.0]));
+        field.deactivate(2);
+        field.activate(2, &[actor_only]).unwrap();
+        field.activate(1, &[regular]).unwrap();
+        assert_eq!(field.sample_actor([1.5, 1.5]), Some([4.0, 0.0]));
+        field.deactivate(2);
+        assert_eq!(field.sample([1.5, 1.5]), Some([4.0, 0.0]));
+        assert_eq!(field.sample_actor([1.5, 1.5]), Some([0.0, 0.0]));
     }
     #[test]
     fn validation_is_atomic_and_rejects_duplicate_activation() {

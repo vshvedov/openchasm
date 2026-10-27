@@ -1,0 +1,10 @@
+[package]
+name = "openchasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "An experimental open-source Chasm: The Rift engine reimplementation"
+
+[dependencies]
+font8x8 = "0.3"
+minifb = "0.29"

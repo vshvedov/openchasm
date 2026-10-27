@@ -1,6 +1,7 @@
 mod archive;
 mod content;
 mod map;
+mod process;
 mod texture;
 mod viewer;
 mod world;
@@ -190,6 +191,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
                 let floor = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
                 let world = make_world(&map)?;
+                let script_bytes = resources.read(&format!("map/process.{id}"))?;
+                let script_text = String::from_utf8_lossy(&script_bytes);
+                let script = process::Script::parse(&script_text);
+                for diagnostic in &script.diagnostics {
+                    eprintln!("process.{id}: {diagnostic}");
+                }
                 // Exercise parsed grids and the floor texture index, too.
                 let _ = (
                     map.floor(0, 0),

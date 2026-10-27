@@ -130,13 +130,16 @@ impl VerticalState {
             grounded: self.grounded,
         }
     }
-    /// Validate against the current physics config and loaded map planes.
+    /// Validate intrinsic state and finite bounds. The head may overlap a
+    /// newly lowered ceiling: Session keeps its prior vertical state until
+    /// clearance returns. The next physics step resolves ordinary overlap.
     pub fn restore(
         &mut self,
         value: VerticalSnapshot,
         bounds: VerticalBounds,
     ) -> Result<(), VerticalSnapshotError> {
         if !value.feet.is_finite()
+            || value.feet.abs() > 4096.0
             || !value.velocity.is_finite()
             || value.velocity.abs() > self.config.max_speed + GROUND_EPSILON
         {
@@ -145,14 +148,14 @@ impl VerticalState {
         if !bounds.floor.is_finite()
             || bounds
                 .ceiling
-                .is_some_and(|z| !z.is_finite() || z - bounds.floor < self.config.body_height)
+                .is_some_and(|z| !z.is_finite() || z < bounds.floor)
         {
             return Err(VerticalSnapshotError::InvalidBounds);
         }
         if value.feet < bounds.floor - GROUND_EPSILON
             || bounds
                 .ceiling
-                .is_some_and(|z| value.feet + self.config.body_height > z + GROUND_EPSILON)
+                .is_some_and(|z| value.feet > z + GROUND_EPSILON)
         {
             return Err(VerticalSnapshotError::OutsideBounds);
         }
@@ -325,6 +328,51 @@ mod tests {
             Err(VerticalSnapshotError::InvalidGroundedState)
         );
         assert_eq!(restored, before);
+    }
+    #[test]
+    fn restore_accepts_state_held_during_insufficient_ceiling_clearance() {
+        let mut source = VerticalState::new(0.0).unwrap();
+        let blocked = VerticalBounds {
+            floor: 0.0,
+            ceiling: Some(0.2),
+        };
+        let before = source.snapshot();
+        assert_eq!(
+            source.step(1.0 / 60.0, false, blocked),
+            Err(VerticalError::InsufficientClearance)
+        );
+        assert_eq!(source.snapshot(), before);
+        let mut restored = VerticalState::new(0.0).unwrap();
+        restored.restore(before, blocked).unwrap();
+        assert_eq!(restored, source);
+        let clear = VerticalBounds::flat_room();
+        assert_eq!(
+            restored.step(1.0 / 60.0, true, clear),
+            source.step(1.0 / 60.0, true, clear)
+        );
+        assert_eq!(restored, source);
+        // A horizontal move after the vertical tick may enter a lower but
+        // otherwise valid ceiling before the next vertical correction.
+        let airborne = source.snapshot();
+        let low = VerticalBounds {
+            floor: 0.0,
+            ceiling: Some(0.9),
+        };
+        assert!(airborne.feet + source.config().body_height > low.ceiling.unwrap());
+        restored.restore(airborne, low).unwrap();
+        assert_eq!(restored.snapshot(), airborne);
+        let prior = restored;
+        assert_eq!(
+            restored.restore(
+                before,
+                VerticalBounds {
+                    floor: 1.0,
+                    ceiling: Some(0.2)
+                }
+            ),
+            Err(VerticalSnapshotError::InvalidBounds)
+        );
+        assert_eq!(restored, prior);
     }
     #[test]
     fn jump_rises_then_lands_with_reference_scale_and_camera_height() {

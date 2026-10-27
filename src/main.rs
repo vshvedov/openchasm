@@ -362,7 +362,7 @@ fn finish_level_fingerprint(
     trace.add_metadata("difficulty", &difficulty_mask(difficulty).to_le_bytes())?;
     // Only immutable baseline/configuration state belongs here. In particular,
     // carried inventory is gameplay state and must not alter content identity.
-    let snapshot = session
+    let mut snapshot = session
         .snapshot(ContentDigest([0; 32]))
         .map_err(|error| format!("baseline snapshot unavailable: {error:?}"))?;
     trace.add_metadata(
@@ -432,7 +432,19 @@ fn finish_level_fingerprint(
         .map(|s| s.manifest.fingerprint_entries().collect())
         .unwrap_or_default();
     trace.add_metadata("replacement-manifest", &serde_json::to_vec(&replacements)?)?;
-    Ok(trace.finish()?)
+    let digest = trace.finish()?;
+    snapshot.content = digest;
+    let restored = session
+        .restore_from_baseline(&snapshot, digest)
+        .map_err(|error| format!("baseline restore unavailable: {error:?}"))?;
+    if restored
+        .snapshot(digest)
+        .map_err(|error| format!("restored baseline snapshot unavailable: {error:?}"))?
+        != snapshot
+    {
+        return Err("baseline snapshot does not round-trip".into());
+    }
+    Ok(digest)
 }
 
 fn play(
@@ -911,7 +923,9 @@ mod wall_graphics_tests {
         path: &Path,
         difficulty: Difficulty,
         fallback: bool,
-    ) -> openchasm::save_format::ContentDigest {
+        carried: bool,
+        invalid: bool,
+    ) -> Result<openchasm::save_format::ContentDigest, Box<dyn Error>> {
         let mut resources = ResourceSet::open(path).unwrap();
         resources.begin_trace().unwrap();
         let info = resources.read("chasm.inf").unwrap();
@@ -940,12 +954,18 @@ mod wall_graphics_tests {
         )
         .unwrap();
         let instances = objects::instances(&map);
-        let game = openchasm::game::GameInventory::new(
+        let mut game = openchasm::game::GameInventory::new(
             openchasm::inventory::WeaponDefinitions::parse(&info).unwrap(),
             &instances,
             &definitions,
             difficulty,
         );
+        let fresh_inventory = game.inventory.clone();
+        if carried {
+            game.inventory.health = 77;
+            game.inventory.weapons[1] = true;
+            game.inventory.ammo[1] = 1;
+        }
         let mut session = openchasm::session::Session::new(openchasm::session::LevelSetup {
             world,
             processes: runtime,
@@ -959,10 +979,13 @@ mod wall_graphics_tests {
         assert!(session.set_wall_material_catalog(materials.clone()));
         assert!(session.set_object_heights(heights.clone(), cells));
         session.ai.set_clip_metadata(clips.clone());
+        if invalid {
+            session.selected_weapon = 7;
+        }
         if fallback {
             assert!(resources.read("optional/not-present.test").is_err());
         }
-        finish_level_fingerprint(
+        let digest = finish_level_fingerprint(
             resources.take_trace().unwrap(),
             "01",
             difficulty,
@@ -970,8 +993,19 @@ mod wall_graphics_tests {
             &clips,
             &heights,
             &materials,
-        )
-        .unwrap()
+        )?;
+        if carried {
+            let checkpoint = session.snapshot(digest).unwrap();
+            let mut fresh = session.clone();
+            fresh.game.inventory = fresh_inventory;
+            let restored = fresh.restore_from_baseline(&checkpoint, digest).unwrap();
+            assert_eq!(restored.game.inventory.snapshot(), checkpoint.inventory);
+            assert_eq!(
+                restored.game.pickups.snapshot().unwrap(),
+                checkpoint.pickups
+            );
+        }
+        Ok(digest)
     }
 
     #[test]
@@ -984,13 +1018,24 @@ mod wall_graphics_tests {
         if !path.exists() && explicit.is_none() {
             return;
         }
-        let normal = fingerprint_fixture(&path, Difficulty::Normal, false);
+        let normal = fingerprint_fixture(&path, Difficulty::Normal, false, false, false).unwrap();
         assert_eq!(
             normal,
-            fingerprint_fixture(&path, Difficulty::Normal, false)
+            fingerprint_fixture(&path, Difficulty::Normal, false, false, false).unwrap()
         );
-        assert_ne!(normal, fingerprint_fixture(&path, Difficulty::Hard, false));
-        assert_ne!(normal, fingerprint_fixture(&path, Difficulty::Normal, true));
+        assert_ne!(
+            normal,
+            fingerprint_fixture(&path, Difficulty::Hard, false, false, false).unwrap()
+        );
+        assert_ne!(
+            normal,
+            fingerprint_fixture(&path, Difficulty::Normal, true, false, false).unwrap()
+        );
+        assert_eq!(
+            normal,
+            fingerprint_fixture(&path, Difficulty::Normal, false, true, false).unwrap()
+        );
+        assert!(fingerprint_fixture(&path, Difficulty::Normal, false, false, true).is_err());
         let sources = content::discover();
         let full = sources.iter().find(|s| s.kind == SourceKind::SteamFull);
         let demo = sources.iter().find(|s| s.kind == SourceKind::SteamDemo);
@@ -1014,8 +1059,10 @@ mod wall_graphics_tests {
             }
             if same {
                 assert_eq!(
-                    fingerprint_fixture(&full.path, Difficulty::Normal, false),
-                    fingerprint_fixture(&demo.path, Difficulty::Normal, false)
+                    fingerprint_fixture(&full.path, Difficulty::Normal, false, false, false)
+                        .unwrap(),
+                    fingerprint_fixture(&demo.path, Difficulty::Normal, false, false, false)
+                        .unwrap()
                 );
             }
         }

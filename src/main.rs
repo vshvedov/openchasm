@@ -121,6 +121,13 @@ fn load_wall_textures(
         })
         .collect()
 }
+fn raw_cells(map: &Map) -> [u8; 4096] {
+    std::array::from_fn(|index| {
+        map.wall(index / MAP_SIDE, index % MAP_SIDE)
+            .expect("valid map cell")
+            .texture_id
+    })
+}
 fn make_world(map: &Map, graphics: &[WallGraphic]) -> Result<World, Box<dyn Error>> {
     let spawn = map
         .monsters
@@ -235,8 +242,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let script_bytes = resources.read(&format!("map/process.{id}"))?;
                 let script_text = String::from_utf8_lossy(&script_bytes);
                 let script = process::Script::parse(&script_text);
-                let supported_processes =
-                    process_runtime::ProcessRuntime::new(&script, &world).usable_count();
+                let cells = raw_cells(&map);
+                let supported_processes = process_runtime::ProcessRuntime::with_cell_data(
+                    &script,
+                    &world,
+                    process_runtime::ProcessCapabilities {
+                        wall_elevation: true,
+                        initial_cell_types: None,
+                    },
+                    &cells,
+                )
+                .usable_count();
                 for diagnostic in &script.diagnostics {
                     eprintln!("process.{id}: {diagnostic}");
                 }
@@ -280,11 +296,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
                 let script_data = resources.read(&format!("map/process.{id}"))?;
                 let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
-                let raw_cells: [u8; 4096] = std::array::from_fn(|index| {
-                    map.wall(index / MAP_SIDE, index % MAP_SIDE)
-                        .expect("valid map cell")
-                        .texture_id
-                });
+                let cells = raw_cells(&map);
                 let processes = process_runtime::ProcessRuntime::with_cell_data(
                     &script,
                     &world,
@@ -292,7 +304,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         wall_elevation: true,
                         initial_cell_types: None,
                     },
-                    &raw_cells,
+                    &cells,
                 );
                 let definitions =
                     objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;

@@ -587,6 +587,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 session.set_explosions_enabled(true);
                 session.set_mines_enabled(mine_available);
                 session.set_protective_powerups_enabled(true);
+                session.set_addon_boss_rule(actors::ActorMapping::recognize_shipped_addon(
+                    &map_bytes, &info,
+                ));
                 if let Some(teleports) = teleports {
                     session.set_teleports(
                         teleports,

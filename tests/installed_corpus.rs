@@ -32,6 +32,7 @@ fn installed_archive_parses_game_data() {
     let mut textures = 0;
     let mut models = 0;
     let mut animations = 0;
+    let mut monsters = 0;
     for name in names {
         if let Some(id) = name.strip_prefix("map/map.") {
             let bytes = archive.read(&name).unwrap();
@@ -54,6 +55,10 @@ fn installed_archive_parses_game_data() {
             let bytes = archive.read(&name).unwrap();
             model::Model::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             models += 1;
+        } else if name.starts_with("monster/") && name.ends_with(".car") {
+            let bytes = archive.read(&name).unwrap();
+            openchasm::monster::Monster::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            monsters += 1;
         } else if name.starts_with("model/") && name.ends_with(".ani") {
             let bytes = archive.read(&name).unwrap();
             model::Animation::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -61,8 +66,8 @@ fn installed_archive_parses_game_data() {
         }
     }
     assert!(
-        maps > 0 && textures > 0 && models > 0 && animations > 0,
+        maps > 0 && textures > 0 && models > 0 && animations > 0 && monsters > 0,
         "archive missing expected content categories"
     );
-    eprintln!("Validated {maps} maps, {textures} textures, {models} models and {animations} animations in {}", path.display());
+    eprintln!("Validated {maps} maps, {textures} textures, {models} models and {animations} animations and {monsters} monster models in {}", path.display());
 }

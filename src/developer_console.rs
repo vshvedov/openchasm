@@ -1,6 +1,7 @@
 //! Bounded client-side developer console. The host owns mouse/text-input routing
 //! and applies returned commands; no console command mutates simulation directly.
 use crate::ui::UiPixel;
+use openchasm::movement::MovementMode;
 use std::collections::VecDeque;
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
@@ -22,6 +23,8 @@ const COMMANDS: &[&str] = &[
     "restart",
     "quit",
     "sensitivity",
+    "autorun",
+    "physics",
     "options",
     "graphics",
     "renderer",
@@ -43,6 +46,8 @@ pub enum Command {
     Quit,
     /// Radians per mouse pixel; None requests the current value.
     Sensitivity(Option<f32>),
+    Autorun(Option<bool>),
+    Physics(Option<MovementMode>),
     Options,
     Graphics(Option<crate::graphics_settings::VisualPreset>),
     Renderer(Option<crate::presentation::BackendChoice>),
@@ -231,7 +236,7 @@ impl Console {
         let args: Vec<_> = parts.collect();
         match command.as_str() {
             "help" | "cmdlist" if args.is_empty() => self
-                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity options graphics renderer tonemap gamma brightness saturation bloom"),
+                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity autorun physics options graphics renderer tonemap gamma brightness saturation bloom"),
             "clear" if args.is_empty() => self.lines.clear(),
             "echo" => self.push(
                 trimmed
@@ -274,6 +279,18 @@ impl Console {
                     _ => self.push("usage: sensitivity [0.0001..1.0] (radians/pixel)"),
                 },
                 _ => self.push("usage: sensitivity [0.0001..1.0] (radians/pixel)"),
+            },
+            "autorun" => match args.as_slice() {
+                [] => return Some(Command::Autorun(None)),
+                [v] if v.eq_ignore_ascii_case("on") || *v == "1" => return Some(Command::Autorun(Some(true))),
+                [v] if v.eq_ignore_ascii_case("off") || *v == "0" => return Some(Command::Autorun(Some(false))),
+                _ => self.push("usage: autorun [on|off|1|0]"),
+            },
+            "physics" => match args.as_slice() {
+                [] => return Some(Command::Physics(None)),
+                [v] if v.eq_ignore_ascii_case("original") => return Some(Command::Physics(Some(MovementMode::Original))),
+                [v] if v.eq_ignore_ascii_case("quake1") => return Some(Command::Physics(Some(MovementMode::Quake1))),
+                _ => self.push("usage: physics [original|quake1]"),
             },
             "options" if args.is_empty() => return Some(Command::Options),
             "graphics" => {
@@ -500,6 +517,46 @@ mod tests {
         assert!(c.input.len() <= MAX_LINE_BYTES);
         c.push(&"猫".repeat(MAX_LINE_BYTES));
         assert!(c.lines.back().unwrap().len() <= MAX_LINE_BYTES);
+    }
+    #[test]
+    fn control_commands_validate_values_queries_help_and_completion() {
+        let mut c = Console::default();
+        for (input, expected) in [
+            ("autorun", Command::Autorun(None)),
+            ("autorun ON", Command::Autorun(Some(true))),
+            ("autorun off", Command::Autorun(Some(false))),
+            ("autorun 1", Command::Autorun(Some(true))),
+            ("autorun 0", Command::Autorun(Some(false))),
+            ("physics", Command::Physics(None)),
+            (
+                "physics ORIGINAL",
+                Command::Physics(Some(MovementMode::Original)),
+            ),
+            (
+                "physics quake1",
+                Command::Physics(Some(MovementMode::Quake1)),
+            ),
+        ] {
+            assert_eq!(submit(&mut c, input), Some(expected));
+        }
+        for input in [
+            "autorun maybe",
+            "autorun on off",
+            "physics quake",
+            "physics quake1 original",
+        ] {
+            assert_eq!(submit(&mut c, input), None);
+            assert!(c.lines.back().unwrap().starts_with("usage:"));
+        }
+        submit(&mut c, "help");
+        assert!(c.lines.back().unwrap().contains("autorun physics"));
+        for (prefix, completed) in [("aut", "autorun "), ("phy", "physics ")] {
+            c.insert(prefix);
+            c.key(Keycode::Tab);
+            assert_eq!(c.input, completed);
+            c.input.clear();
+            c.cursor = 0;
+        }
     }
     #[test]
     fn sdl_text_input_only_works_open_and_overlay_is_clipped() {

@@ -289,7 +289,7 @@ fn draw_pause_menu<C: UiPixel>(frame: &mut [C], menu: &PauseMenu) {
             "RESUME",
             "MEMORY QUICK SAVE",
             "MEMORY QUICK LOAD",
-            "GRAPHICS OPTIONS",
+            "OPTIONS",
             "RESTART LEVEL",
             "EXIT LEVEL",
         ]
@@ -1264,7 +1264,13 @@ impl UiFrame<'_> {
     }
 }
 
+pub struct LevelCarry {
+    pub inventory: openchasm::inventory::Inventory,
+    pub physics: openchasm::movement::MovementMode,
+}
+
 pub struct ClientFeedback {
+    pub movement_override: Option<openchasm::movement::MovementMode>,
     pub hud: Option<crate::hud::Hud>,
     pub map: crate::map::Map,
     pub session: Session,
@@ -1288,8 +1294,9 @@ pub fn run(
     mut objects: ObjectScene,
     feedback: ClientFeedback,
     label: &str,
-) -> Result<Option<openchasm::inventory::Inventory>, Box<dyn Error>> {
+) -> Result<Option<LevelCarry>, Box<dyn Error>> {
     let ClientFeedback {
+        movement_override,
         hud,
         map,
         mut session,
@@ -1306,7 +1313,6 @@ pub fn run(
     } = feedback;
     let map = Arc::new(map);
     let difficulty_mask = crate::difficulty_mask(difficulty);
-    let initial_session = session.clone();
     let mut warned_actor_clips = HashSet::new();
     if let Some(targets) = &session.objects {
         for (cell, visible) in targets.visibility() {
@@ -1376,6 +1382,13 @@ pub fn run(
         }
         None => GraphicsSettings::default(),
     };
+    if let Some(mode) = movement_override {
+        graphics.physics = mode;
+    }
+    session
+        .set_movement_mode(graphics.physics)
+        .map_err(|error| format!("movement settings: {error:?}"))?;
+    let initial_session = session.clone();
     let mut uncapped_override = std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1");
     let mut color_pipeline = ColorPipeline::new(graphics.color_settings())?;
     let mut graphics_menu = GraphicsMenu::default();
@@ -1642,6 +1655,24 @@ pub fn run(
                             }
                             console.push(&format!("graphics {:?}", graphics.preset));
                         }
+                        Command::Autorun(value) => {
+                            if let Some(value) = value {
+                                graphics.autorun = value;
+                                graphics_changed = true;
+                            }
+                            console.push(if graphics.autorun {
+                                "autorun on"
+                            } else {
+                                "autorun off"
+                            });
+                        }
+                        Command::Physics(value) => {
+                            if let Some(value) = value {
+                                graphics.physics = value;
+                                graphics_changed = true;
+                            }
+                            console.push(&format!("physics {:?}", graphics.physics));
+                        }
                         Command::Renderer(value) => {
                             if let Some(choice) = value {
                                 presentation.set_backend(choice)?;
@@ -1695,6 +1726,14 @@ pub fn run(
                                 session.vertical.feet(),
                                 p.angle,
                                 session.pitch()
+                            ));
+                            let velocity = session.movement_velocity();
+                            console.push(&format!(
+                                "physics {:?}; velocity {:.3} {:.3}; autorun {}",
+                                session.movement_mode(),
+                                velocity[0],
+                                velocity[1],
+                                if graphics.autorun { "on" } else { "off" }
                             ));
                             console.push(&format!(
                                 "{:.1} fps / {:.2} ms per frame; max {:.2} ms",
@@ -1897,6 +1936,10 @@ pub fn run(
                 .and_then(|_| ColorPipeline::new(graphics.color_settings()))
             {
                 Ok(pipeline) => {
+                    if let Err(error) = session.set_movement_mode(graphics.physics) {
+                        graphics.physics = session.movement_mode();
+                        console.push(&format!("Movement change rejected: {error:?}"));
+                    }
                     if graphics.max_fps != graphics_before.max_fps {
                         uncapped_override = false;
                     }
@@ -1940,7 +1983,12 @@ pub fn run(
         if restart_requested {
             audio.stop_one_shots();
             audio.reset_ambient();
+            let physics = session.movement_mode();
             session = initial_session.clone();
+            session
+                .set_movement_mode(physics)
+                .map_err(|error| format!("restart movement: {error:?}"))?;
+            graphics.physics = physics;
             minimap = minimap::Minimap::new(&session.world);
             if let Some(renderer) = &mut explosion_renderer {
                 renderer.clear();
@@ -1996,6 +2044,7 @@ pub fn run(
                             audio.stop_one_shots();
                             audio.reset_ambient();
                             session = saved.session.clone();
+                            graphics.physics = session.movement_mode();
                             minimap = saved.minimap.clone();
                             animation_tick = saved.animation_tick;
                             weapon_clock = saved.weapon_clock;
@@ -2040,7 +2089,10 @@ pub fn run(
         });
         if completed && advance_requested && !pause.open {
             sdl.mouse().set_relative_mouse_mode(false);
-            return Ok(Some(session.game.inventory.clone()));
+            return Ok(Some(LevelCarry {
+                inventory: session.game.inventory.clone(),
+                physics: session.movement_mode(),
+            }));
         }
         let simulation_started = Instant::now();
         let movement = held_movement(&held);
@@ -2058,6 +2110,9 @@ pub fn run(
                 .map(|_| crate::trail_motion::TrailSnapshot::capture(&session));
             let events = session.step(SessionInput {
                 movement,
+                running: graphics.autorun
+                    ^ (held.contains(&Scancode::LShift) || held.contains(&Scancode::RShift)),
+                jump_held: held.contains(&Scancode::Space),
                 yaw_delta,
                 pitch_delta,
                 interact: pending_interact,

@@ -898,7 +898,7 @@ impl EnemyAi {
                 let mut obstacles = Vec::with_capacity(circles.len() + objects.len() + 1);
                 obstacles.push(CollisionCircle {
                     center: target,
-                    radius: 0.18,
+                    radius: crate::world::PLAYER_RADIUS,
                 });
                 obstacles.extend(
                     circles.iter().enumerate().filter_map(|(other, circle)| {

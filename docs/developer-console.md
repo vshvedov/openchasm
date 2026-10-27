@@ -13,10 +13,10 @@ and apply only to the current client session.
 - `status` reports the current game status.
 - `restart` restarts the current level. `quit` leaves the current game (returning
   to the launcher when started there).
-- `sensitivity [value]` shows or sets mouse sensitivity in radians per pixel;
+- `sensitivity [value]` shows or sets mouse sensitivity in radians per relative count;
   accepted values are 0.0001 through 1.0.
 
-Only the commands above are implemented. Closing, pausing and input capture
+Closing, pausing and input capture
 are managed by the client; the command parser itself never mutates gameplay.
 
 The FPS counter is visible by default. `status` reports the recent wall-clock
@@ -29,7 +29,7 @@ For repeatable profiling, `OPENCHASM_PROFILE=1` prints periodic timings to stder
 `OPENCHASM_UNCAPPED=1` starts without the frame cap; normal launches remain capped.
 
 Graphics controls are available with `options`, or from the pause menu. Use
-Up/Down to select a row, Left/Right or Enter to change it, and Escape to close.
+Up/Down to select a row, Left/Right or Enter to change it, Tab to switch between Graphics and Controls, and Escape to close.
 The client saves explicit changes to `graphics.json` in SDL's per-user
 OpenChasm preference directory. A missing file uses defaults; invalid files are
 reported and ignored by the host.
@@ -58,3 +58,20 @@ per relative count at original sensitivity 1. Version-one preferences using the
 old factory `0.002` value upgrade in memory; other custom values are preserved.
 Loading preferences does not rewrite their file. The `sensitivity` command
 continues to use radians per count.
+
+The Controls page includes mouse sensitivity (a multiplier of the original
+coefficient), autorun (on by default), and Original/Quake 1 movement. Shift
+temporarily inverts autorun. These controls are saved independently of visual
+presets. The console also supports:
+
+- `autorun [on|off|1|0]` queries or sets autorun.
+- `physics [original|quake1]` queries or changes movement mode. Changing modes
+  clears horizontal momentum and retains the player position.
+
+Original mode uses verified remaster speed, acceleration, braking, gravity,
+500 μs integration and held-jump timing. Quake 1 mode uses ground friction,
+acceleration, air acceleration and jump-release behavior adapted to Chasm's
+geometry, with 64 Quake units per tile. Quake BSP stairs, slopes and water
+physics are not represented. Checkpoints include the movement mode and momentum;
+`status` shows the active mode, autorun preference and horizontal velocity.
+See [movement evidence](movement-evidence.md) for source findings and limits.

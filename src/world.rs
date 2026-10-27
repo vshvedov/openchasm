@@ -172,7 +172,7 @@ fn sub(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
     [a[0] - b[0], a[1] - b[1]]
 }
 
-const PLAYER_RADIUS: f32 = 0.18;
+pub const PLAYER_RADIUS: f32 = 0.25;
 const CONTACT_SLOP: f32 = 0.0001;
 
 fn dot(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -845,7 +845,8 @@ mod tests {
         assert_eq!(world.player.position, [0.0, 0.0]);
         world.player.position = [2.0, 0.0];
         world.step_with_external(Input::default(), 1.0 / 60.0, &[], [-2.0, 0.0]);
-        assert!(world.player.position[0] > 1.179);
+        let contact = world.walls[0].a[0] + PLAYER_RADIUS + CONTACT_SLOP;
+        assert!((world.player.position[0] - contact).abs() < 1e-5);
         world.player.position = [2.0, 0.0];
         let mut hits = Vec::new();
         world.ray_hits([-1.0, 0.0], &mut hits);
@@ -928,7 +929,8 @@ mod tests {
         w.walls[0].texture = 120;
         w.walls[0].blocks_movement = true;
         let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls, &[]);
-        assert!(end[0] < 0.83);
+        let contact = w.walls[0].a[0] - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((end[0] - contact).abs() < 1e-5);
     }
     #[test]
     fn camera_basis_and_strafe_match_original_right_at_cardinal_angles() {
@@ -970,13 +972,15 @@ mod tests {
                 1.0 / 60.0,
             );
         }
-        assert!(w.player.position[0] < 0.83 && w.player.position[0] > 0.7);
+        let contact = w.walls[0].a[0] - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((w.player.position[0] - contact).abs() < 1e-5);
     }
     #[test]
     fn swept_motion_cannot_tunnel_through_a_wall() {
         let w = test_world();
         let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &w.walls, &[]);
-        assert!(end[0] > 0.81 && end[0] < 0.821, "{end:?}");
+        let contact = 1.0 - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((end[0] - contact).abs() < 1e-5, "{end:?}");
     }
     #[test]
     fn slides_along_diagonal_wall() {
@@ -1026,7 +1030,8 @@ mod tests {
             radius: 0.2,
         };
         let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &[], &[circle]);
-        assert!((end[0] - 0.62).abs() < 0.001, "{end:?}");
+        let contact = circle.center[0] - circle.radius - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((end[0] - contact).abs() < 1e-5, "{end:?}");
     }
     #[test]
     fn sliding_around_actor_preserves_clearance() {
@@ -1035,9 +1040,31 @@ mod tests {
             radius: 0.2,
         };
         let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &[], &[circle]);
-        assert!(end[0] > 0.8 && end[1] < -0.15, "{end:?}");
+        // A single long move follows the tangent at the first disc contact.
+        // Derive that tangent from the new combined radius, rather than
+        // retaining the old smaller body's arbitrary endpoint threshold.
+        let combined = PLAYER_RADIUS + circle.radius;
+        let horizontal = (combined * combined - circle.center[1].powi(2)).sqrt();
+        let contact_x = circle.center[0] - horizontal;
+        let normal = [-horizontal / combined, -circle.center[1] / combined];
+        let remaining_x = 2.0 - contact_x;
+        let expected = [
+            contact_x - CONTACT_SLOP + remaining_x * (1.0 - normal[0] * normal[0]),
+            -remaining_x * normal[0] * normal[1],
+        ];
+        assert!(
+            (end[0] - expected[0]).abs() < 1e-5 && (end[1] - expected[1]).abs() < 1e-5,
+            "{end:?} != {expected:?}"
+        );
         let distance = (end[0] - circle.center[0]).hypot(end[1] - circle.center[1]);
         assert!(distance >= PLAYER_RADIUS + circle.radius - 1e-4, "{end:?}");
+        let mut position = [0.0, 0.0];
+        for _ in 0..60 {
+            position = move_and_slide(position, [0.05, 0.0], &[], &[circle]);
+            let clearance = (position[0] - circle.center[0]).hypot(position[1] - circle.center[1]);
+            assert!(clearance >= combined - 1e-4, "{position:?}: {clearance}");
+        }
+        assert!(position[0] > circle.center[0] + combined, "{position:?}");
     }
     #[test]
     fn nearest_wall_or_actor_blocks_regardless_of_list_order() {
@@ -1053,13 +1080,17 @@ mod tests {
             radius: 0.2,
         };
         let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &[wall], &[behind]);
-        assert!((end[0] - 0.82).abs() < 0.001, "{end:?}");
+        let wall_contact = wall.a[0] - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((end[0] - wall_contact).abs() < 1e-5, "{end:?}");
         let in_front = CollisionCircle {
             center: [0.8, 0.0],
             radius: 0.2,
         };
         let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &[wall], &[behind, in_front]);
-        assert!((end[0] - 0.42).abs() < 0.001, "{end:?}");
+        let actor_contact = in_front.center[0] - in_front.radius - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((end[0] - actor_contact).abs() < 1e-5, "{end:?}");
+        let reordered = move_and_slide([0.0, 0.0], [4.0, 0.0], &[wall], &[in_front, behind]);
+        assert_eq!(end, reordered);
     }
     #[test]
     fn actor_overlap_allows_escape_but_blocks_deeper_motion() {
@@ -1108,9 +1139,10 @@ mod tests {
         for _ in 0..60 {
             w.step_with_circles(input, 1.0 / 60.0, &[circle]);
         }
-        assert!((w.player.position[0] - 0.62).abs() < 0.001);
+        let contact = circle.center[0] - circle.radius - PLAYER_RADIUS - CONTACT_SLOP;
+        assert!((w.player.position[0] - contact).abs() < 1e-5);
         w.step(input, 1.0 / 60.0);
-        assert!(w.player.position[0] > 0.62);
+        assert!(w.player.position[0] > circle.center[0] - circle.radius - PLAYER_RADIUS);
     }
     #[test]
     fn invalid_input_does_not_corrupt_player_state() {
@@ -1160,7 +1192,8 @@ mod tests {
             delta,
             &[false, true],
         );
-        assert!(player.player.position[0] > 1.179 && player.player.position[0] < 1.181);
+        let player_contact = world.walls[0].a[0] + PLAYER_RADIUS + CONTACT_SLOP;
+        assert!((player.player.position[0] - player_contact).abs() < 1e-5);
         for texture in [87, 119, 120] {
             let mut barrier = test_world();
             barrier.walls[0].texture = texture;

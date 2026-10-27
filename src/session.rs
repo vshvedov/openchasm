@@ -15,6 +15,7 @@ use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::light_sources::{LightSourceError, LightSources};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
 use crate::motion_push::{self, EntityId, MotionProposal, MoverId, PushEntity, Translation};
+use crate::movement::{self, MovementCommand, MovementMode, MovementSnapshot, MovementState};
 use crate::object_combat::{ObjectCombat, ObjectDestructionInfo};
 use crate::object_heights::ObjectHeightCatalog;
 use crate::object_states::{ObjectAction, ObjectStates, ObjectTransition, TransitionKind};
@@ -52,6 +53,10 @@ pub const MAX_PLAYER_PITCH: f32 = std::f32::consts::FRAC_PI_2;
 #[derive(Default)]
 pub struct SessionInput {
     pub movement: Input,
+    /// Resolved run intent; autorun and modifier bindings belong to the client.
+    pub running: bool,
+    /// Held jump state for original repeated jumps and Quake release gating.
+    pub jump_held: bool,
     /// Horizontal look displacement in radians for this tick, independent of frame rate.
     pub yaw_delta: f32,
     /// Positive radians look upward; applied once per fixed tick.
@@ -364,7 +369,7 @@ fn object_platform_top(
 }
 
 fn object_touches_player(object: &ProcessObject, position: [f32; 2], extra: f32) -> bool {
-    let radius = object.blocking_radius + 0.18 + extra;
+    let radius = object.blocking_radius + crate::world::PLAYER_RADIUS + extra;
     let dx = position[0] - object.position[0];
     let dy = position[1] - object.position[1];
     radius.is_finite() && radius > 0.0 && dx * dx + dy * dy <= radius * radius
@@ -417,6 +422,7 @@ pub struct Session {
     teleports: Option<(Vec<Teleport>, TeleportState)>,
     object_heights: Option<SessionObjectHeights>,
     pub vertical: VerticalState,
+    movement: MovementState,
     pitch: f32,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
@@ -462,6 +468,8 @@ pub struct SessionSnapshot {
     pub capabilities: SessionSnapshotCapabilities,
     pub world: crate::world::WorldSnapshot,
     pub vertical: crate::vertical::VerticalSnapshot,
+    #[serde(default)]
+    pub movement: MovementSnapshot,
     #[serde(default)]
     pub pitch: f32,
     pub processes: crate::process_runtime::ProcessRuntimeSnapshot,
@@ -580,6 +588,7 @@ impl Session {
             capabilities: self.snapshot_capabilities(),
             world: self.world.snapshot(),
             vertical: self.vertical.snapshot(),
+            movement: self.movement.snapshot(),
             pitch: self.pitch,
             processes,
             actors: self
@@ -767,6 +776,20 @@ impl Session {
         candidate
             .elevation_by_cell
             .clone_from(&snapshot.elevation_by_cell);
+        // Configure the saved body without validating the baseline's old
+        // vertical pose against the snapshot's already-restored geometry.
+        let config = match snapshot.movement.mode {
+            MovementMode::Original => {
+                movement::original_vertical_config(candidate.vertical.config())
+            }
+            MovementMode::Quake1 => movement::quake_vertical_config(candidate.vertical.config()),
+        };
+        candidate.vertical = VerticalState::with_config(snapshot.vertical.feet, config)
+            .map_err(|_| SessionSnapshotError::Component("movement configuration"))?;
+        candidate
+            .movement
+            .restore(snapshot.movement)
+            .map_err(|_| SessionSnapshotError::Component("movement"))?;
         candidate
             .vertical
             .restore(
@@ -1031,7 +1054,7 @@ impl Session {
                 return Err(SessionSnapshotError::Inconsistent("removed process object"));
             }
         }
-        let needed = (candidate.vertical.head() * 64.0).max(80.0);
+        let needed = candidate.vertical.head() * 64.0;
         for ((wall, original), elevation) in candidate
             .world
             .walls
@@ -1075,6 +1098,7 @@ impl Session {
             teleports: None,
             object_heights: None,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
+            movement: MovementState::default(),
             pitch: 0.0,
             processes: setup.processes,
             actors: setup.actors,
@@ -1197,6 +1221,34 @@ impl Session {
         }
         self.wall_materials = Some(catalog);
         true
+    }
+    pub fn movement_mode(&self) -> MovementMode {
+        self.movement.mode()
+    }
+    pub fn movement_velocity(&self) -> [f32; 2] {
+        self.movement.velocity()
+    }
+    /// A mode change clears horizontal momentum while retaining current feet
+    /// and valid vertical motion. Mode is authoritative and saved with momentum.
+    pub fn set_movement_mode(
+        &mut self,
+        mode: MovementMode,
+    ) -> Result<(), crate::vertical::VerticalSnapshotError> {
+        if self.movement.mode() == mode {
+            return Ok(());
+        }
+        let config = match mode {
+            MovementMode::Original => movement::original_vertical_config(self.vertical.config()),
+            MovementMode::Quake1 => movement::quake_vertical_config(self.vertical.config()),
+        };
+        let mut state = self.vertical.snapshot();
+        state.velocity = state.velocity.clamp(-config.max_speed, config.max_speed);
+        let mut vertical = VerticalState::with_config(state.feet, config)
+            .map_err(|_| crate::vertical::VerticalSnapshotError::InvalidValue)?;
+        vertical.restore(state, self.player_bounds())?;
+        self.vertical = vertical;
+        self.movement.set_mode(mode);
+        Ok(())
     }
     /// Committed Z velocity, independent of horizontal speed even at view poles.
     pub fn projectile_vertical_velocity(&self, id: u64) -> Option<f32> {
@@ -1694,7 +1746,7 @@ impl Session {
                 .wall_materials
                 .as_ref()
                 .ok_or((ProcessOutcome::Unsupported, true))?;
-            let needed = (self.vertical.head() * 64.0).max(80.0);
+            let needed = self.vertical.head() * 64.0;
             let clear = |wall: &crate::world::Wall, position: [f32; 2], radius: f32| {
                 if !position.iter().all(|v| v.is_finite()) || !radius.is_finite() {
                     return false;
@@ -1721,7 +1773,7 @@ impl Session {
                         blocks && self.wall_elevations.get(index).is_some_and(|e| *e < needed)
                     },
                     |_, wall| {
-                        clear(wall, player, 0.18)
+                        clear(wall, player, crate::world::PLAYER_RADIUS)
                             && actor_circles.iter().all(|(p, r)| clear(wall, *p, *r))
                     },
                 )
@@ -1738,7 +1790,7 @@ impl Session {
             |_, position, radius| {
                 let distance = |p: [f32; 2]| (p[0] - position[0]).hypot(p[1] - position[1]);
                 player.iter().all(|v| v.is_finite())
-                    && distance(player) >= radius + 0.18
+                    && distance(player) >= radius + crate::world::PLAYER_RADIUS
                     && actor_circles
                         .iter()
                         .all(|(p, r)| p.iter().all(|v| v.is_finite()) && distance(*p) >= radius + r)
@@ -2035,7 +2087,7 @@ impl Session {
             id: TargetId::Player,
             cylinder: Cylinder {
                 center: self.world.player.position,
-                radius: 0.18,
+                radius: crate::world::PLAYER_RADIUS,
                 bottom: self.vertical.feet(),
                 top: self.vertical.head(),
             },
@@ -2213,7 +2265,7 @@ impl Session {
             triggers.push(MineTrigger {
                 id: TargetId::Player,
                 position: self.world.player.position,
-                radius: 0.18,
+                radius: crate::world::PLAYER_RADIUS,
             });
         }
         triggers.extend(self.actors.actors.iter().filter_map(|actor| {
@@ -2339,14 +2391,14 @@ impl Session {
             };
             let dx = p[0] - (wall.a[0] + d[0] * t);
             let dy = p[1] - (wall.a[1] + d[1] * t);
-            if dx * dx + dy * dy < 0.18 * 0.18 {
+            if dx * dx + dy * dy < crate::world::PLAYER_RADIUS * crate::world::PLAYER_RADIUS {
                 bounds.ceiling = Some(offset);
             }
         }
         bounds
     }
     fn sync_wall_blocking(&mut self) {
-        let needed = (self.vertical.head() * 64.0).max(80.0);
+        let needed = self.vertical.head() * 64.0;
         for (i, wall) in self.world.walls.iter_mut().enumerate() {
             wall.blocks_movement = self.base_wall_blocking.get(i).copied().unwrap_or(false)
                 && self.wall_elevations.get(i).copied().unwrap_or(0.0) < needed;
@@ -2412,7 +2464,7 @@ impl Session {
         let mut entities = vec![PushEntity {
             id: EntityId::Player,
             position: self.world.player.position,
-            radius: 0.18,
+            radius: crate::world::PLAYER_RADIUS,
             vertical: [self.vertical.feet(), self.vertical.head()],
         }];
         let mut actor_indices = BTreeMap::new();
@@ -2612,6 +2664,147 @@ impl Session {
         self.game.inventory.health = self.game.inventory.health.saturating_sub(damage);
         damage
     }
+    fn movement_bounds(&self, vertical: crate::vertical::VerticalSnapshot) -> VerticalBounds {
+        let bounds = self.player_bounds_at(vertical.feet);
+        if bounds
+            .ceiling
+            .is_some_and(|ceiling| ceiling - bounds.floor < self.vertical.config().body_height)
+        {
+            // A moving wall may temporarily crush the current body volume.
+            // Keep its last elevation while allowing a horizontal escape;
+            // process crushing remains responsible for the overlap damage.
+            VerticalBounds {
+                floor: vertical.feet,
+                ceiling: Some(vertical.feet + self.vertical.config().body_height),
+            }
+        } else {
+            bounds
+        }
+    }
+    fn fill_player_obstacles(&self, actors: &[CollisionCircle], output: &mut Vec<CollisionCircle>) {
+        output.clear();
+        output.extend_from_slice(actors);
+        output.extend(
+            self.processes
+                .objects()
+                .filter(|object| {
+                    if object_platform_top(
+                        self.object_heights.as_ref(),
+                        self.scripted_objects.as_ref(),
+                        &self.processes,
+                        object,
+                        self.vertical.config().body_height,
+                    )
+                    .is_some_and(|top| self.vertical.feet() >= top - 1e-5)
+                    {
+                        return false;
+                    }
+                    object_blocks_height(
+                        self.object_heights.as_ref(),
+                        &self.processes,
+                        object,
+                        self.vertical.feet(),
+                        self.vertical.head(),
+                        self.vertical.head(),
+                    )
+                })
+                .map(|object| CollisionCircle {
+                    center: object.position,
+                    radius: object.blocking_radius,
+                }),
+        );
+    }
+    fn original_player_step(
+        &mut self,
+        command: MovementCommand,
+        actors: &[CollisionCircle],
+    ) -> crate::vertical::VerticalEvents {
+        let previous_position = self.world.player.position;
+        let previous_vertical = self.vertical;
+        let mut movement = self.movement;
+        let mut obstacles = Vec::new();
+        let mut contact_bounds = self.movement_bounds(self.vertical.snapshot());
+        let result = movement.step_original_with_contacts(
+            command,
+            self.world.player.angle,
+            self.vertical.snapshot(),
+            contact_bounds,
+            self.vertical.config().body_height,
+            |displacement, velocity, proposed_vertical| {
+                let wind = self
+                    .wind
+                    .displacement(self.world.player.position, 0.0005)
+                    .unwrap_or([0.0; 2]);
+                let displacement = [displacement[0] + wind[0], displacement[1] + wind[1]];
+                // Static geometry and support cannot change between substeps
+                // when the player and its vertical state remain unchanged.
+                if displacement == [0.0; 2] && proposed_vertical == self.vertical.snapshot() {
+                    return movement::OriginalContact {
+                        velocity,
+                        vertical: proposed_vertical,
+                        bounds: contact_bounds,
+                    };
+                }
+                if self
+                    .vertical
+                    .restore(proposed_vertical, contact_bounds)
+                    .is_err()
+                {
+                    return movement::OriginalContact {
+                        velocity: [f32::NAN; 2],
+                        vertical: proposed_vertical,
+                        bounds: contact_bounds,
+                    };
+                }
+                self.sync_wall_blocking();
+                self.fill_player_obstacles(actors, &mut obstacles);
+                let mask = (self.wall_collision_mode == WallCollisionMode::AuthoredSides)
+                    .then(|| self.processes.static_wall_mask());
+                let (position, velocity) = self.world.move_circle_with_velocity(
+                    self.world.player.position,
+                    displacement,
+                    velocity,
+                    crate::world::PLAYER_RADIUS,
+                    &obstacles,
+                    mask,
+                );
+                self.world.player.position = position;
+                contact_bounds = self.movement_bounds(proposed_vertical);
+                movement::OriginalContact {
+                    velocity,
+                    vertical: proposed_vertical,
+                    bounds: contact_bounds,
+                }
+            },
+        );
+        if let Ok(step) = result {
+            let bounds = self.movement_bounds(step.vertical);
+            if self.vertical.restore(step.vertical, bounds).is_ok() {
+                self.movement = movement;
+                self.sync_wall_blocking();
+                return step.events;
+            }
+        }
+        self.world.player.position = previous_position;
+        self.vertical = previous_vertical;
+        self.sync_wall_blocking();
+        crate::vertical::VerticalEvents::default()
+    }
+    fn at_quake_dropoff(&self) -> bool {
+        let velocity = self.movement.velocity();
+        let speed = velocity[0].hypot(velocity[1]);
+        if speed <= 0.0 {
+            return false;
+        }
+        let position = [
+            self.world.player.position[0] + velocity[0] / speed * 0.25,
+            self.world.player.position[1] + velocity[1] / speed * 0.25,
+        ];
+        self.player_bounds_at_position(position, self.vertical.feet())
+            .floor
+            < self.vertical.feet() - 34.0 / 64.0
+    }
+
     /// Advance exactly one 60 Hz simulation tick, returning presentation events.
     pub fn step(&mut self, input: SessionInput) -> SessionEvents {
         const DT: f32 = 1.0 / 60.0;
@@ -2643,11 +2836,10 @@ impl Session {
             self.selected_weapon = index;
         }
         // Process look as simulation input so a future server can own the view
-        // direction. Discard non-finite values and bound a single tick's turn.
+        // direction. Discard non-finite values; preserve complete relative
+        // motion even when a slow render frame accumulates more than half a turn.
         if input.yaw_delta.is_finite() && self.world.player.angle.is_finite() {
-            let delta = input
-                .yaw_delta
-                .clamp(-std::f32::consts::PI, std::f32::consts::PI);
+            let delta = input.yaw_delta % std::f32::consts::TAU;
             self.world.player.angle =
                 (self.world.player.angle + delta).rem_euclid(std::f32::consts::TAU);
         }
@@ -2658,16 +2850,48 @@ impl Session {
                     .clamp(-MAX_PLAYER_PITCH * 2.0, MAX_PLAYER_PITCH * 2.0))
             .clamp(-MAX_PLAYER_PITCH, MAX_PLAYER_PITCH);
         }
-        let bounds = self.player_bounds();
-        // A closing wall can temporarily leave insufficient clearance; retain
-        // the last valid vertical state until the player can move clear.
-        events.vertical = self
-            .vertical
-            .step(DT, input.jump, bounds)
-            .unwrap_or_default();
+        // Keyboard turning is independent of the chosen translational style.
+        if input.movement.turn.is_finite() {
+            self.world.player.angle = (self.world.player.angle
+                + input.movement.turn.clamp(-1.0, 1.0) * 3.0 * DT)
+                .rem_euclid(std::f32::consts::TAU);
+        }
+        let command = MovementCommand {
+            forward: input.movement.forward,
+            strafe: input.movement.strafe,
+            running: input.running,
+            jump_held: input.jump_held || input.jump,
+        };
+        let quake_step = if self.movement.mode() == MovementMode::Quake1 {
+            let step = self
+                .movement
+                .step_quake(
+                    command,
+                    self.world.player.angle,
+                    self.vertical.grounded(),
+                    self.at_quake_dropoff(),
+                )
+                .ok();
+            if let Some(step) = step {
+                let bounds = self.movement_bounds(self.vertical.snapshot());
+                if let Ok((vertical, vertical_events)) = movement::quake_vertical_step(
+                    self.vertical.snapshot(),
+                    bounds,
+                    self.vertical.config().body_height,
+                    step.jump,
+                ) {
+                    if self.vertical.restore(vertical, bounds).is_ok() {
+                        events.vertical = vertical_events;
+                    }
+                }
+            }
+            step
+        } else {
+            None
+        };
         self.sync_wall_blocking();
         // Actors currently use a provisional full-room vertical extent.
-        let mut circles: Vec<_> = self
+        let circles: Vec<_> = self
             .actors
             .actors
             .iter()
@@ -2686,6 +2910,20 @@ impl Session {
             .wind
             .displacement(self.world.player.position, DT)
             .unwrap_or([0.0, 0.0]);
+        let intended = if let Some(step) = quake_step {
+            step.displacement
+        } else {
+            let mut probe_movement = self.movement;
+            probe_movement
+                .step_original(
+                    command,
+                    self.world.player.angle,
+                    self.vertical.snapshot(),
+                    self.movement_bounds(self.vertical.snapshot()),
+                    self.vertical.config().body_height,
+                )
+                .map_or([0.0; 2], |step| step.displacement)
+        };
         // Test the actual attempted move with the candidate platform removed;
         // walls and all other objects still constrain the probe. Pull only if
         // the player can reach its side and the complete body fits above it.
@@ -2725,21 +2963,21 @@ impl Session {
                     });
                 }
             }
-            let mut probe = self.world.clone();
-            if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
-                probe.step_with_external_static_sides(
-                    input.movement,
-                    DT,
-                    &blockers,
-                    displacement,
-                    self.processes.static_wall_mask(),
-                );
-            } else {
-                probe.step_with_external(input.movement, DT, &blockers, displacement);
-            }
             let p = self.world.player.position;
+            let probe_delta = [intended[0] + displacement[0], intended[1] + displacement[1]];
+            let q = if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
+                self.world.move_circle_with_static_sides(
+                    p,
+                    probe_delta,
+                    crate::world::PLAYER_RADIUS,
+                    &blockers,
+                    self.processes.static_wall_mask(),
+                )
+            } else {
+                self.world
+                    .move_circle(p, probe_delta, crate::world::PLAYER_RADIUS, &blockers)
+            };
             let old = (p[0] - object.position[0]).hypot(p[1] - object.position[1]);
-            let q = probe.player.position;
             let new = (q[0] - object.position[0]).hypot(q[1] - object.position[1]);
             if new >= old || !object_touches_player(object, q, 0.0) {
                 continue;
@@ -2764,49 +3002,53 @@ impl Session {
                 break;
             }
         }
-        // Only opt-in, live, represented objects have a process-owned pose.
-        // Radii are provisional circles; optional mesh heights filter
-        // vertically separated objects, with conservative unknown fallback.
-        circles.extend(
-            self.processes
-                .objects()
-                .filter(|object| {
-                    if object_platform_top(
-                        self.object_heights.as_ref(),
-                        self.scripted_objects.as_ref(),
-                        &self.processes,
-                        object,
-                        self.vertical.config().body_height,
-                    )
-                    .is_some_and(|top| self.vertical.feet() >= top - 1e-5)
-                    {
-                        return false;
-                    }
-                    object_blocks_height(
-                        self.object_heights.as_ref(),
-                        &self.processes,
-                        object,
-                        self.vertical.feet(),
-                        self.vertical.head(),
-                        self.vertical.head(),
-                    )
-                })
-                .map(|object| crate::world::CollisionCircle {
-                    center: object.position,
-                    radius: object.blocking_radius,
-                }),
-        );
-        if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
-            self.world.step_with_external_static_sides(
-                input.movement,
-                DT,
-                &circles,
-                displacement,
-                self.processes.static_wall_mask(),
+        if self.movement.mode() == MovementMode::Original {
+            events.vertical = self.original_player_step(command, &circles);
+        } else if let Some(step) = quake_step {
+            let mut obstacles = Vec::new();
+            self.fill_player_obstacles(&circles, &mut obstacles);
+            let delta = [
+                step.displacement[0] + displacement[0],
+                step.displacement[1] + displacement[1],
+            ];
+            let mask = (self.wall_collision_mode == WallCollisionMode::AuthoredSides)
+                .then(|| self.processes.static_wall_mask());
+            let (position, velocity) = self.world.move_circle_with_velocity(
+                self.world.player.position,
+                delta,
+                self.movement.velocity(),
+                crate::world::PLAYER_RADIUS,
+                &obstacles,
+                mask,
             );
-        } else {
-            self.world
-                .step_with_external(input.movement, DT, &circles, displacement);
+            let previous_position = self.world.player.position;
+            self.world.player.position = position;
+            // Support must describe the destination on this same tick. In
+            // particular, walking off a model platform enters air immediately,
+            // before the next command chooses ground friction or jump rules.
+            let bounds = self.movement_bounds(self.vertical.snapshot());
+            let mut vertical = self.vertical.snapshot();
+            if let Some(ceiling) = bounds.ceiling {
+                if vertical.feet + self.vertical.config().body_height > ceiling {
+                    vertical.feet = ceiling - self.vertical.config().body_height;
+                    vertical.velocity = vertical.velocity.min(0.0);
+                    events.vertical.hit_ceiling = true;
+                }
+            }
+            if vertical.feet <= bounds.floor {
+                events.vertical.landed |= !vertical.grounded;
+                vertical.feet = bounds.floor;
+                vertical.velocity = 0.0;
+                vertical.grounded = true;
+            } else {
+                vertical.grounded = false;
+            }
+            if self.vertical.restore(vertical, bounds).is_ok() {
+                let _ = self.movement.commit_collision_velocity(velocity);
+                self.sync_wall_blocking();
+            } else {
+                self.world.player.position = previous_position;
+            }
         }
         // Move live actors in stable order using the same tick-start field.
         // Rebuild obstacles after each move, so subsequent actors see new positions.
@@ -2830,7 +3072,7 @@ impl Session {
             }
             let mut obstacles = vec![CollisionCircle {
                 center: self.world.player.position,
-                radius: 0.18,
+                radius: crate::world::PLAYER_RADIUS,
             }];
             obstacles.extend(self.actors.actors.iter().enumerate().filter_map(
                 |(other_index, other)| {
@@ -2910,7 +3152,7 @@ impl Session {
             let elevations = &self.wall_elevations;
             let mut destination_floor = 0.0_f32;
             let outcome = state.tick(definitions, world.player.position, |destination| {
-                const RADIUS: f32 = 0.18;
+                const RADIUS: f32 = crate::world::PLAYER_RADIUS;
                 for object in self.processes.objects() {
                     if object_touches_player(object, destination, 0.0) {
                         if let Some(top) = object_platform_top(
@@ -2962,7 +3204,7 @@ impl Session {
                     && world.disc_is_clear(destination, RADIUS, &obstacles, |index, _| {
                         base.get(index).copied().unwrap_or(true)
                             && elevations.get(index).copied().unwrap_or(0.0)
-                                < (destination_head * 64.0).max(80.0)
+                                < (destination_head * 64.0)
                     })
             });
             match outcome {
@@ -6367,7 +6609,7 @@ mod tests {
         for _ in 0..20 {
             assert!(session.step(SessionInput::default()).wind_errors.is_empty());
         }
-        assert!(session.world.player.position[0] > 0.8);
+        assert!(session.world.player.position[0] > 0.74);
         assert!(session.world.player.position[0] <= 0.8201);
     }
 
@@ -6514,7 +6756,7 @@ mod tests {
     }
 
     #[test]
-    fn look_input_is_finite_bounded_and_applied_before_movement() {
+    fn look_input_preserves_full_relative_turns_and_applies_before_movement() {
         let mut session = mission_session("");
         session.step(SessionInput {
             yaw_delta: std::f32::consts::FRAC_PI_2,
@@ -6533,10 +6775,16 @@ mod tests {
         });
         assert_eq!(session.world.player.angle, angle);
         session.step(SessionInput {
-            yaw_delta: 100_000.0,
+            yaw_delta: std::f32::consts::TAU * 2.0 + 0.25,
             ..Default::default()
         });
-        assert!((session.world.player.angle - (angle + std::f32::consts::PI)).abs() < 1e-6);
+        assert!((session.world.player.angle - (angle + 0.25)).abs() < 1e-6);
+        session.step(SessionInput {
+            yaw_delta: f32::MAX,
+            ..Default::default()
+        });
+        assert!(session.world.player.angle.is_finite());
+        assert!((0.0..std::f32::consts::TAU).contains(&session.world.player.angle));
     }
 
     #[test]
@@ -6871,7 +7119,10 @@ mod tests {
                 ..Default::default()
             });
         }
-        assert!((session.world.player.position[0] - (1.5 - 0.3 - 0.18)).abs() < 0.002);
+        assert!(
+            (session.world.player.position[0] - (1.5 - 0.3 - crate::world::PLAYER_RADIUS)).abs()
+                < 0.002
+        );
         assert!(session.processes.remove_object([1, 0]));
         for _ in 0..40 {
             session.step(SessionInput {
@@ -6934,7 +7185,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        assert!((session.world.player.position[0] - 1.02).abs() < 0.002);
+        assert!((session.world.player.position[0] - 0.95).abs() < 0.002);
     }
     #[test]
     fn player_can_escape_initial_wall_and_object_overlap() {
@@ -7015,8 +7266,8 @@ mod tests {
             cell: Some([1, 0]),
         });
         session.base_wall_blocking.push(true);
-        session.wall_elevations.push(80.0);
-        session.elevation_by_cell[64] = 80.0;
+        session.wall_elevations.push(62.0);
+        session.elevation_by_cell[64] = 62.0;
         let first = session.step(SessionInput {
             jump: true,
             ..Default::default()
@@ -7026,7 +7277,7 @@ mod tests {
         for _ in 0..100 {
             let event = session.step(SessionInput::default());
             hit |= event.vertical.hit_ceiling;
-            assert!(session.vertical.head() <= 1.25 + 1e-5);
+            assert!(session.vertical.head() <= 62.0 / 64.0 + 1e-5);
         }
         assert!(hit);
         assert!(session.vertical.grounded());
@@ -8959,7 +9210,7 @@ mod tests {
         assert!(overhead.actors.actors[0].position[0] > 1.6);
     }
     #[test]
-    fn enemy_sight_uses_raised_wall_height_without_changing_movement_collision() {
+    fn enemy_sight_and_player_clearance_use_distinct_heights_under_raised_walls() {
         use crate::world::Wall;
         let mut session = mission_session("");
         session.world.player.position = [3.0, 0.5];
@@ -9003,11 +9254,19 @@ mod tests {
         let mut raised = session.clone();
         raised.wall_elevations[0] = 64.0;
         raised.elevation_by_cell[64] = 64.0;
+        let mut lower = raised.clone();
+        lower.wall_elevations[0] = 61.0;
+        lower.elevation_by_cell[64] = 61.0;
+        lower.step(SessionInput::default());
         session.step(SessionInput::default());
         raised.step(SessionInput::default());
         assert_eq!(session.ai.mode(7), Some(Mode::Idle));
         assert_eq!(raised.ai.mode(7), Some(Mode::Chasing));
-        assert!(raised.world.walls[0].blocks_movement);
+        assert!(!raised.world.walls[0].blocks_movement);
+        // 61/64 clears the .9375 player body but not the provisional
+        // one-tile-high enemy sight ray. Both use the same wall elevation.
+        assert_eq!(lower.ai.mode(7), Some(Mode::Idle));
+        assert!(!lower.world.walls[0].blocks_movement);
     }
     #[test]
     fn armor_absorbs_full_hit_and_uses_quarter_health_rounding() {

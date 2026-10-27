@@ -360,7 +360,7 @@ fn parse_options(
 }
 
 /// Increment whenever simulation rules or startup interpretation changes.
-const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v9";
+const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v10";
 
 fn finish_level_fingerprint(
     mut trace: content::ResourceTrace,
@@ -470,6 +470,7 @@ fn play(
     mut id: String,
 ) -> Result<(), Box<dyn Error>> {
     let mut carry: Option<openchasm::inventory::Inventory> = None;
+    let mut carry_physics = None;
     let info = resources.read("chasm.inf")?;
     loop {
         let tracing = resources.begin_trace().is_ok();
@@ -724,6 +725,7 @@ fn play(
             planes,
             object_scene,
             viewer::ClientFeedback {
+                movement_override: carry_physics,
                 hud,
                 map,
                 session,
@@ -740,8 +742,9 @@ fn play(
             },
             &format!("{id}: {name} ({difficulty:?})"),
         )?;
-        if let (Some(inventory), Some(next)) = (next_level, next_campaign_level(&id)) {
-            carry = Some(inventory);
+        if let (Some(completed), Some(next)) = (next_level, next_campaign_level(&id)) {
+            carry = Some(completed.inventory);
+            carry_physics = Some(completed.physics);
             id = next;
         } else {
             break;

@@ -101,3 +101,18 @@ Keyboard turning is separate: camera update `0x1400237fc`–`0x140023820` divide
 A faithful baseline should use the verified autorun inversion, mouse coefficient, normalized direction, target speed, capped vector approach, gravity/jump timing, and velocity clipping. A Quake 1 option is a separate user-requested movement model and should remain explicitly selectable. Its constants and unit mapping must not replace or be attributed to the original formulas above.
 
 Useful focused checks are: axial versus diagonal equal speed; run/walk ratio; both autorun states with Shift; stop/reverse acceleration; equal approach while airborne; preservation of wall tangent velocity; fixed-step residual carry; gravity-before-displacement; held jump after landing/cooldown; and yaw response to a known relative-count total. These verify the implemented mathematical behavior, not complete replay equivalence with the original. Full 1:1 collision, moving platforms, stance/head-bob, input-backend physical sensitivity, and rendered input latency still require further tracing or controlled comparison.
+
+The implemented Session now selects Original by default and offers Quake 1
+separately. Save data retains mode, velocity, jump latch/cooldown and substep
+carry; switching modes intentionally clears horizontal velocity. Relative
+yaw inputs retain their complete angular displacement rather than dropping
+motion above half a turn in one simulation tick. The software renderer still
+uses an approximate horizon shift at extreme pitch.
+
+Public session tests cover run/walk distances and acceleration, diagonal speed,
+braking, held-jump differences, airborne momentum, destination support after
+leaving platforms, fresh-baseline save continuation and raised-door clearance.
+Native Linux checks exercised the Controls page, console mode changes, saved
+preferences, running and quickload mode restoration. These establish working
+controls and the specified mathematical laws, not complete original-engine
+physics equivalence or physical mouse-device calibration.

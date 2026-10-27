@@ -1,23 +1,29 @@
-//! Independent player vertical motion, using provisional reconstruction values.
+//! Independent vertical state with verified remaster default constants.
 //!
 //! Units are map tiles and seconds. The session supplies the relevant floor
 //! and ceiling planes; horizontal collision, platform selection, moving-wall
-//! crushing, and input bindings are separate responsibilities.
+//! crushing, and input bindings are separate responsibilities. `step` retains
+//! the generic trapezoidal integrator; Session's normal movement uses the
+//! separately reconstructed 500-microsecond integrator in `movement`.
 use std::error::Error;
 use std::fmt;
 
 const MAX_SUBSTEP: f32 = 1.0 / 120.0;
 const MAX_DELTA: f32 = 1.0;
 const GROUND_EPSILON: f32 = 0.00001;
+// Maximum permitted step height remains provisional; only the rise speed is
+// established by the original post-collision stepping calculation.
 const PLATFORM_PULL_DISTANCE: f32 = 0.4;
-const PLATFORM_PULL_SPEED: f32 = 2.5;
+const PLATFORM_PULL_SPEED: f32 = 3.0;
 
-/// Values based on the published PanzerChasm reconstruction. They are not
-/// calibrated against this installation; the reference marks jump speed TODO.
+/// Defaults follow the installed remaster's normal player at scale one;
+/// see docs/movement-evidence.md. Alternate movement modes can override forces
+/// without changing the independently represented body and eye dimensions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VerticalConfig {
     pub gravity: f32,
     pub jump_speed: f32,
+    /// Optional vertical speed bound; the default introduces no terminal cap.
     pub max_speed: f32,
     pub body_height: f32,
     pub eye_height: f32,
@@ -25,10 +31,10 @@ pub struct VerticalConfig {
 impl Default for VerticalConfig {
     fn default() -> Self {
         Self {
-            gravity: 9.8,
-            jump_speed: 2.9,
-            max_speed: 5.0,
-            body_height: 0.9,
+            gravity: 8.7,
+            jump_speed: 2.75,
+            max_speed: f32::MAX,
+            body_height: 0.9375,
             eye_height: 0.75,
         }
     }
@@ -229,7 +235,9 @@ impl VerticalState {
         true
     }
 
-    /// Advance by a simulation delta, subdividing to handle ceiling/floor hits.
+    /// Generic trapezoidal integration with bounded substeps for plane hits.
+    /// This convenience API does not implement the remaster's 500 μs timing,
+    /// held-jump cooldown or low-clearance jump; Session uses `movement` for it.
     /// `jump_pressed` is a press edge, not a held input. An airborne press is
     /// ignored; no buffering or automatic repeat is applied. Bounds must be
     /// the planes at the player's current horizontal position. If the player
@@ -330,7 +338,7 @@ mod tests {
         assert!(!state.pull_up(0.7, Some(1.5), 1.0 / 60.0));
         let before = state.feet();
         assert!(state.pull_up(0.7, Some(2.0), 1.0 / 60.0));
-        assert!((state.feet() - before - 2.5 / 60.0).abs() < 1e-5);
+        assert!((state.feet() - before - 3.0 / 60.0).abs() < 1e-5);
         for _ in 0..20 {
             state.pull_up(0.7, Some(2.0), 1.0 / 60.0);
         }
@@ -368,6 +376,60 @@ mod tests {
         assert_eq!(restored, before);
     }
     #[test]
+    fn default_has_verified_dimensions_and_accepts_finite_unclamped_fall_speed() {
+        let mut state = VerticalState::new(0.0).unwrap();
+        assert_eq!(state.head(), 0.9375);
+        assert_eq!(state.eye(), 0.75);
+        assert_eq!(state.config().gravity, 8.7);
+        assert_eq!(state.config().jump_speed, 2.75);
+        assert_eq!(state.config().max_speed, f32::MAX);
+        let bounds = VerticalBounds {
+            floor: 0.0,
+            ceiling: None,
+        };
+        let falling = VerticalSnapshot {
+            feet: 100.0,
+            velocity: -100.0,
+            grounded: false,
+        };
+        state.restore(falling, bounds).unwrap();
+        state.step(1.0 / 60.0, false, bounds).unwrap();
+        assert!(state.velocity() < -100.0);
+        let before = state;
+        for velocity in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            assert_eq!(
+                state.restore(
+                    VerticalSnapshot {
+                        velocity,
+                        ..falling
+                    },
+                    bounds
+                ),
+                Err(VerticalSnapshotError::InvalidValue)
+            );
+            assert_eq!(state, before);
+        }
+        for feet in [-0.01, 4097.0, f32::INFINITY, f32::NAN] {
+            assert!(state
+                .restore(VerticalSnapshot { feet, ..falling }, bounds)
+                .is_err());
+            assert_eq!(state, before);
+        }
+        // A caller-selected capped mode still gets its requested validation.
+        let mut capped = VerticalState::with_config(
+            0.0,
+            VerticalConfig {
+                max_speed: 5.0,
+                ..VerticalConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            capped.restore(falling, bounds),
+            Err(VerticalSnapshotError::InvalidValue)
+        );
+    }
+    #[test]
     fn restore_accepts_state_held_during_insufficient_ceiling_clearance() {
         let mut source = VerticalState::new(0.0).unwrap();
         let blocked = VerticalBounds {
@@ -394,7 +456,7 @@ mod tests {
         let airborne = source.snapshot();
         let low = VerticalBounds {
             floor: 0.0,
-            ceiling: Some(0.9),
+            ceiling: Some(0.9375),
         };
         assert!(airborne.feet + source.config().body_height > low.ceiling.unwrap());
         restored.restore(airborne, low).unwrap();
@@ -413,7 +475,7 @@ mod tests {
         assert_eq!(restored, prior);
     }
     #[test]
-    fn jump_rises_then_lands_with_reference_scale_and_camera_height() {
+    fn generic_jump_arc_uses_verified_default_forces_and_camera_height() {
         let mut player = VerticalState::new(0.0).unwrap();
         assert_eq!(player.eye(), 0.75);
         assert!(
@@ -432,7 +494,7 @@ mod tests {
             landed |= event.landed;
         }
         assert!(
-            (max_height - (2.9f32 * 2.9 / (2.0 * 9.8))).abs() < 0.01,
+            (max_height - (2.75f32 * 2.75 / (2.0 * 8.7))).abs() < 0.01,
             "{max_height}"
         );
         assert!(landed && player.grounded());

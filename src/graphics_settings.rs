@@ -1,7 +1,8 @@
-//! Validated client graphics settings and keyboard options menu.
+//! Validated client graphics/control preferences and keyboard options menu.
 use crate::color_pipeline::ColorSettings;
 use crate::ui::UiPixel;
 use font8x8::{UnicodeFonts, BASIC_FONTS};
+use openchasm::movement::MovementMode;
 use sdl2::{event::Event, keyboard::Keycode};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,10 +13,14 @@ use std::{
 };
 
 const MAX_BYTES: u64 = 16 * 1024;
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 3;
 /// Verified original mouse scale at sensitivity 1, in radians per relative count.
 pub const DEFAULT_MOUSE_SENSITIVITY: f32 = std::f32::consts::PI / 1024.0;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+fn default_autorun() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +67,11 @@ pub struct GraphicsSettings {
     /// Zero means uncapped.
     pub max_fps: u32,
     pub sensitivity: f32,
+    /// Shift temporarily inverts this saved preference.
+    #[serde(default = "default_autorun")]
+    pub autorun: bool,
+    #[serde(default)]
+    pub physics: MovementMode,
 }
 impl Default for GraphicsSettings {
     fn default() -> Self {
@@ -77,6 +87,8 @@ impl Default for GraphicsSettings {
             show_help: false,
             max_fps: 60,
             sensitivity: DEFAULT_MOUSE_SENSITIVITY,
+            autorun: true,
+            physics: MovementMode::Original,
         }
     }
 }
@@ -166,6 +178,8 @@ impl SettingsStore {
             if settings.sensitivity == 0.002 {
                 settings.sensitivity = DEFAULT_MOUSE_SENSITIVITY;
             }
+        }
+        if matches!(settings.version, 1 | 2) {
             settings.version = SETTINGS_VERSION;
         }
         settings
@@ -240,6 +254,7 @@ pub enum MenuAction {
 pub struct GraphicsMenu {
     open: bool,
     selected: usize,
+    controls: bool,
 }
 impl GraphicsMenu {
     pub fn open(&mut self) {
@@ -264,45 +279,71 @@ impl GraphicsMenu {
             return MenuAction::None;
         };
         match *key {
+            Keycode::Tab => {
+                self.controls = !self.controls;
+                self.selected = 0;
+                MenuAction::None
+            }
             Keycode::Escape => {
                 self.close();
                 MenuAction::Closed
             }
             Keycode::Up => {
-                self.selected = (self.selected + 7) % 8;
+                let rows = if self.controls { 3 } else { 8 };
+                self.selected = (self.selected + rows - 1) % rows;
                 MenuAction::None
             }
             Keycode::Down => {
-                self.selected = (self.selected + 1) % 8;
+                self.selected = (self.selected + 1) % if self.controls { 3 } else { 8 };
                 MenuAction::None
             }
             Keycode::Left | Keycode::Right | Keycode::Return | Keycode::KpEnter => {
                 let step = if *key == Keycode::Left { -1 } else { 1 };
                 let old = settings.clone();
-                match self.selected {
-                    0 => settings.set_preset(settings.preset.shifted(step)),
-                    1 => settings.tone_mapping = !settings.tone_mapping,
-                    2 => settings.gamma = (settings.gamma + step as f32 * 0.1).clamp(0.05, 16.0),
-                    3 => {
-                        settings.brightness =
-                            (settings.brightness + step as f32 * 0.1).clamp(0.0, 16.0)
+                if self.controls {
+                    match self.selected {
+                        0 => {
+                            settings.sensitivity = (settings.sensitivity
+                                + step as f32 * 0.1 * DEFAULT_MOUSE_SENSITIVITY)
+                                .clamp(0.0001, 1.0)
+                        }
+                        1 => settings.autorun = !settings.autorun,
+                        2 => {
+                            settings.physics = match settings.physics {
+                                MovementMode::Original => MovementMode::Quake1,
+                                MovementMode::Quake1 => MovementMode::Original,
+                            }
+                        }
+                        _ => unreachable!(),
                     }
-                    4 => {
-                        settings.saturation =
-                            (settings.saturation + step as f32 * 0.1).clamp(0.0, 16.0)
+                } else {
+                    match self.selected {
+                        0 => settings.set_preset(settings.preset.shifted(step)),
+                        1 => settings.tone_mapping = !settings.tone_mapping,
+                        2 => {
+                            settings.gamma = (settings.gamma + step as f32 * 0.1).clamp(0.05, 16.0)
+                        }
+                        3 => {
+                            settings.brightness =
+                                (settings.brightness + step as f32 * 0.1).clamp(0.0, 16.0)
+                        }
+                        4 => {
+                            settings.saturation =
+                                (settings.saturation + step as f32 * 0.1).clamp(0.0, 16.0)
+                        }
+                        5 => settings.bloom = (settings.bloom + step as f32 * 0.05).clamp(0.0, 1.0),
+                        6 => settings.show_fps = !settings.show_fps,
+                        7 => {
+                            let choices = [0, 30, 60, 90, 120, 144, 240, 1000];
+                            let index = choices
+                                .iter()
+                                .position(|x| *x == settings.max_fps)
+                                .unwrap_or(2);
+                            settings.max_fps = choices
+                                [(index as i32 + step).rem_euclid(choices.len() as i32) as usize];
+                        }
+                        _ => unreachable!(),
                     }
-                    5 => settings.bloom = (settings.bloom + step as f32 * 0.05).clamp(0.0, 1.0),
-                    6 => settings.show_fps = !settings.show_fps,
-                    7 => {
-                        let choices = [0, 30, 60, 90, 120, 144, 240, 1000];
-                        let index = choices
-                            .iter()
-                            .position(|x| *x == settings.max_fps)
-                            .unwrap_or(2);
-                        settings.max_fps = choices
-                            [(index as i32 + step).rem_euclid(choices.len() as i32) as usize];
-                    }
-                    _ => unreachable!(),
                 }
                 if *settings != old {
                     MenuAction::Changed
@@ -326,26 +367,54 @@ impl GraphicsMenu {
         for pixel in frame.iter_mut() {
             *pixel = pixel.dim_shift_bias(1, 0);
         }
-        let rows = [
-            format!("PRESET: {}", settings.preset.name()),
-            format!("TONE MAPPING: {}", onoff(settings.tone_mapping)),
-            format!("GAMMA: {:.2}", settings.gamma),
-            format!("BRIGHTNESS: {:.2}", settings.brightness),
-            format!("SATURATION: {:.2}", settings.saturation),
-            format!("BLOOM: {:.2}", settings.bloom),
-            format!("FPS DISPLAY: {}", onoff(settings.show_fps)),
-            format!(
-                "FRAME CAP: {}",
-                if settings.max_fps == 0 {
-                    "UNLIMITED".to_owned()
-                } else {
-                    settings.max_fps.to_string()
-                }
-            ),
-        ];
+        let rows = if self.controls {
+            vec![
+                format!(
+                    "MOUSE SENS: {:.2}X",
+                    settings.sensitivity / DEFAULT_MOUSE_SENSITIVITY
+                ),
+                format!("ALWAYS RUN: {}", onoff(settings.autorun)),
+                format!(
+                    "MOVEMENT: {}",
+                    match settings.physics {
+                        MovementMode::Original => "ORIGINAL",
+                        MovementMode::Quake1 => "QUAKE1",
+                    }
+                ),
+            ]
+        } else {
+            vec![
+                format!("PRESET: {}", settings.preset.name()),
+                format!("TONE MAPPING: {}", onoff(settings.tone_mapping)),
+                format!("GAMMA: {:.2}", settings.gamma),
+                format!("BRIGHTNESS: {:.2}", settings.brightness),
+                format!("SATURATION: {:.2}", settings.saturation),
+                format!("BLOOM: {:.2}", settings.bloom),
+                format!("FPS DISPLAY: {}", onoff(settings.show_fps)),
+                format!(
+                    "FRAME CAP: {}",
+                    if settings.max_fps == 0 {
+                        "UNLIMITED".to_owned()
+                    } else {
+                        settings.max_fps.to_string()
+                    }
+                ),
+            ]
+        };
         let x = width.saturating_sub(250) / 2;
         let y = height.saturating_sub(125) / 2;
-        draw(frame, width, height, x, y, "GRAPHICS OPTIONS");
+        draw(
+            frame,
+            width,
+            height,
+            x,
+            y,
+            if self.controls {
+                "CONTROLS"
+            } else {
+                "GRAPHICS OPTIONS"
+            },
+        );
         for (i, row) in rows.iter().enumerate() {
             draw(
                 frame,
@@ -356,8 +425,29 @@ impl GraphicsMenu {
                 &format!("{} {row}", if i == self.selected { ">" } else { " " }),
             );
         }
+        draw(
+            frame,
+            width,
+            height,
+            x,
+            y + 95,
+            if self.controls {
+                "TAB: GRAPHICS"
+            } else {
+                "TAB: CONTROLS"
+            },
+        );
         draw(frame, width, height, x, y + 105, "ARROWS CHANGE  ESC CLOSE");
-        if !settings.uses_hdr() {
+        if self.controls {
+            draw(
+                frame,
+                width,
+                height,
+                x,
+                y + 115,
+                "SHIFT TEMPORARILY INVERTS RUN",
+            );
+        } else if !settings.uses_hdr() {
             draw(
                 frame,
                 width,
@@ -419,6 +509,8 @@ mod tests {
         assert_eq!(settings.bloom, 0.0);
         settings.sensitivity = 0.01;
         settings.max_fps = 144;
+        settings.autorun = false;
+        settings.physics = MovementMode::Quake1;
         settings.set_preset(VisualPreset::Enhanced);
         assert_eq!(settings.bloom, 0.35);
         assert!(settings.uses_hdr());
@@ -427,6 +519,8 @@ mod tests {
         settings.set_preset(VisualPreset::Legacy);
         assert!(!settings.uses_hdr());
         assert_eq!(settings.bloom, 0.0);
+        assert!(!settings.autorun);
+        assert_eq!(settings.physics, MovementMode::Quake1);
         assert!(settings.validate().is_ok());
         settings.gamma = f32::NAN;
         assert!(settings.validate().is_err());
@@ -437,24 +531,30 @@ mod tests {
         let dir = directory();
         fs::create_dir_all(&dir).unwrap();
         let store = SettingsStore::new(dir.clone());
-        for sensitivity in [0.002, 0.004] {
+        for (version, sensitivity) in [(1, 0.002), (1, 0.004), (2, 0.002), (2, 0.004)] {
             let old = GraphicsSettings {
-                version: 1,
+                version,
                 sensitivity,
                 ..GraphicsSettings::default()
             };
+            let mut old = serde_json::to_value(old).unwrap();
+            let fields = old.as_object_mut().unwrap();
+            fields.remove("autorun");
+            fields.remove("physics");
             let bytes = serde_json::to_vec(&old).unwrap();
             fs::write(dir.join("graphics.json"), &bytes).unwrap();
             let loaded = store.load().unwrap();
             assert_eq!(loaded.version, SETTINGS_VERSION);
             assert_eq!(
                 loaded.sensitivity,
-                if sensitivity == 0.002 {
+                if version == 1 && sensitivity == 0.002 {
                     DEFAULT_MOUSE_SENSITIVITY
                 } else {
                     sensitivity
                 }
             );
+            assert!(loaded.autorun);
+            assert_eq!(loaded.physics, MovementMode::Original);
             assert_eq!(
                 fs::read(dir.join("graphics.json")).unwrap(),
                 bytes,
@@ -472,6 +572,8 @@ mod tests {
         };
         let mut old = serde_json::to_value(&settings).unwrap();
         old.as_object_mut().unwrap().remove("show_help");
+        old.as_object_mut().unwrap().remove("autorun");
+        old.as_object_mut().unwrap().remove("physics");
         let restored: GraphicsSettings = serde_json::from_value(old).unwrap();
         assert_eq!(restored, settings);
         assert!(!restored.show_help);
@@ -544,5 +646,76 @@ mod tests {
             MenuAction::Closed
         );
         assert!(!menu.is_open());
+    }
+
+    #[test]
+    fn control_page_edits_roundtrip_without_changing_graphics() {
+        let mut settings = GraphicsSettings::default();
+        let mut menu = GraphicsMenu::default();
+        menu.open();
+        menu.event(&key(Keycode::Up), &mut settings);
+        assert_eq!(menu.selected, 7);
+        assert_eq!(
+            menu.event(&key(Keycode::Tab), &mut settings),
+            MenuAction::None
+        );
+        assert!(menu.controls);
+        assert_eq!(menu.selected, 0);
+        assert_eq!(
+            menu.event(&key(Keycode::Right), &mut settings),
+            MenuAction::Changed
+        );
+        assert!((settings.sensitivity / DEFAULT_MOUSE_SENSITIVITY - 1.1).abs() < 1e-6);
+        menu.event(&key(Keycode::Down), &mut settings);
+        menu.event(&key(Keycode::Return), &mut settings);
+        assert!(!settings.autorun);
+        menu.event(&key(Keycode::Down), &mut settings);
+        menu.event(&key(Keycode::Left), &mut settings);
+        assert_eq!(settings.physics, MovementMode::Quake1);
+        menu.event(&key(Keycode::Down), &mut settings);
+        assert_eq!(menu.selected, 0);
+        menu.event(&key(Keycode::Up), &mut settings);
+        assert_eq!(menu.selected, 2);
+        let mut frame = vec![0xffffffu32; 320 * 200];
+        menu.render(&mut frame, 320, 200, &settings);
+        assert_eq!(frame[0], 0x7f7f7f);
+        assert!(frame.contains(&0xffffff));
+        menu.event(&key(Keycode::Tab), &mut settings);
+        assert!(!menu.controls);
+        assert_eq!(menu.selected, 0);
+        let expected = GraphicsSettings {
+            sensitivity: DEFAULT_MOUSE_SENSITIVITY * 1.1,
+            autorun: false,
+            physics: MovementMode::Quake1,
+            ..GraphicsSettings::default()
+        };
+        assert!((settings.sensitivity - expected.sensitivity).abs() < 1e-9);
+        let mut without_roundoff = settings.clone();
+        without_roundoff.sensitivity = expected.sensitivity;
+        assert_eq!(without_roundoff, expected);
+        let dir = directory();
+        let store = SettingsStore::new(dir.clone());
+        store.save(&settings).unwrap();
+        assert_eq!(store.load().unwrap(), settings);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("graphics.json")).unwrap()).unwrap();
+        assert_eq!(saved["version"], 3);
+        assert_eq!(saved["physics"], "quake1");
+        assert_eq!(saved["autorun"], false);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mouse_control_clamps_to_existing_valid_preference_range() {
+        let mut settings = GraphicsSettings::default();
+        let mut menu = GraphicsMenu::default();
+        menu.open();
+        menu.event(&key(Keycode::Tab), &mut settings);
+        for (sensitivity, direction) in [(0.0001, Keycode::Left), (1.0, Keycode::Right)] {
+            settings.sensitivity = sensitivity;
+            assert_eq!(menu.event(&key(direction), &mut settings), MenuAction::None);
+            assert_eq!(settings.sensitivity, sensitivity);
+            assert!(settings.validate().is_ok());
+        }
     }
 }

@@ -137,6 +137,24 @@ pub enum ProcessEffect {
     CellType { cell: [u8; 2], raw_type: u8 },
     /// Presentation request; no object animation is simulated by the runtime.
     PlayAnimation { object_id: u16 },
+    /// The host must activate all zones under this process ID. Zones use
+    /// inclusive map cells and raw vertical/damage units.
+    HazardActivated {
+        process_id: u16,
+        zones: Vec<DeathZone>,
+    },
+    /// Remove the active hazards belonging to this process ID.
+    HazardDeactivated { process_id: u16 },
+}
+/// A death field's authored values. Vertical bounds use 1/64 tile; negative
+/// lower bounds designate fields that do not damage the player in the manual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeathZone {
+    pub min_cell: [u8; 2],
+    pub max_cell: [u8; 2],
+    pub z_bottom_raw: i32,
+    pub z_top_raw: i32,
+    pub damage_raw: u32,
 }
 #[derive(Debug, Clone)]
 struct CellChange {
@@ -163,6 +181,9 @@ struct RuntimeProcess {
     lock_changes: Vec<(u16, bool)>,
     cell_changes: Vec<CellChange>,
     animations: Vec<u16>,
+    death_zones: Vec<DeathZone>,
+    nonstop: bool,
+    hazard_active: bool,
     supported: bool,
     required_keys: [bool; 3],
     mission_effect: bool,
@@ -185,12 +206,15 @@ impl RuntimeProcess {
         world: &World,
         capabilities: ProcessCapabilities<'_>,
         raw_cells: Option<&[u8; 4096]>,
+        hazards_enabled: bool,
     ) -> Self {
         let mut motions = Vec::new();
         let mut empty_motion_cells = Vec::new();
         let mut empty_motion_distance = 0.0_f32;
         let mut cell_changes = Vec::new();
         let mut animations = Vec::new();
+        let mut death_zones = Vec::new();
+        let mut nonstop = false;
         let mut waitout = Vec::new();
         let mut lock_changes = Vec::new();
         let mut supported = true;
@@ -209,6 +233,46 @@ impl RuntimeProcess {
                     .is_ok_and(|value| value != 0)
         });
         for action in &process.actions {
+            if action.name == "nonstop" {
+                if hazards_enabled && action.arguments.is_empty() && !nonstop {
+                    nonstop = true;
+                    continue;
+                }
+                supported = false;
+                break;
+            }
+            if action.name == "death" {
+                let parsed = (|| {
+                    if !hazards_enabled || action.arguments.len() != 7 {
+                        return None;
+                    }
+                    let values: Vec<i32> = action
+                        .arguments
+                        .iter()
+                        .map(|v| v.parse::<i32>().ok())
+                        .collect::<Option<_>>()?;
+                    let x1 = u8::try_from(values[0]).ok()?;
+                    let y1 = u8::try_from(values[1]).ok()?;
+                    let x2 = u8::try_from(values[2]).ok()?;
+                    let y2 = u8::try_from(values[3]).ok()?;
+                    if x1 > x2 || y1 > y2 || x2 >= 64 || y2 >= 64 || values[4] > values[5] {
+                        return None;
+                    }
+                    Some(DeathZone {
+                        min_cell: [x1, y1],
+                        max_cell: [x2, y2],
+                        z_bottom_raw: values[4],
+                        z_top_raw: values[5],
+                        damage_raw: u32::try_from(values[6]).ok()?,
+                    })
+                })();
+                if let Some(zone) = parsed {
+                    death_zones.push(zone);
+                    continue;
+                }
+                supported = false;
+                break;
+            }
             if action.name == "playani" {
                 if action.arguments.len() == 1 {
                     if let Ok(object_id) = action.arguments[0].parse::<u16>() {
@@ -381,12 +445,18 @@ impl RuntimeProcess {
                 }
             }
         }
+        // `nonstop` modifies zone lifecycle. Without an understood persistent
+        // effect it cannot safely make an otherwise unsupported script runnable.
+        if nonstop && death_zones.is_empty() {
+            supported = false;
+        }
         if !supported {
             motions.clear();
             empty_motion_cells.clear();
             lock_changes.clear();
             cell_changes.clear();
             animations.clear();
+            death_zones.clear();
         }
         // The manual labels Speed but does not specify units. At speed 8 we use
         // one tile per second; each process completes when its longest move does.
@@ -395,6 +465,14 @@ impl RuntimeProcess {
             .iter()
             .map(|m| m.travel_bound(&world.walls[m.wall]))
             .fold(empty_motion_distance, f32::max);
+        // The independent reconstruction advances procedure stages at
+        // Speed/10 per second even for a hazard with no moving geometry.
+        // Existing non-hazard movement timing is left unchanged.
+        let duration = if death_zones.is_empty() {
+            (max_distance / speed).max(0.001)
+        } else {
+            10.0 / property_float(process, "speed", 10.0).max(0.01)
+        };
         let locked = process.properties.iter().any(|cmd| cmd.name == "lock");
         let required_keys = ["redkey", "greenkey", "bluekey"]
             .map(|name| process.properties.iter().any(|cmd| cmd.name == name));
@@ -403,7 +481,7 @@ impl RuntimeProcess {
             empty_motion_cells,
             phase: Phase::Closed,
             progress: 0.0,
-            duration: (max_distance / speed).max(0.001),
+            duration,
             delay: property_float(process, "startdelay", 0.0),
             back_wait: property_float(process, "backwait", 0.0),
             open_time: 0.0,
@@ -412,6 +490,9 @@ impl RuntimeProcess {
             lock_changes,
             cell_changes,
             animations,
+            death_zones,
+            nonstop,
+            hazard_active: false,
             supported,
             required_keys,
             mission_effect: has_end_delay || has_message,
@@ -433,6 +514,7 @@ impl RuntimeProcess {
                 && self.lock_changes.is_empty()
                 && self.cell_changes.is_empty()
                 && self.animations.is_empty()
+                && self.death_zones.is_empty()
                 && !self.mission_effect)
         {
             return Err(ProcessOutcome::Unsupported);
@@ -442,6 +524,7 @@ impl RuntimeProcess {
                 if !self.motions.is_empty()
                     || !self.empty_motion_cells.is_empty()
                     || !self.cell_changes.is_empty()
+                    || !self.death_zones.is_empty()
                 {
                     self.phase = if self.delay > 0.0 {
                         Phase::Delay(self.delay)
@@ -454,7 +537,8 @@ impl RuntimeProcess {
             Phase::Open
                 if !self.motions.is_empty()
                     || !self.empty_motion_cells.is_empty()
-                    || !self.cell_changes.is_empty() =>
+                    || !self.cell_changes.is_empty()
+                    || !self.death_zones.is_empty() =>
             {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
@@ -465,7 +549,22 @@ impl RuntimeProcess {
     }
     /// Reverse an active process without re-triggering it or firing its
     /// activation side effects. An already closed or closing process is inert.
-    fn return_to_start(&mut self) {
+    fn start_hazard(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
+        if !self.locked && !self.hazard_active && !self.death_zones.is_empty() {
+            self.hazard_active = true;
+            effects.push(ProcessEffect::HazardActivated {
+                process_id,
+                zones: self.death_zones.clone(),
+            });
+        }
+    }
+    fn stop_hazard(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
+        if self.hazard_active {
+            self.hazard_active = false;
+            effects.push(ProcessEffect::HazardDeactivated { process_id });
+        }
+    }
+    fn return_to_start(&mut self, process_id: u16, effects: &mut Vec<ProcessEffect>) {
         if self.locked || !self.supported {
             return;
         }
@@ -477,12 +576,16 @@ impl RuntimeProcess {
             Phase::Opening | Phase::Open => {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
+                if !self.nonstop {
+                    self.stop_hazard(process_id, effects);
+                }
             }
             Phase::Closed | Phase::Closing => {}
         }
     }
     fn tick(
         &mut self,
+        process_id: u16,
         world: &mut World,
         dt: f32,
         elevations: &mut [f32],
@@ -497,6 +600,7 @@ impl RuntimeProcess {
             })
         {
             self.phase = Phase::Opening;
+            self.start_hazard(process_id, effects);
         }
         let previous = self.progress;
         match self.phase {
@@ -506,6 +610,7 @@ impl RuntimeProcess {
                     self.phase = Phase::Delay(remaining - dt);
                 } else {
                     self.phase = Phase::Opening;
+                    self.start_hazard(process_id, effects);
                     self.progress = ((dt - remaining) / self.duration).min(1.0);
                 }
             }
@@ -580,6 +685,9 @@ impl RuntimeProcess {
                 }
             }
         }
+        if self.phase == Phase::Open && !self.nonstop {
+            self.stop_hazard(process_id, effects);
+        }
     }
 }
 
@@ -622,7 +730,13 @@ impl ProcessRuntime {
         world: &World,
         capabilities: ProcessCapabilities<'_>,
     ) -> Self {
-        Self::build(script, world, capabilities, capabilities.initial_cell_types)
+        Self::build(
+            script,
+            world,
+            capabilities,
+            capabilities.initial_cell_types,
+            false,
+        )
     }
     /// Supply x-major map cell types for validating empty motion targets without
     /// opting into applying `change` effects. Non-empty cells without supported
@@ -638,6 +752,23 @@ impl ProcessRuntime {
             world,
             capabilities,
             capabilities.initial_cell_types.or(Some(raw_cells)),
+            false,
+        )
+    }
+    /// Enable death-zone effects only when the authoritative host consumes
+    /// and simulates every emitted hazard activation/deactivation.
+    pub fn with_hazards(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+    ) -> Self {
+        Self::build(
+            script,
+            world,
+            capabilities,
+            capabilities.initial_cell_types.or(Some(raw_cells)),
+            true,
         )
     }
     fn build(
@@ -645,6 +776,7 @@ impl ProcessRuntime {
         world: &World,
         capabilities: ProcessCapabilities<'_>,
         raw_cells: Option<&[u8; 4096]>,
+        hazards_enabled: bool,
     ) -> Self {
         Self {
             processes: script
@@ -653,7 +785,13 @@ impl ProcessRuntime {
                 .map(|(&id, process)| {
                     (
                         id,
-                        RuntimeProcess::new(process, world, capabilities, raw_cells),
+                        RuntimeProcess::new(
+                            process,
+                            world,
+                            capabilities,
+                            raw_cells,
+                            hazards_enabled,
+                        ),
                     )
                 })
                 .collect(),
@@ -712,6 +850,11 @@ impl ProcessRuntime {
         };
         let outcome = match result {
             Ok((changes, animations)) => {
+                if let Some(process) = self.processes.get_mut(&id) {
+                    if process.phase == Phase::Opening {
+                        process.start_hazard(id, &mut self.effects);
+                    }
+                }
                 self.effects.extend(
                     animations
                         .into_iter()
@@ -720,6 +863,9 @@ impl ProcessRuntime {
                 for (target, locked) in changes {
                     if let Some(process) = self.processes.get_mut(&target) {
                         process.locked = locked;
+                        if locked {
+                            process.stop_hazard(target, &mut self.effects);
+                        }
                     }
                 }
                 ProcessOutcome::Accepted
@@ -744,7 +890,7 @@ impl ProcessRuntime {
         if matches!(kind, "return" | "returnf") {
             for id in ids {
                 if let Some(process) = self.processes.get_mut(&id) {
-                    process.return_to_start();
+                    process.return_to_start(id, &mut self.effects);
                 }
             }
             return Vec::new();
@@ -778,7 +924,7 @@ impl ProcessRuntime {
         for (kind, id) in links {
             if kind == "return" {
                 if let Some(process) = self.processes.get_mut(&id) {
-                    process.return_to_start();
+                    process.return_to_start(id, &mut self.effects);
                 }
             } else {
                 events.push(self.trigger(id));
@@ -824,7 +970,7 @@ impl ProcessRuntime {
                 for (kind, id) in links {
                     if kind == "returnf" {
                         if let Some(process) = self.processes.get_mut(&id) {
-                            process.return_to_start();
+                            process.return_to_start(id, &mut self.effects);
                         }
                     } else {
                         events.push(self.trigger(id));
@@ -851,8 +997,9 @@ impl ProcessRuntime {
                 events.extend(self.use_at(cell));
             }
         }
-        for process in self.processes.values_mut() {
+        for (&id, process) in &mut self.processes {
             process.tick(
+                id,
                 world,
                 dt,
                 &mut self.elevations,
@@ -1407,5 +1554,125 @@ mod tests {
         assert!(runtime.activate_at("return", [2, 0]).is_empty());
         tick_for(&mut runtime, &mut world, 0.1);
         assert!(world.walls[0].a[0] > before);
+    }
+
+    #[test]
+    fn nonstop_hazard_starts_after_delay_and_stops_when_locked() {
+        let script = Script::parse("#proc1\nLock\nStartDelay 0.5\n#action\nnonstop\ndeath 4 4 60 60 -1 128 100\n#end\n#proc2\n#action\nunlock 1\n#end\n#proc3\n#action\nlock 1\n#end\n#links\nfloor 0 0 1\nlink 1 0 2\nlink 2 0 3\n#end\n");
+        let mut world = world();
+        let cells = [0; 4096];
+        let mut default =
+            ProcessRuntime::with_cell_data(&script, &world, ProcessCapabilities::default(), &cells);
+        default.activate_at("link", [1, 0]);
+        assert_eq!(
+            default.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+
+        let mut runtime =
+            ProcessRuntime::with_hazards(&script, &world, ProcessCapabilities::default(), &cells);
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        assert!(runtime.take_effects().is_empty());
+        assert_eq!(
+            runtime.activate_at("link", [1, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert!(runtime.take_effects().is_empty());
+        world.player.position = [-10.0, -10.0];
+        runtime.tick(&mut world, 0.25, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.tick(&mut world, 0.3, false);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::HazardActivated {
+                process_id: 1,
+                zones: vec![DeathZone {
+                    min_cell: [4, 4],
+                    max_cell: [60, 60],
+                    z_bottom_raw: -1,
+                    z_top_raw: 128,
+                    damage_raw: 100
+                }]
+            }]
+        );
+        runtime.tick(&mut world, 2.0, false);
+        assert!(
+            runtime.take_effects().is_empty(),
+            "nonstop survives the opening stage"
+        );
+        assert_eq!(
+            runtime.activate_at("link", [2, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::HazardDeactivated { process_id: 1 }]
+        );
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        assert!(runtime.take_effects().is_empty());
+    }
+
+    #[test]
+    fn finite_hazard_stays_active_during_opening_then_deactivates() {
+        let script = Script::parse(
+            "#proc1\nSpeed 10\n#action\ndeath 1 2 3 4 0 24 500\n#end\n#links\nfloor 0 0 1\n#end\n",
+        );
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let cells = [0; 4096];
+        let mut runtime =
+            ProcessRuntime::with_hazards(&script, &world, ProcessCapabilities::default(), &cells);
+        assert_eq!(
+            runtime.activate_at("floor", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert!(
+            matches!(&runtime.take_effects()[0], ProcessEffect::HazardActivated { process_id: 1, zones } if zones[0].damage_raw == 500)
+        );
+        runtime.tick(&mut world, 0.5, false);
+        assert!(runtime.take_effects().is_empty());
+        runtime.tick(&mut world, 0.5, false);
+        assert_eq!(
+            runtime.take_effects(),
+            vec![ProcessEffect::HazardDeactivated { process_id: 1 }]
+        );
+    }
+
+    #[test]
+    fn malformed_and_unrelated_hazard_actions_do_not_emit_partial_effects() {
+        for action in [
+            "death 1 1 1 1 -1 128 -1",
+            "death 4 4 1 1 0 128 100",
+            "nonstop 1",
+            "nonstop\nwind 1 1 2 2 5 5",
+            "death 1 1 1 1 0 128 100\nquake 1 1 2 2 10",
+        ] {
+            let script = Script::parse(&format!(
+                "#proc1\n#action\n{action}\n#end\n#links\nlink 0 0 1\n#end\n"
+            ));
+            let world = world();
+            let mut runtime = ProcessRuntime::with_hazards(
+                &script,
+                &world,
+                ProcessCapabilities::default(),
+                &[0; 4096],
+            );
+            assert_eq!(
+                runtime.activate_at("link", [0, 0])[0].outcome,
+                ProcessOutcome::Unsupported,
+                "{action}"
+            );
+            assert!(runtime.take_effects().is_empty());
+        }
     }
 }

@@ -592,6 +592,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 session.ai.set_clip_metadata(actor_clips);
                 session.set_explosions_enabled(true);
                 session.set_mines_enabled(mine_available);
+                session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
                 session.set_protective_powerups_enabled(true);
                 session.set_addon_boss_rule(actors::ActorMapping::recognize_shipped_addon(
                     &map_bytes, &info,

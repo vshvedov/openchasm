@@ -608,13 +608,15 @@ impl Session {
         {
             return Err(SessionSnapshotError::Inconsistent("powerup state"));
         }
-        self.validate_grid_journal(snapshot)?;
+        let (replayed_world, replayed_blocking) = self.validate_grid_journal(snapshot)?;
         if snapshot.selected_weapon as usize >= snapshot.inventory.weapons.len()
             || !snapshot.inventory.weapons[snapshot.selected_weapon as usize]
         {
             return Err(SessionSnapshotError::Inconsistent("selected weapon"));
         }
         let mut candidate = self.clone();
+        candidate.world = replayed_world;
+        candidate.base_wall_blocking = replayed_blocking;
         candidate
             .world
             .restore(&snapshot.world)
@@ -1077,7 +1079,12 @@ impl Session {
                         Some(actions) => actions
                             .iter()
                             .filter(|a| {
-                                matches!(a, ImmediateAction::Ambient(_) | ImmediateAction::Quake(_))
+                                matches!(
+                                    a,
+                                    ImmediateAction::Ambient(_)
+                                        | ImmediateAction::Quake(_)
+                                        | ImmediateAction::WallChange { .. }
+                                )
                             })
                             .count(),
                         None => return false,
@@ -1120,7 +1127,7 @@ impl Session {
     fn validate_grid_journal(
         &self,
         snapshot: &SessionSnapshot,
-    ) -> Result<(), SessionSnapshotError> {
+    ) -> Result<(World, Vec<bool>), SessionSnapshotError> {
         let invalid = || SessionSnapshotError::Unverifiable("grid journal");
         if !self.grid_journal.is_empty()
             || self.grid_journal_overflow
@@ -1131,6 +1138,11 @@ impl Session {
         let mut wind = self.wind.clone();
         let mut ambient = self.ambient.clone();
         let mut quake = self.scripted_objects.as_ref().map(|s| s.quake.clone());
+        let mut walls = self.world.clone();
+        let mut base_blocking = self.base_wall_blocking.clone();
+        if base_blocking.len() != walls.walls.len() {
+            return Err(invalid());
+        }
         let mut work = 0usize;
         for entry in &snapshot.grid_journal {
             match *entry {
@@ -1166,7 +1178,51 @@ impl Session {
                                     .map_err(|_| invalid())?;
                                 found = true;
                             }
-                            ImmediateAction::Object(_) | ImmediateAction::WallChange { .. } => {}
+                            ImmediateAction::WallChange { cell, raw_type } => {
+                                work = work.checked_add(4096).ok_or_else(invalid)?;
+                                if work > MAX_GRID_REPLAY_WORK {
+                                    return Err(invalid());
+                                }
+                                if walls.walls.len() > 4096 {
+                                    return Err(invalid());
+                                }
+                                let catalog = self.wall_materials.as_ref().ok_or_else(invalid)?;
+                                let mut matching = walls
+                                    .walls
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, wall)| wall.cell == Some(*cell));
+                                let (index, wall) = matching.next().ok_or_else(invalid)?;
+                                if matching.next().is_some()
+                                    || self.processes.cell_type(*cell)
+                                        != Some(self.world.walls[index].texture)
+                                {
+                                    return Err(invalid());
+                                }
+                                let old = catalog.get(wall.texture).ok_or_else(invalid)?;
+                                let new = catalog.get(*raw_type).ok_or_else(invalid)?;
+                                if !(1..=127).contains(raw_type)
+                                    || !(1..=127).contains(&wall.texture)
+                                    || !new.presentation_available
+                                    || old.blocks_movement != base_blocking[index]
+                                    || old.blocks_shots
+                                        != self.shot_blocking[usize::from(wall.texture)]
+                                    || new.blocks_shots
+                                        != self.shot_blocking[usize::from(*raw_type)]
+                                    || wall.a == wall.b
+                                    || wall
+                                        .a
+                                        .iter()
+                                        .chain(&wall.b)
+                                        .any(|v| !v.is_finite() || v.abs() > 4096.0)
+                                {
+                                    return Err(invalid());
+                                }
+                                walls.walls[index].texture = *raw_type;
+                                base_blocking[index] = new.blocks_movement;
+                                found = true;
+                            }
+                            ImmediateAction::Object(_) => {}
                         }
                     }
                     if !found {
@@ -1206,7 +1262,7 @@ impl Session {
         {
             return Err(invalid());
         }
-        Ok(())
+        Ok((walls, base_blocking))
     }
     /// Execute one prepared process. The bool in an error indicates a failure
     /// during external validation, rather than a denied runtime activation.
@@ -1224,10 +1280,14 @@ impl Session {
         }
         .map_err(|outcome| (outcome, false))?;
         let delayed = prepared.is_delayed();
-        let grid_immediate = prepared
-            .actions()
-            .iter()
-            .any(|a| matches!(a, ImmediateAction::Ambient(_) | ImmediateAction::Quake(_)));
+        let grid_immediate = prepared.actions().iter().any(|a| {
+            matches!(
+                a,
+                ImmediateAction::Ambient(_)
+                    | ImmediateAction::Quake(_)
+                    | ImmediateAction::WallChange { .. }
+            )
+        });
         let quakes: Vec<_> = prepared
             .actions()
             .iter()
@@ -3364,7 +3424,87 @@ mod tests {
         source.apply_process_effects();
         let digest = crate::save_format::ContentDigest([12; 32]);
         let snapshot = source.snapshot(digest).unwrap();
-        assert!(baseline.restore_from_baseline(&snapshot, digest).is_err());
+        let restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
+        let mut forged = snapshot.clone();
+        forged.grid_journal.clear();
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.world.walls[0].texture = 87;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.processes.cell_types.as_mut().unwrap()[64] = 87;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.processes.wall_identity[0].1 = 87;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.world.walls[0].blocks_movement = false;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut missing = baseline.clone();
+        let mut catalog = missing.wall_materials.clone().unwrap();
+        catalog.set(
+            2,
+            crate::wall_transitions::WallMaterial {
+                blocks_movement: true,
+                blocks_shots: false,
+                presentation_available: false,
+            },
+        );
+        assert!(missing.set_wall_material_catalog(catalog));
+        assert!(missing.restore_from_baseline(&snapshot, digest).is_err());
+    }
+
+    #[test]
+    fn wall_journal_roundtrips_wall_only_reversal_and_continues() {
+        let text = "#proc1\n#action\nchange 1 0 2\n#end\n#proc2\n#action\nchange 1 0 87\n#end\n#links\nlink 0 0 1\nlink 0 0 2\n#end\n";
+        let baseline = wall_change_session(text);
+        let mut source = baseline.clone();
+        let digest = crate::save_format::ContentDigest([19; 32]);
+        for id in [1, 2] {
+            source
+                .try_staged_process("link", [0, 0], id, &mut SessionEvents::default())
+                .unwrap();
+            source.apply_process_effects();
+        }
+        assert_eq!(
+            source.grid_journal,
+            vec![
+                GridJournalEntry::Immediate { process_id: 1 },
+                GridJournalEntry::Immediate { process_id: 2 }
+            ]
+        );
+        let snapshot = source.snapshot(digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
+        source.step(SessionInput::default());
+        restored.step(SessionInput::default());
+        assert_eq!(
+            restored.snapshot(digest).unwrap(),
+            source.snapshot(digest).unwrap()
+        );
+        let mut forged = snapshot.clone();
+        forged.grid_journal.reverse();
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+    }
+
+    #[test]
+    fn wall_journal_restores_a_changed_moving_wall() {
+        let text = "#proc1\nspeed 1\n#action\nchange 1 0 2\nmove 1 0 64 0\n#end\n#links\nlink 0 0 1\n#end\n";
+        let baseline = wall_change_session(text);
+        let mut source = baseline.clone();
+        source
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .unwrap();
+        for _ in 0..8 {
+            source.step(SessionInput::default());
+        }
+        let digest = crate::save_format::ContentDigest([20; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        source.step(SessionInput::default());
+        restored.step(SessionInput::default());
+        assert_eq!(source.world.snapshot(), restored.world.snapshot());
     }
 
     #[test]

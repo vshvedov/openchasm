@@ -1,0 +1,365 @@
+//! Independent player vertical motion, using provisional reconstruction values.
+//!
+//! Units are map tiles and seconds. The session supplies the relevant floor
+//! and ceiling planes; horizontal collision, jumping onto objects, moving-wall
+//! crushing, and input bindings are separate responsibilities.
+use std::error::Error;
+use std::fmt;
+
+const MAX_SUBSTEP: f32 = 1.0 / 120.0;
+const MAX_DELTA: f32 = 1.0;
+const GROUND_EPSILON: f32 = 0.00001;
+
+/// Values based on the published PanzerChasm reconstruction. They are not
+/// calibrated against this installation; the reference marks jump speed TODO.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalConfig {
+    pub gravity: f32,
+    pub jump_speed: f32,
+    pub max_speed: f32,
+    pub body_height: f32,
+    pub eye_height: f32,
+}
+impl Default for VerticalConfig {
+    fn default() -> Self {
+        Self {
+            gravity: 9.8,
+            jump_speed: 2.9,
+            max_speed: 5.0,
+            body_height: 0.9,
+            eye_height: 0.75,
+        }
+    }
+}
+impl VerticalConfig {
+    fn valid(self) -> bool {
+        [
+            self.gravity,
+            self.jump_speed,
+            self.max_speed,
+            self.body_height,
+            self.eye_height,
+        ]
+        .iter()
+        .all(|x| x.is_finite())
+            && self.gravity > 0.0
+            && self.jump_speed > 0.0
+            && self.max_speed > 0.0
+            && self.body_height > 0.0
+            && self.eye_height >= 0.0
+            && self.eye_height <= self.body_height
+    }
+}
+
+/// Height of floor and optional ceiling in world tile units. `None` represents
+/// an open ceiling, not a guessed interpretation of a map texture index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalBounds {
+    pub floor: f32,
+    pub ceiling: Option<f32>,
+}
+impl VerticalBounds {
+    /// Provisional fixed planes consistent with a two-tile-high room.
+    pub const fn flat_room() -> Self {
+        Self {
+            floor: 0.0,
+            ceiling: Some(2.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalError {
+    InvalidConfiguration,
+    InvalidBounds,
+    InsufficientClearance,
+    InvalidDelta,
+}
+impl fmt::Display for VerticalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfiguration => f.write_str("invalid vertical physics configuration"),
+            Self::InvalidBounds => f.write_str("invalid vertical plane bounds"),
+            Self::InsufficientClearance => {
+                f.write_str("player does not fit between floor and ceiling")
+            }
+            Self::InvalidDelta => f.write_str("invalid vertical simulation timestep"),
+        }
+    }
+}
+impl Error for VerticalError {}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VerticalEvents {
+    pub jumped: bool,
+    pub landed: bool,
+    pub hit_ceiling: bool,
+}
+
+/// Authoritative player feet elevation and vertical speed. Cloning preserves
+/// state for snapshots and restart. No platform or networking assumptions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalState {
+    feet: f32,
+    velocity: f32,
+    grounded: bool,
+    config: VerticalConfig,
+}
+impl VerticalState {
+    pub fn new(floor: f32) -> Result<Self, VerticalError> {
+        Self::with_config(floor, VerticalConfig::default())
+    }
+    pub fn with_config(floor: f32, config: VerticalConfig) -> Result<Self, VerticalError> {
+        if !config.valid() {
+            return Err(VerticalError::InvalidConfiguration);
+        }
+        if !floor.is_finite() {
+            return Err(VerticalError::InvalidBounds);
+        }
+        Ok(Self {
+            feet: floor,
+            velocity: 0.0,
+            grounded: true,
+            config,
+        })
+    }
+    pub fn feet(&self) -> f32 {
+        self.feet
+    }
+    pub fn velocity(&self) -> f32 {
+        self.velocity
+    }
+    pub fn grounded(&self) -> bool {
+        self.grounded
+    }
+    pub fn head(&self) -> f32 {
+        self.feet + self.config.body_height
+    }
+    pub fn eye(&self) -> f32 {
+        self.feet + self.config.eye_height
+    }
+    pub fn config(&self) -> VerticalConfig {
+        self.config
+    }
+
+    /// Advance by a simulation delta, subdividing to handle ceiling/floor hits.
+    /// `jump_pressed` is a press edge, not a held input. An airborne press is
+    /// ignored; no buffering or automatic repeat is applied. Bounds must be
+    /// the planes at the player's current horizontal position. If the player
+    /// cannot fit, return an error without modifying the state; the session
+    /// should resolve crushing or reject the horizontal move separately.
+    pub fn step(
+        &mut self,
+        dt: f32,
+        jump_pressed: bool,
+        bounds: VerticalBounds,
+    ) -> Result<VerticalEvents, VerticalError> {
+        if !dt.is_finite() || !(0.0..=MAX_DELTA).contains(&dt) {
+            return Err(VerticalError::InvalidDelta);
+        }
+        if !bounds.floor.is_finite() || bounds.ceiling.is_some_and(|z| !z.is_finite()) {
+            return Err(VerticalError::InvalidBounds);
+        }
+        if bounds
+            .ceiling
+            .is_some_and(|z| z - bounds.floor < self.config.body_height)
+        {
+            return Err(VerticalError::InsufficientClearance);
+        }
+        if dt == 0.0 {
+            return Ok(VerticalEvents::default());
+        }
+        let mut next = *self;
+        let mut events = VerticalEvents::default();
+        // The caller handles horizontal motion/platform collision. If a plane
+        // rises under the player, place the feet on it rather than embedding.
+        if next.feet < bounds.floor {
+            next.feet = bounds.floor;
+            if next.velocity < 0.0 {
+                next.velocity = 0.0;
+            }
+        }
+        if let Some(ceiling) = bounds.ceiling {
+            let max_feet = ceiling - next.config.body_height;
+            if next.feet > max_feet {
+                next.feet = max_feet;
+                if next.velocity > 0.0 {
+                    next.velocity = 0.0;
+                }
+                events.hit_ceiling = true;
+            }
+        }
+        next.grounded = next.feet <= bounds.floor + GROUND_EPSILON && next.velocity <= 0.0;
+        if jump_pressed && next.grounded {
+            next.velocity = next.config.jump_speed.min(next.config.max_speed);
+            next.grounded = false;
+            events.jumped = true;
+        }
+        let steps = (dt / MAX_SUBSTEP).ceil() as usize;
+        let h = dt / steps as f32;
+        for _ in 0..steps {
+            // Trapezoidal integration and bounded substeps keep the arc close
+            // across frame rates, including the terminal velocity transition.
+            let previous_velocity = next.velocity;
+            let velocity =
+                (previous_velocity - next.config.gravity * h).max(-next.config.max_speed);
+            let position = next.feet + (previous_velocity + velocity) * 0.5 * h;
+            next.velocity = velocity;
+            next.feet = position;
+            if let Some(ceiling) = bounds.ceiling {
+                let max_feet = ceiling - next.config.body_height;
+                if next.feet > max_feet {
+                    next.feet = max_feet;
+                    if next.velocity > 0.0 {
+                        next.velocity = 0.0;
+                    }
+                    events.hit_ceiling = true;
+                }
+            }
+            if next.feet <= bounds.floor {
+                if !next.grounded {
+                    events.landed = true;
+                }
+                next.feet = bounds.floor;
+                next.velocity = 0.0;
+                next.grounded = true;
+            } else {
+                next.grounded = false;
+            }
+        }
+        *self = next;
+        Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn jump_rises_then_lands_with_reference_scale_and_camera_height() {
+        let mut player = VerticalState::new(0.0).unwrap();
+        assert_eq!(player.eye(), 0.75);
+        assert!(
+            player
+                .step(1.0 / 60.0, true, VerticalBounds::flat_room())
+                .unwrap()
+                .jumped
+        );
+        let mut max_height = player.feet();
+        let mut landed = false;
+        for _ in 0..120 {
+            let event = player
+                .step(1.0 / 60.0, false, VerticalBounds::flat_room())
+                .unwrap();
+            max_height = max_height.max(player.feet());
+            landed |= event.landed;
+        }
+        assert!(
+            (max_height - (2.9f32 * 2.9 / (2.0 * 9.8))).abs() < 0.01,
+            "{max_height}"
+        );
+        assert!(landed && player.grounded());
+        assert_eq!(player.feet(), 0.0);
+        assert_eq!(player.velocity(), 0.0);
+    }
+    #[test]
+    fn jumping_hits_ceiling_without_crossing_it() {
+        let mut player = VerticalState::new(0.0).unwrap();
+        let room = VerticalBounds {
+            floor: 0.0,
+            ceiling: Some(1.0),
+        };
+        let mut hit = player.step(1.0 / 60.0, true, room).unwrap().hit_ceiling;
+        for _ in 0..60 {
+            hit |= player.step(1.0 / 60.0, false, room).unwrap().hit_ceiling;
+            assert!(player.head() <= 1.0 + 1e-6);
+        }
+        assert!(hit && player.grounded());
+    }
+    #[test]
+    fn airborne_press_does_not_double_jump_and_open_sky_is_supported() {
+        let mut player = VerticalState::new(0.0).unwrap();
+        let open = VerticalBounds {
+            floor: 0.0,
+            ceiling: None,
+        };
+        player.step(1.0 / 60.0, true, open).unwrap();
+        let previous = player.velocity();
+        assert!(!player.step(1.0 / 60.0, true, open).unwrap().jumped);
+        assert!(player.velocity() < previous);
+    }
+    #[test]
+    fn dropping_and_raising_floor_updates_ground_state() {
+        let mut player = VerticalState::new(0.0).unwrap();
+        let lowered = VerticalBounds {
+            floor: -1.0,
+            ceiling: Some(2.0),
+        };
+        player.step(1.0 / 60.0, false, lowered).unwrap();
+        assert!(!player.grounded() && player.feet() < 0.0);
+        let raised = VerticalBounds {
+            floor: 0.25,
+            ceiling: Some(2.0),
+        };
+        player.step(1.0 / 60.0, false, raised).unwrap();
+        assert!(player.grounded());
+        assert_eq!(player.feet(), 0.25);
+    }
+    #[test]
+    fn invalid_contexts_are_rejected_without_corrupting_state() {
+        let mut player = VerticalState::new(0.0).unwrap();
+        let before = player;
+        assert_eq!(
+            player.step(
+                0.1,
+                true,
+                VerticalBounds {
+                    floor: 0.0,
+                    ceiling: Some(0.5)
+                }
+            ),
+            Err(VerticalError::InsufficientClearance)
+        );
+        assert_eq!(
+            player.step(f32::NAN, true, VerticalBounds::flat_room()),
+            Err(VerticalError::InvalidDelta)
+        );
+        assert_eq!(
+            player.step(2.0, true, VerticalBounds::flat_room()),
+            Err(VerticalError::InvalidDelta)
+        );
+        assert_eq!(
+            player.step(
+                0.1,
+                true,
+                VerticalBounds {
+                    floor: f32::NAN,
+                    ceiling: None
+                }
+            ),
+            Err(VerticalError::InvalidBounds)
+        );
+        assert_eq!(player, before);
+        let cfg = VerticalConfig {
+            gravity: 0.0,
+            ..VerticalConfig::default()
+        };
+        assert_eq!(
+            VerticalState::with_config(0.0, cfg),
+            Err(VerticalError::InvalidConfiguration)
+        );
+    }
+    #[test]
+    fn equivalent_small_steps_produce_equivalent_height() {
+        let mut fixed = VerticalState::new(0.0).unwrap();
+        let mut combined = fixed;
+        let bounds = VerticalBounds::flat_room();
+        fixed.step(1.0 / 60.0, true, bounds).unwrap();
+        for _ in 0..5 {
+            fixed.step(1.0 / 60.0, false, bounds).unwrap();
+        }
+        combined.step(0.1, true, bounds).unwrap();
+        assert!((fixed.feet() - combined.feet()).abs() < 1e-5);
+        assert!((fixed.velocity() - combined.velocity()).abs() < 1e-5);
+    }
+}

@@ -18,3 +18,4 @@ pub mod object_combat;
 pub mod pickups;
 pub mod projectiles;
 pub mod session;
+pub mod vertical;

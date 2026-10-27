@@ -10,7 +10,7 @@ use std::io::{self, Write};
 pub const MAX_SESSION_PAYLOAD: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 65_536;
 const MAX_MAP_CELLS: usize = 4096;
-const SCHEMA_VERSION: u16 = 3;
+const SCHEMA_VERSION: u16 = 4;
 
 #[derive(Debug)]
 pub enum SessionCodecError {
@@ -216,7 +216,7 @@ pub fn decode(bytes: &[u8], expected: ContentDigest) -> Result<SessionSnapshot, 
                     Some(crate::light_sources::LightSourcesSnapshot::default());
             }
         }
-        2 | SCHEMA_VERSION => {}
+        2 | 3 | SCHEMA_VERSION => {}
         version => return Err(SessionCodecError::UnsupportedVersion(version)),
     }
     if payload.snapshot.content != envelope.content {

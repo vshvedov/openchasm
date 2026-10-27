@@ -120,6 +120,7 @@ fn destroying_level_16_heart_runs_its_atomic_process() {
             weapon_id + 1,
             RocketDefinition {
                 model_name: String::new(),
+                animation_name: String::new(),
                 power: 0,
                 raw_fields: vec![],
             },

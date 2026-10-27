@@ -6,7 +6,7 @@ use crate::content::ResourceSet;
 use crate::object_render::CameraView;
 use crate::texture::Palette;
 use openchasm::combat::RocketDefinitions;
-use openchasm::model::{Model, SKIN_WIDTH};
+use openchasm::model::{Animation, Model, Vertex as ModelVertex, SKIN_WIDTH};
 use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
@@ -22,12 +22,35 @@ pub struct ProjectileVisual {
     pub position: [f32; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// Time since launch, in simulation seconds (unchanged by reflection).
+    pub elapsed_seconds: f32,
+}
+
+struct RocketMesh {
+    model: Model,
+    animation: Option<Animation>,
+}
+impl RocketMesh {
+    fn vertices(&self, elapsed_seconds: f32) -> &[ModelVertex] {
+        let Some(animation) = self.animation.as_ref().filter(|a| !a.frames.is_empty()) else {
+            return &self.model.vertices;
+        };
+        let time = if elapsed_seconds.is_finite() {
+            elapsed_seconds.max(0.0) as f64
+        } else {
+            0.0
+        };
+        let frame = (time * 18.0)
+            .round()
+            .rem_euclid(animation.frames.len() as f64) as usize;
+        &animation.frames[frame]
+    }
 }
 
 pub struct ProjectileRenderer {
     /// Indexed by RocketDefinitions entry; empty instant shots have no model.
     rocket_models: Vec<Option<usize>>,
-    models: Vec<Model>,
+    models: Vec<RocketMesh>,
     palette: [u32; 256],
 }
 
@@ -49,7 +72,7 @@ impl ProjectileRenderer {
     ) -> Self {
         let mut models = Vec::new();
         let mut rocket_models = Vec::with_capacity(rockets.0.len());
-        let mut cache: HashMap<String, Option<usize>> = HashMap::new();
+        let mut cache: HashMap<(String, Option<String>), Option<usize>> = HashMap::new();
         let mut warnings = BTreeSet::new();
         for definition in &rockets.0 {
             let Some(path) = model_path(&definition.model_name) else {
@@ -59,19 +82,53 @@ impl ProjectileRenderer {
                 rocket_models.push(None);
                 continue;
             };
-            let model = *cache.entry(path.clone()).or_insert_with(|| {
-                match resources.read(&path).and_then(|data| Model::parse(&data)) {
-                    Ok(model) => {
-                        let index = models.len();
-                        models.push(model);
-                        Some(index)
-                    }
-                    Err(error) => {
-                        warnings.insert(format!("{path}: {error}"));
-                        None
-                    }
+            let animation_path = if definition.animation_name.trim().is_empty() {
+                None
+            } else {
+                let path = model_path(&definition.animation_name);
+                if path.is_none() {
+                    warnings.insert(format!(
+                        "invalid projectile animation name {:?}",
+                        definition.animation_name
+                    ));
                 }
-            });
+                path
+            };
+            let model = *cache
+                .entry((path.clone(), animation_path.clone()))
+                .or_insert_with(|| {
+                    match resources.read(&path).and_then(|data| Model::parse(&data)) {
+                        Ok(model) => {
+                            let animation =
+                                animation_path.as_ref().and_then(|path| {
+                                    match resources
+                                        .read(path)
+                                        .and_then(|bytes| Animation::parse(&bytes))
+                                    {
+                                        Ok(animation) if animation.matches_model(&model) => {
+                                            Some(animation)
+                                        }
+                                        Ok(_) => {
+                                            warnings
+                                                .insert(format!("{path}: vertex count mismatch"));
+                                            None
+                                        }
+                                        Err(error) => {
+                                            warnings.insert(format!("{path}: {error}"));
+                                            None
+                                        }
+                                    }
+                                });
+                            let index = models.len();
+                            models.push(RocketMesh { model, animation });
+                            Some(index)
+                        }
+                        Err(error) => {
+                            warnings.insert(format!("{path}: {error}"));
+                            None
+                        }
+                    }
+                });
             rocket_models.push(model);
         }
         for warning in warnings {
@@ -135,10 +192,11 @@ impl ProjectileRenderer {
             };
             let (yaw_sin, yaw_cos) = (projectile.yaw - std::f32::consts::FRAC_PI_2).sin_cos();
             let (pitch_sin, pitch_cos) = projectile.pitch.sin_cos();
-            for polygon in &mesh.polygons {
+            let pose = mesh.vertices(projectile.elapsed_seconds);
+            for polygon in &mesh.model.polygons {
                 let mut vertices = Vec::with_capacity(polygon.vertex_count());
                 for corner in 0..polygon.vertex_count() {
-                    let [x, y, z] = mesh.vertices[polygon.vertices[corner] as usize]
+                    let [x, y, z] = pose[polygon.vertices[corner] as usize]
                         .position
                         .map(|p| f32::from(p) * MODEL_SCALE);
                     // Source rocket meshes face +Y. Rotate pitch about local X,
@@ -171,7 +229,7 @@ impl ProjectileRenderer {
                             project(clipped[i], width, height, camera.horizon(height)),
                             project(clipped[i + 1], width, height, camera.horizon(height)),
                         ],
-                        mesh,
+                        &mesh.model,
                         polygon.flags,
                     );
                 }
@@ -321,6 +379,107 @@ mod tests {
     use openchasm::model::{Polygon, Vertex as ModelVertex};
     use openchasm::world::Player;
 
+    #[test]
+    fn projectile_animations_follow_launch_age_and_cache_animation_identity() {
+        let path =
+            std::env::temp_dir().join(format!("openchasm-rocket-anim-{}", std::process::id()));
+        std::fs::create_dir_all(path.join("model")).unwrap();
+        let mut model = vec![0u8; 0x4806 + 64];
+        for (i, value) in [0u16, 1, 2, 255].iter().enumerate() {
+            model[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        model[0x4800..0x4802].copy_from_slice(&3u16.to_le_bytes());
+        model[0x4802..0x4804].copy_from_slice(&1u16.to_le_bytes());
+        model[0x4804..0x4806].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(path.join("model/a.3o"), model).unwrap();
+        let mut animation = vec![0u8; 2 + 3 * 6 * 2];
+        animation[..2].copy_from_slice(&3u16.to_le_bytes());
+        animation[20..22].copy_from_slice(&512i16.to_le_bytes());
+        std::fs::write(path.join("model/a.ani"), animation).unwrap();
+        let info = b"[ROCKETS]\n3\n3d_MODEL=a.3o\nANIMATION=a.ani\n1 0 0 1 1\n3d_MODEL=a.3o\nANIMATION=missing.ani\n1 0 0 1 1\n3d_MODEL=a.3o\nANIMATION=../bad.ani\n1 0 0 1 1\n";
+        let rockets = RocketDefinitions::parse(info).unwrap();
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let palette = Palette::parse(&[0; 768]).unwrap();
+        let renderer = ProjectileRenderer::load(&mut resources, &rockets, &palette);
+        let animated = &renderer.models[renderer.rocket_models[0].unwrap()];
+        let static_fallback = &renderer.models[renderer.rocket_models[1].unwrap()];
+        assert_ne!(renderer.rocket_models[0], renderer.rocket_models[1]);
+        assert_eq!(animated.vertices(0.0)[0].position[0], 0);
+        assert_eq!(animated.vertices(1.0 / 18.0)[0].position[0], 512);
+        assert_eq!(animated.vertices(2.0 / 18.0)[0].position[0], 0);
+        assert_eq!(animated.vertices(f32::NAN)[0].position[0], 0);
+        assert_eq!(
+            static_fallback.vertices(1.0)[0],
+            static_fallback.model.vertices[0]
+        );
+        assert!(renderer.models[renderer.rocket_models[2].unwrap()]
+            .animation
+            .is_none());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn projectile_animation_changes_rendered_pose_and_keeps_wall_occlusion() {
+        let mut renderer = renderer();
+        let first = renderer.models[0].model.vertices.clone();
+        let mut second = first.clone();
+        for vertex in &mut second {
+            vertex.position[2] += 512;
+        }
+        renderer.models[0].animation = Some(Animation {
+            vertex_count: first.len() as u16,
+            frames: vec![first, second],
+        });
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [1.0, 0.0, 1.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        let mut first_frame = vec![0; 64 * 64];
+        let mut second_frame = first_frame.clone();
+        let mut depth = vec![f32::INFINITY; first_frame.len()];
+        renderer.render(&mut first_frame, &mut depth, 64, 64, camera, &[shot]);
+        shot.elapsed_seconds = 1.0 / 18.0;
+        depth.fill(f32::INFINITY);
+        renderer.render(&mut second_frame, &mut depth, 64, 64, camera, &[shot]);
+        assert_ne!(first_frame, second_frame);
+        second_frame.fill(0);
+        depth.fill(0.1);
+        renderer.render(&mut second_frame, &mut depth, 64, 64, camera, &[shot]);
+        assert!(second_frame.iter().all(|pixel| *pixel == 0));
+    }
+
+    #[test]
+    fn installed_projectile_animation_assets_load_when_available() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let rockets = RocketDefinitions::parse(&resources.read("chasm.inf").unwrap()).unwrap();
+        assert_eq!(rockets.0[0].animation_name, "disk.ani");
+        assert_eq!(rockets.0[6].animation_name, "3arow_.ani");
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let renderer = ProjectileRenderer::load(&mut resources, &rockets, &palette);
+        let mesh = &renderer.models[renderer.rocket_models[0].unwrap()];
+        assert!(mesh.animation.as_ref().unwrap().frames.len() > 1);
+        assert_ne!(mesh.vertices(0.0), mesh.vertices(1.0 / 18.0));
+    }
+
     fn renderer() -> ProjectileRenderer {
         let vertex = |y, z| ModelVertex {
             position: [0, y, z],
@@ -343,7 +502,10 @@ mod tests {
         palette[1] = 0xff0000;
         ProjectileRenderer {
             rocket_models: vec![Some(0), None],
-            models: vec![model],
+            models: vec![RocketMesh {
+                model,
+                animation: None,
+            }],
             palette,
         }
     }
@@ -361,6 +523,7 @@ mod tests {
             position: [1.0, 0.0, 1.0],
             yaw: std::f32::consts::FRAC_PI_2,
             pitch: 0.0,
+            elapsed_seconds: 0.0,
         };
         renderer.render(
             &mut frame,
@@ -431,6 +594,7 @@ mod tests {
             position: [1.0, 0.0, 1.0],
             yaw: std::f32::consts::FRAC_PI_2,
             pitch: 0.0,
+            elapsed_seconds: 0.0,
         };
         let mut frame = vec![0; 64 * 64];
         let mut depth = vec![f32::INFINITY; 64 * 64];
@@ -481,6 +645,7 @@ mod tests {
             position: [f32::NAN, 0.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            elapsed_seconds: 0.0,
         };
         renderer().render(
             &mut frame,

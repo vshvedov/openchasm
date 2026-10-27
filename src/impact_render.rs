@@ -313,6 +313,7 @@ mod tests {
         let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
         let rockets = RocketDefinitions(vec![RocketDefinition {
             model_name: String::new(),
+            animation_name: String::new(),
             power: 1,
             raw_fields: vec![1],
         }]);

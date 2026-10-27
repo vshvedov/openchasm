@@ -730,7 +730,12 @@ impl Session {
         }
         candidate
             .projectiles
-            .restore(&snapshot.projectiles, &candidate.rockets, &candidate.actors)
+            .restore_with_vertical(
+                &snapshot.projectiles,
+                &candidate.rockets,
+                &candidate.actors,
+                &snapshot.projectile_vertical_speeds,
+            )
             .map_err(|_| SessionSnapshotError::Component("projectiles"))?;
         candidate
             .mines
@@ -766,11 +771,10 @@ impl Session {
                     "projectile vertical speeds",
                 ));
             };
-            let maximum = projectile.velocity[0].hypot(projectile.velocity[1])
-                * MAX_PLAYER_PITCH.tan()
-                + 0.001;
-            if projectile.owner != Owner::Player
-                || speed.abs() > maximum
+            let horizontal = projectile.velocity[0].hypot(projectile.velocity[1]);
+            let player_launch =
+                projectile.owner == Owner::Player && projectile.reflected_from.is_none();
+            if (player_launch && speed.abs() > horizontal * MAX_PLAYER_PITCH.tan() + 0.001)
                 || !ids.contains(&id)
                 || !speed.is_finite()
                 || speed.abs() > 64.0
@@ -1455,6 +1459,33 @@ impl Session {
         }
         Ok((walls, base_blocking))
     }
+    /// Provisional generic muzzle; reference target is player feet + 0.5.
+    fn spawn_enemy_projectile(
+        &mut self,
+        source_index: usize,
+        rocket_id: usize,
+        origin: [f32; 2],
+        target: [f32; 2],
+    ) -> Option<u64> {
+        let launch = Launch {
+            owner: Owner::Enemy { source_index },
+            rocket_id,
+            origin,
+            direction: [target[0] - origin[0], target[1] - origin[1]],
+        };
+        let id = self.projectiles.spawn(launch, &self.rockets).ok()?;
+        let muzzle = 0.5;
+        let horizontal = (target[0] - origin[0]).hypot(target[1] - origin[1]);
+        let pitch = (self.vertical.feet() + 0.5 - muzzle).atan2(horizontal);
+        let Some(speed) = self.projectiles.apply_launch_pitch(id, pitch) else {
+            self.projectiles.take(id);
+            return None;
+        };
+        self.projectile_heights.insert(id, muzzle);
+        self.projectile_vertical_speeds.insert(id, speed);
+        Some(id)
+    }
+
     fn advance_projectile_heights(&mut self, dt: f32, frozen: &BTreeSet<u64>) {
         for projectile in self.projectiles.active() {
             if frozen.contains(&projectile.id) {
@@ -3032,15 +3063,11 @@ impl Session {
                 if let Ok(id) = spawned {
                     self.projectile_heights.insert(id, self.vertical.eye());
                     if self.pitch != 0.0 {
-                        if let Some(projectile) =
-                            self.projectiles.active().iter().find(|p| p.id == id)
-                        {
-                            self.projectile_vertical_speeds.insert(
-                                id,
-                                projectile.velocity[0].hypot(projectile.velocity[1])
-                                    * self.pitch.tan(),
-                            );
-                        }
+                        let speed = self
+                            .projectiles
+                            .apply_launch_pitch(id, self.pitch)
+                            .expect("spawned projectile and validated pitch");
+                        self.projectile_vertical_speeds.insert(id, speed);
                     }
                 } else {
                     self.game.inventory.ammo[self.selected_weapon] =
@@ -3205,18 +3232,7 @@ impl Session {
                 target,
             } = attack.kind
             {
-                let launch = Launch {
-                    owner: Owner::Enemy {
-                        source_index: attack.source_index,
-                    },
-                    rocket_id,
-                    origin,
-                    direction: [target[0] - origin[0], target[1] - origin[1]],
-                };
-                let spawned = self.projectiles.spawn(launch, &self.rockets);
-                if let Ok(id) = spawned {
-                    self.projectile_heights.insert(id, 1.0);
-                }
+                self.spawn_enemy_projectile(attack.source_index, rocket_id, origin, target);
                 continue;
             }
             events.damage = events
@@ -3828,11 +3844,11 @@ mod tests {
         let envelope = save_format::decode(&encoded).unwrap();
         let original: serde_json::Value = serde_json::from_slice(envelope.payload).unwrap();
         let mut future = original.clone();
-        future["version"] = 4.into();
+        future["version"] = 5.into();
         let envelope = save_format::encode(digest, &serde_json::to_vec(&future).unwrap()).unwrap();
         assert!(matches!(
             session_codec::decode(&envelope, digest),
-            Err(session_codec::SessionCodecError::UnsupportedVersion(4))
+            Err(session_codec::SessionCodecError::UnsupportedVersion(5))
         ));
         let mut legacy = original.clone();
         legacy["version"] = 1.into();
@@ -3864,6 +3880,11 @@ mod tests {
             .remove("projectile_vertical_speeds");
         let envelope =
             save_format::encode(digest, &serde_json::to_vec(&legacy_v2).unwrap()).unwrap();
+        assert_eq!(session_codec::decode(&envelope, digest).unwrap(), snapshot);
+        let mut legacy_v3 = original.clone();
+        legacy_v3["version"] = 3.into();
+        let envelope =
+            save_format::encode(digest, &serde_json::to_vec(&legacy_v3).unwrap()).unwrap();
         assert_eq!(session_codec::decode(&envelope, digest).unwrap(), snapshot);
         let mut unknown = original.clone();
         unknown["snapshot"]["world"]["future"] = true.into();
@@ -3913,6 +3934,7 @@ mod tests {
     fn aggregate_snapshot_restores_from_fresh_baseline_atomically() {
         let mut baseline = mission_session("");
         baseline.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: String::new(),
             power: 10,
             raw_fields: vec![0, 0, 0, 0, 10],
@@ -4698,11 +4720,13 @@ mod tests {
         assert!(session.set_object_heights(catalog, cells));
         session.rockets = RocketDefinitions(vec![
             RocketDefinition {
+                animation_name: String::new(),
                 model_name: "".into(),
                 power: 10,
                 raw_fields: vec![0, 0, 0, 0, 10],
             },
             RocketDefinition {
+                animation_name: String::new(),
                 model_name: "rocket.3o".into(),
                 power: 10,
                 raw_fields: vec![0, 0, 0, 1, 10],
@@ -4837,6 +4861,7 @@ mod tests {
         session.game.inventory.ammo[3] = 1;
         session.game.weapons.0[3].rocket_type = 0;
         session.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
             model_name: "rocket.3o".into(),
             power: 10,
             raw_fields: vec![0, 0, 0, 20, 10],
@@ -4876,6 +4901,69 @@ mod tests {
         let (target, height) = ceiling.unwrap();
         assert_eq!(target, ImpactTarget::Plane);
         assert!((height - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn enemy_projectile_tracks_jumping_player_and_reflection_preserves_z() {
+        let mut session = mission_session("");
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 32,
+            actor_radius: 32,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: 0,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement: Monster {
+                position: [256, 128],
+                id: 101,
+                angle: 0,
+                flags: 2,
+            },
+            position: [1.0, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
+            model_name: "rocket.3o".into(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 20, 10],
+        });
+        session.world.player.position = [3.0, 0.5];
+        let baseline = session.clone();
+        session
+            .vertical
+            .step(0.1, true, VerticalBounds::flat_room())
+            .unwrap();
+        assert!(session.vertical.feet() > 0.0);
+        let id = session
+            .spawn_enemy_projectile(7, 0, [1.0, 0.5], [3.0, 0.5])
+            .unwrap();
+        let zspeed = session.projectile_vertical_speeds[&id];
+        assert!(zspeed > 0.0);
+        let projectile = session.projectiles.take(id).unwrap();
+        let horizontal = projectile.velocity[0].hypot(projectile.velocity[1]);
+        assert!((horizontal.hypot(zspeed) - 10.0).abs() < 1e-4);
+        assert!((zspeed / horizontal - session.vertical.feet() / 2.0).abs() < 1e-5);
+        assert!(session
+            .projectiles
+            .reflect_from_player(projectile, [0.0, 0.5]));
+        assert_eq!(session.projectile_vertical_speeds[&id], zspeed);
+        let digest = crate::save_format::ContentDigest([31; 32]);
+        let snapshot = session.snapshot(digest).unwrap();
+        let restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.projectile_vertical_speeds[&id], zspeed);
+        assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
     }
 
     #[test]
@@ -5102,6 +5190,7 @@ mod tests {
         session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
         session.rockets = RocketDefinitions(vec![
             RocketDefinition {
+                animation_name: String::new(),
                 model_name: "bomb.3o".into(),
                 power: 10,
                 raw_fields: vec![1, 0, 0, 10, 10, 0, 0, 0, 0, 0, 0],
@@ -5976,6 +6065,7 @@ mod tests {
         let text = "#proc1\nLock\nEndDelay 0.05\n#end\n#links\ndestroy 1 0 1\n#end\n";
         let mut session = mission_session(text);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "".into(),
             power: 10,
             raw_fields: vec![],
@@ -6034,6 +6124,7 @@ mod tests {
         projectile_session.game.inventory.ammo[3] = 1;
         projectile_session.game.weapons.0[3].rocket_type = 1;
         projectile_session.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
             model_name: "disk.3o".into(),
             power: 10,
             raw_fields: vec![0, 0, 0, 20, 10],
@@ -6497,6 +6588,7 @@ mod tests {
             Difficulty::Normal,
         );
         let rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "".into(),
             power: 10,
             raw_fields: vec![],
@@ -6550,6 +6642,7 @@ mod tests {
         projectile_session.game.inventory.ammo[3] = 2;
         projectile_session.game.weapons.0[3].rocket_type = 1;
         projectile_session.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
             model_name: "disk.3o".into(),
             power: 12,
             raw_fields: vec![0, 0, 0, 20, 12],
@@ -6598,6 +6691,7 @@ mod tests {
         let script = Script::parse(text);
         let mut session = mission_session(text);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "".into(),
             power: 10,
             raw_fields: vec![],
@@ -6671,6 +6765,7 @@ mod tests {
         projectile_retry.game.inventory.ammo[3] = 1;
         projectile_retry.game.weapons.0[3].rocket_type = 1;
         projectile_retry.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
             model_name: "disk.3o".into(),
             power: 10,
             raw_fields: vec![0, 0, 0, 20, 10],
@@ -6748,6 +6843,7 @@ mod tests {
         projectile_success.game.inventory.ammo[3] = 1;
         projectile_success.game.weapons.0[3].rocket_type = 1;
         projectile_success.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
             model_name: "disk.3o".into(),
             power: 10,
             raw_fields: vec![0, 0, 0, 20, 10],
@@ -7112,6 +7208,7 @@ mod tests {
         session.base_wall_blocking.push(true);
         session.wall_elevations.push(0.0);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "grenade.3o".into(),
             power: 100,
             raw_fields: vec![2, 0, 424, 42, 100, 0, 0, 1, 0, 0, 0, 18],
@@ -7180,6 +7277,7 @@ mod tests {
             let mut raw = vec![2, 0, 424, 42, 100, 0, 0, 0, 0, 0, 0];
             raw[index] = 1;
             session.rockets = RocketDefinitions(vec![RocketDefinition {
+                animation_name: String::new(),
                 model_name: "grenade.3o".into(),
                 power: 100,
                 raw_fields: raw,
@@ -7549,6 +7647,7 @@ mod tests {
         });
         session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "gravity.3o".into(),
             power: 100,
             raw_fields: vec![4, 3, 640, 42, 100, 1, 0, 0, 0, 1, 0],
@@ -7799,6 +7898,7 @@ mod tests {
             false,
         ));
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "grenade.3o".into(),
             power: 100,
             raw_fields: vec![2, 0, 424, 42, 100, 0, 0, 1, 0, 0, 0, 18],
@@ -7812,6 +7912,7 @@ mod tests {
             ..Default::default()
         });
         session.rockets.0.push(RocketDefinition {
+            animation_name: String::new(),
             model_name: "arrow.3o".into(),
             power: 10,
             raw_fields: vec![1, 0, 120, 0, 10, 0],
@@ -7901,6 +8002,7 @@ mod tests {
         });
         session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "arrow.3o".into(),
             power: 20,
             raw_fields: vec![1, 0, 120, 0, 20, 0],
@@ -7970,6 +8072,7 @@ mod tests {
         session.actors.actors[1].definition_index = 1;
         session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: String::new(),
             power: 20,
             raw_fields: vec![],
@@ -8382,6 +8485,7 @@ mod tests {
         let mut projectile = mission_session("");
         projectile.game.inventory.armor = 100;
         projectile.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "arrow.3o".into(),
             power: 20,
             raw_fields: vec![1, 0, 120, 0, 20, 0],
@@ -8492,6 +8596,7 @@ mod tests {
         });
         session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "arrow.3o".into(),
             power: 20,
             raw_fields: vec![1, 0, 120, 0, 20, 0],
@@ -8596,6 +8701,7 @@ mod tests {
         session.game.protective_powerups.reflector_ticks_remaining = 100;
         session.set_explosions_enabled(true);
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "grenade.3o".into(),
             power: 20,
             raw_fields: vec![2, 0, 424, 0, 20, 0],
@@ -8742,6 +8848,7 @@ mod tests {
         session.set_protective_powerups_enabled(true);
         session.game.protective_powerups.reflector_ticks_remaining = 1;
         session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
             model_name: "arrow.3o".into(),
             power: 20,
             raw_fields: vec![1, 0, 120, 0, 20, 0],

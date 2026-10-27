@@ -116,6 +116,7 @@ fn level08_destroy_arms_delayed_hazards_and_switch_changes() {
             weapon_id + 1,
             RocketDefinition {
                 model_name: String::new(),
+                animation_name: String::new(),
                 power: 0,
                 raw_fields: vec![],
             },

@@ -1390,6 +1390,7 @@ pub fn run(
             .iter()
             .map(|projectile| ProjectileVisual {
                 rocket_type: projectile.rocket_id,
+                elapsed_seconds: projectile.elapsed_seconds(),
                 position: [
                     projectile.position[0],
                     projectile.position[1],

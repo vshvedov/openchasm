@@ -8,7 +8,7 @@ use crate::combat::RocketDefinitions;
 use crate::map::UNITS_PER_TILE;
 use crate::object_combat::ObjectCombat;
 use crate::world::{Wall, World};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const DEFAULT_SPEED: f32 = 10.0; // tiles per second
 const FAST_SPEED: f32 = 20.0;
@@ -76,6 +76,13 @@ pub struct Projectile {
     pub radius: f32,
     pub damage: i32,
     pub remaining: f32,
+}
+
+impl Projectile {
+    /// Time since spawn under the provisional fixed ten-second lifetime.
+    pub fn elapsed_seconds(&self) -> f32 {
+        (DEFAULT_LIFETIME - self.remaining).max(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +274,25 @@ impl ProjectileSystem {
         rockets: &RocketDefinitions,
         actors: &ActorState,
     ) -> Result<(), ProjectileSnapshotError> {
+        self.restore_with_vertical(value, rockets, actors, &[])
+    }
+
+    /// Restore horizontal and optional host-owned vertical velocities together.
+    /// Legacy snapshots with full horizontal speed remain valid; new pitched
+    /// shots instead preserve the authored total 3D speed.
+    pub fn restore_with_vertical(
+        &mut self,
+        value: &ProjectileSystemSnapshot,
+        rockets: &RocketDefinitions,
+        actors: &ActorState,
+        vertical: &[(u64, f32)],
+    ) -> Result<(), ProjectileSnapshotError> {
+        let mut vertical_by_id = BTreeMap::new();
+        for &(id, speed) in vertical {
+            if !speed.is_finite() || vertical_by_id.insert(id, speed).is_some() {
+                return Err(ProjectileSnapshotError::InvalidValue);
+            }
+        }
         if value.projectiles.len() > MAX_PROJECTILES {
             return Err(ProjectileSnapshotError::Capacity);
         }
@@ -311,12 +337,17 @@ impl ProjectileSystem {
             } else {
                 DEFAULT_SPEED
             };
+            let horizontal_speed = p.velocity[0].hypot(p.velocity[1]);
+            let vertical_speed = vertical_by_id.get(&p.id).copied().unwrap_or(0.0);
+            let normalized = (horizontal_speed.hypot(vertical_speed) - speed).abs() <= 0.001;
+            let legacy = (horizontal_speed - speed).abs() <= 0.001
+                && (vertical_speed == 0.0 || (owner == Owner::Player && reflected_from.is_none()));
             if !p
                 .position
                 .iter()
                 .all(|v| v.is_finite() && v.abs() <= 4096.0)
                 || !p.velocity.iter().all(|v| v.is_finite())
-                || (p.velocity[0].hypot(p.velocity[1]) - speed).abs() > 0.001
+                || !(normalized || legacy)
                 || !p.radius.is_finite()
                 || p.radius != radius
                 || p.damage != rocket.power
@@ -336,6 +367,9 @@ impl ProjectileSystem {
                 damage: p.damage,
                 remaining: p.remaining,
             });
+        }
+        if vertical_by_id.keys().any(|id| !ids.contains(id)) {
+            return Err(ProjectileSnapshotError::IdOutOfRange);
         }
         self.projectiles = projectiles;
         self.next_id = value.next_id;
@@ -717,6 +751,27 @@ impl ProjectileSystem {
         Ok(id)
     }
 
+    /// Normalize a newly spawned horizontal shot into a 3D launch. Returns its
+    /// vertical speed for the host's height state. Existing flight is unchanged
+    /// if the id/pitch is invalid. The caller retains this value on reflection.
+    pub fn apply_launch_pitch(&mut self, id: u64, pitch: f32) -> Option<f32> {
+        if !pitch.is_finite() || pitch.abs() >= std::f32::consts::FRAC_PI_2 {
+            return None;
+        }
+        let projectile = self
+            .projectiles
+            .iter_mut()
+            .find(|projectile| projectile.id == id)?;
+        let speed = projectile.velocity[0].hypot(projectile.velocity[1]);
+        if !speed.is_finite() || speed <= 0.0 {
+            return None;
+        }
+        let (sin, cos) = pitch.sin_cos();
+        projectile.velocity[0] *= cos;
+        projectile.velocity[1] *= cos;
+        Some(speed * sin)
+    }
+
     /// Conservative opt-in path: no gravity, bounce, or homing physics.
     pub fn spawn_straight(
         &mut self,
@@ -990,6 +1045,81 @@ mod tests {
         assert_eq!(system.spawn(shot, &rockets), Err(SpawnError::InvalidLaunch));
         assert!(system.active().is_empty());
     }
+    #[test]
+    fn pitched_launch_validates_angles_and_preserves_fast_speed() {
+        let (mut rockets, ..) = setup();
+        rockets.0[0].raw_fields.resize(11, 0);
+        rockets.0[0].raw_fields[10] = 1;
+        for pitch in [-1.0_f32, 0.0, 1.0] {
+            let mut system = ProjectileSystem::new();
+            let id = system
+                .spawn(launch(Owner::Player, [0.0, 0.0], [1.0, 0.0]), &rockets)
+                .unwrap();
+            let before = system.active()[0].velocity;
+            assert!(system.apply_launch_pitch(id, f32::NAN).is_none());
+            assert!(system
+                .apply_launch_pitch(id, std::f32::consts::FRAC_PI_2)
+                .is_none());
+            assert_eq!(system.active()[0].velocity, before);
+            let vz = system.apply_launch_pitch(id, pitch).unwrap();
+            let shot = &system.active()[0];
+            assert!((shot.velocity[0].hypot(shot.velocity[1]).hypot(vz) - FAST_SPEED).abs() < 1e-4);
+            assert!((vz - FAST_SPEED * pitch.sin()).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn normalized_pitch_preserves_speed_and_reflection_with_legacy_restore() {
+        let (rockets, _, actors, _) = setup();
+        let mut system = ProjectileSystem::new();
+        let id = system
+            .spawn(
+                launch(Owner::Enemy { source_index: 0 }, [1.0, 0.0], [-1.0, 0.0]),
+                &rockets,
+            )
+            .unwrap();
+        let vertical = system.apply_launch_pitch(id, 0.6).unwrap();
+        let horizontal = system.active()[0].velocity[0].hypot(system.active()[0].velocity[1]);
+        assert!((horizontal - DEFAULT_SPEED * 0.6f32.cos()).abs() < 1e-5);
+        assert!((horizontal.hypot(vertical) - DEFAULT_SPEED).abs() < 1e-5);
+        let incoming = system.take(id).unwrap();
+        assert!(system.reflect_from_player(incoming, [0.0, 0.0]));
+        assert!(
+            (system.active()[0].velocity[0]
+                .hypot(system.active()[0].velocity[1])
+                .hypot(vertical)
+                - DEFAULT_SPEED)
+                .abs()
+                < 1e-5
+        );
+        let saved = system.snapshot().unwrap();
+        let mut restored = ProjectileSystem::new();
+        restored
+            .restore_with_vertical(&saved, &rockets, &actors, &[(id, vertical)])
+            .unwrap();
+        assert_eq!(restored.snapshot().unwrap(), saved);
+        assert!(restored.restore(&saved, &rockets, &actors).is_err());
+        let mut legacy = saved.clone();
+        legacy.projectiles[0].velocity = [DEFAULT_SPEED, 0.0];
+        legacy.projectiles[0].reflected_from = None;
+        restored
+            .restore_with_vertical(
+                &legacy,
+                &rockets,
+                &actors,
+                &[(id, DEFAULT_SPEED * 0.6f32.tan())],
+            )
+            .unwrap();
+        assert_eq!(restored.snapshot().unwrap(), legacy);
+        let mut invalid = saved.clone();
+        invalid.projectiles[0].velocity = [1.0, 0.0];
+        assert_eq!(
+            restored.restore_with_vertical(&invalid, &rockets, &actors, &[(id, vertical)]),
+            Err(ProjectileSnapshotError::InvalidValue)
+        );
+        assert_eq!(restored.snapshot().unwrap(), legacy);
+    }
+
     #[test]
     fn fast_flag_selects_the_authored_projectile_speed() {
         let (mut rockets, ..) = setup();

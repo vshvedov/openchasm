@@ -21,6 +21,8 @@ fn invalid(message: impl Into<String>) -> io::Error {
 pub struct RocketDefinition {
     /// An empty model field indicates an instant projectile in the game's manual.
     pub model_name: String,
+    /// Optional authored ANI filename; an empty value means a static pose.
+    pub animation_name: String,
     pub power: i32,
     /// The complete numeric row is retained for future projectile behavior.
     pub raw_fields: Vec<i32>,
@@ -52,6 +54,7 @@ impl RocketDefinitions {
         }
         let mut rows = Vec::with_capacity(count);
         let mut model: Option<String> = None;
+        let mut animation = String::new();
         for (line_number, raw) in lines {
             if rows.len() == count {
                 break;
@@ -66,6 +69,9 @@ impl RocketDefinitions {
             if let Some((name, value)) = line.split_once('=') {
                 if name.trim().eq_ignore_ascii_case("3d_model") {
                     model = Some(value.trim().to_owned());
+                    animation.clear();
+                } else if name.trim().eq_ignore_ascii_case("animation") {
+                    animation = value.trim().to_owned();
                 }
                 continue;
             }
@@ -92,6 +98,7 @@ impl RocketDefinitions {
             })?;
             rows.push(RocketDefinition {
                 model_name,
+                animation_name: std::mem::take(&mut animation),
                 power: values[4],
                 raw_fields: values,
             });
@@ -1060,5 +1067,12 @@ mod tests {
         assert!(RocketDefinitions::parse(b"[ROCKETS]\n1\n1 2 3 4 5\n").is_err());
         assert!(RocketDefinitions::parse(b"[ROCKETS]\n1\n3d_MODEL=\n1 2 3 bad 5\n").is_err());
         assert!(RocketDefinitions::parse(b"[ROCKETS]\n2\n3d_MODEL=\n1 2 3 4 5\n").is_err());
+    }
+    #[test]
+    fn rocket_parser_keeps_each_authored_animation_without_leaking_to_next_row() {
+        let definitions = RocketDefinitions::parse(b"[ROCKETS]\n3\n3d_MODEL=disk.3o\nANIMATION=disk.ani\n1 0 0 1 5\n3d_MODEL=other.3o\n1 0 0 1 5\n3d_MODEL=\nANIMATION=\n1 0 0 1 5\n").unwrap();
+        assert_eq!(definitions.0[0].animation_name, "disk.ani");
+        assert!(definitions.0[1].animation_name.is_empty());
+        assert!(definitions.0[2].animation_name.is_empty());
     }
 }

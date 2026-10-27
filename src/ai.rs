@@ -1143,11 +1143,13 @@ mod tests {
     fn rockets() -> RocketDefinitions {
         RocketDefinitions(vec![
             crate::combat::RocketDefinition {
+                animation_name: String::new(),
                 model_name: "".into(),
                 power: 12,
                 raw_fields: vec![],
             },
             crate::combat::RocketDefinition {
+                animation_name: String::new(),
                 model_name: "disk.3o".into(),
                 power: 25,
                 raw_fields: vec![],

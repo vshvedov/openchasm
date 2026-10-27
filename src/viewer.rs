@@ -1,6 +1,11 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
+//!
+//! F5/F9 provide a same-level in-memory quicksave only. The snapshot includes
+//! simulation and scene instance/animation state; transient explosion sprites
+//! are cleared on load and already-playing audio is not rewound. No data is
+//! written to disk; the checkpoint is lost on leaving the viewer/level.
 use crate::audio::Audio;
-use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene};
+use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot};
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
 use crate::texture::CelImage;
@@ -264,7 +269,7 @@ fn draw_header(frame: &mut [u32], label: &str) {
         frame,
         8,
         32,
-        "EARLY GAMEPLAY PREVIEW - BEHAVIOR IS PROVISIONAL",
+        "PREVIEW: F5 QUICKSAVE  F9 QUICKLOAD  R RESTART  ESC QUIT",
     );
 }
 
@@ -307,6 +312,23 @@ fn restore_level_visibility(objects: &mut ObjectScene, session: &Session, diffic
             );
         }
     }
+}
+
+// In-memory checkpoint scoped to this viewer's current level and assets.
+struct QuickSave {
+    session: Session,
+    scene: ObjectSceneSnapshot,
+    animation_tick: u64,
+    shoot_ticks: usize,
+    current_message: Option<(Vec<String>, f32)>,
+    completed: bool,
+    shot_feedback: Option<(&'static str, f32)>,
+}
+
+#[derive(Clone, Copy)]
+enum CheckpointCommand {
+    Save,
+    Load,
 }
 
 pub struct ClientFeedback {
@@ -385,7 +407,9 @@ pub fn run(
     let mut pending_weapon = None;
     let mut shoot_ticks = 0usize;
     let mut current_message: Option<(Vec<String>, f32)> = None;
-    let mut shot_feedback: Option<(&str, f32)> = None;
+    let mut shot_feedback: Option<(&'static str, f32)> = None;
+    let mut quicksave: Option<QuickSave> = None;
+    let mut checkpoint_notice: Option<(&'static str, f32)> = None;
     let mut completed = false;
     let number_keys = [
         Scancode::Num1,
@@ -402,6 +426,7 @@ pub fn run(
         let frame_start = Instant::now();
         let mut restart_requested = false;
         let mut advance_requested = false;
+        let mut checkpoint_command = None;
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => running = false,
@@ -431,14 +456,18 @@ pub fn run(
                     repeat,
                     ..
                 } if look.focused => {
-                    held.insert(code);
                     if !repeat {
+                        held.insert(code);
                         if code == Scancode::Escape {
                             running = false;
                         } else if code == Scancode::R {
                             restart_requested = true;
                         } else if code == Scancode::Return {
                             advance_requested = true;
+                        } else if code == Scancode::F5 {
+                            checkpoint_command = Some(CheckpointCommand::Save);
+                        } else if code == Scancode::F9 {
+                            checkpoint_command = Some(CheckpointCommand::Load);
                         } else if code == Scancode::E {
                             pending_interact = true;
                         } else if code == Scancode::Space {
@@ -549,6 +578,52 @@ pub fn run(
             completed = false;
             look.pending_dx = 0;
         }
+        if let Some(command) = checkpoint_command {
+            match command {
+                CheckpointCommand::Save => {
+                    quicksave = Some(QuickSave {
+                        session: session.clone(),
+                        scene: objects.snapshot(),
+                        animation_tick,
+                        shoot_ticks,
+                        current_message: current_message.clone(),
+                        completed,
+                        shot_feedback,
+                    });
+                    checkpoint_notice = Some(("QUICKSAVED (MEMORY ONLY)", 2.0));
+                }
+                CheckpointCommand::Load => {
+                    if let Some(saved) = &quicksave {
+                        if objects.restore(&saved.scene) {
+                            session = saved.session.clone();
+                            animation_tick = saved.animation_tick;
+                            shoot_ticks = saved.shoot_ticks;
+                            current_message = saved.current_message.clone();
+                            completed = saved.completed;
+                            shot_feedback = saved.shot_feedback;
+                            if let Some(renderer) = &mut explosion_renderer {
+                                renderer.clear();
+                            }
+                            // Leave window focus/capture unchanged; discard all
+                            // inputs accumulated before the restored state.
+                            held.clear();
+                            mouse_fire = false;
+                            pending_interact = false;
+                            pending_jump = false;
+                            pending_weapon = None;
+                            look.pending_dx = 0;
+                            accumulator = 0.0;
+                            advance_requested = false;
+                            checkpoint_notice = Some(("QUICKLOADED", 2.0));
+                        } else {
+                            checkpoint_notice = Some(("QUICKLOAD UNAVAILABLE", 2.0));
+                        }
+                    } else {
+                        checkpoint_notice = Some(("NO QUICKSAVE", 2.0));
+                    }
+                }
+            }
+        }
         if completed && advance_requested {
             sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
@@ -572,6 +647,12 @@ pub fn run(
             pending_weapon = None;
             if session.selected_weapon != old_weapon {
                 shot_feedback = None;
+            }
+            if let Some((_, remaining)) = &mut checkpoint_notice {
+                *remaining -= STEP;
+            }
+            if checkpoint_notice.is_some_and(|(_, remaining)| remaining <= 0.0) {
+                checkpoint_notice = None;
             }
             if let Some((_, remaining)) = &mut shot_feedback {
                 *remaining -= STEP;
@@ -824,6 +905,9 @@ pub fn run(
             for (row, line) in lines.iter().enumerate().take(6) {
                 text(&mut frame, 8, 52 + row * 10, line);
             }
+        }
+        if let Some((message, _)) = checkpoint_notice {
+            text(&mut frame, 8, HEIGHT - 54, message);
         }
         if let Some((message, _)) = shot_feedback {
             text(&mut frame, 8, HEIGHT - 42, message);

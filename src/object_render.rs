@@ -101,6 +101,7 @@ struct Mesh {
     gltf_actor_clips: [Option<GltfClip>; 20],
 }
 
+#[derive(Clone)]
 struct Instance {
     mesh: usize,
     position: [f32; 2],
@@ -184,6 +185,12 @@ fn gltf_radius(model: &GltfModel) -> f32 {
         }
     }
     radius
+}
+
+/// Compact same-scene presentation checkpoint; meshes remain shared.
+#[derive(Clone)]
+pub struct ObjectSceneSnapshot {
+    instances: Vec<Instance>,
 }
 
 /// A deduplicated collection of static object meshes and placements.
@@ -1078,6 +1085,35 @@ impl ObjectScene {
         }
         self.mine_mesh = mesh;
         mesh.is_some()
+    }
+
+    /// Capture per-instance visibility, pose, mesh and animation clocks without
+    /// copying immutable model assets. Only valid for this same scene.
+    pub fn snapshot(&self) -> ObjectSceneSnapshot {
+        ObjectSceneSnapshot {
+            instances: self.instances.clone(),
+        }
+    }
+
+    /// Restore a same-scene checkpoint atomically after verifying identities
+    /// and mesh references. Returns false without changes for another scene.
+    pub fn restore(&mut self, snapshot: &ObjectSceneSnapshot) -> bool {
+        if snapshot.instances.len() != self.instances.len()
+            || !snapshot
+                .instances
+                .iter()
+                .zip(&self.instances)
+                .all(|(saved, current)| {
+                    saved.mesh < self.meshes.len()
+                        && saved.cell == current.cell
+                        && saved.actor_source_index == current.actor_source_index
+                        && saved.original_definition_index == current.original_definition_index
+                })
+        {
+            return false;
+        }
+        self.instances.clone_from(&snapshot.instances);
+        true
     }
 
     /// Update one render-side actor pose by its stable source placement index.
@@ -2404,5 +2440,27 @@ mod tests {
         raster.finish();
         assert_eq!(raster.frame[0], 0x0000ff);
         assert_eq!(raster.depth[0], 1.0);
+    }
+    #[test]
+    fn scene_snapshot_restores_instance_state_and_rejects_incompatible_scene() {
+        let mut scene = gltf_scene(255);
+        scene.instances[0].object_animation_playing = true;
+        scene.instances[0].object_animation_seconds = 0.35;
+        let saved = scene.snapshot();
+        scene.instances[0].visible = false;
+        scene.instances[0].position = [9.0, 7.0];
+        scene.instances[0].elevation = 2.0;
+        scene.instances[0].object_animation_seconds = 1.0;
+        assert!(scene.restore(&saved));
+        let instance = &scene.instances[0];
+        assert!(instance.visible);
+        assert_eq!(instance.position, [2.0, 0.0]);
+        assert_eq!(instance.elevation, 0.0);
+        assert!(instance.object_animation_playing);
+        assert_eq!(instance.object_animation_seconds, 0.35);
+        let mut other = gltf_scene(255);
+        other.instances[0].cell = Some([5, 5]);
+        assert!(!other.restore(&saved));
+        assert_eq!(other.instances[0].cell, Some([5, 5]));
     }
 }

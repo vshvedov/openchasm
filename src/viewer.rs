@@ -185,6 +185,21 @@ impl PauseMenu {
         }
         None
     }
+
+    fn event(&mut self, event: &Event, focused: bool) -> Option<PauseAction> {
+        match event {
+            Event::KeyDown {
+                scancode: Some(code),
+                repeat: false,
+                ..
+            } if focused => self.key(*code),
+            _ => None,
+        }
+    }
+}
+
+fn simulation_active(focused: bool, menu_open: bool, suppress_gameplay: bool) -> bool {
+    focused && !menu_open && !suppress_gameplay
 }
 
 fn draw_pause_menu(frame: &mut [u32], menu: &PauseMenu) {
@@ -793,38 +808,35 @@ pub fn run(
                 if suppress_gameplay {
                     continue;
                 }
-                if let Event::KeyDown {
-                    scancode: Some(code),
-                    repeat: false,
-                    ..
-                } = event
-                {
-                    if look.focused {
-                        match pause.key(code) {
-                            Some(PauseAction::Resume) => {
-                                pause.open = false;
-                                clear_held_controls(
-                                    &mut held,
-                                    &mut mouse_fire,
-                                    &mut look,
-                                    &mut accumulator,
-                                );
-                                pending_interact = false;
-                                pending_jump = false;
-                                pending_weapon = None;
-                                frame_clock.rebase(Instant::now());
-                                suppress_gameplay = true;
-                            }
-                            Some(PauseAction::Save) => {
-                                checkpoint_command = Some(CheckpointCommand::Save)
-                            }
-                            Some(PauseAction::Load) => {
-                                checkpoint_command = Some(CheckpointCommand::Load)
-                            }
-                            Some(PauseAction::Restart) => restart_requested = true,
-                            Some(PauseAction::Exit) => running = false,
-                            None => {}
+                if let Some(action) = pause.event(&event, look.focused) {
+                    match action {
+                        PauseAction::Resume => {
+                            pause.open = false;
+                            clear_held_controls(
+                                &mut held,
+                                &mut mouse_fire,
+                                &mut look,
+                                &mut accumulator,
+                            );
+                            pending_interact = false;
+                            pending_jump = false;
+                            pending_weapon = None;
+                            frame_clock.rebase(Instant::now());
+                            suppress_gameplay = true;
                         }
+                        PauseAction::Save => {
+                            checkpoint_command = Some(CheckpointCommand::Save);
+                            suppress_gameplay = true;
+                        }
+                        PauseAction::Load => {
+                            checkpoint_command = Some(CheckpointCommand::Load);
+                            suppress_gameplay = true;
+                        }
+                        PauseAction::Restart => {
+                            restart_requested = true;
+                            suppress_gameplay = true;
+                        }
+                        PauseAction::Exit => running = false,
                     }
                 }
                 continue;
@@ -923,11 +935,9 @@ pub fn run(
         if !running {
             break;
         }
-        let elapsed = frame_clock.sample(
-            Instant::now(),
-            look.focused && !pause.open && !suppress_gameplay,
-        );
-        if look.focused && !pause.open && !suppress_gameplay {
+        let active = simulation_active(look.focused, pause.open, suppress_gameplay);
+        let elapsed = frame_clock.sample(Instant::now(), active);
+        if active {
             accumulator += elapsed;
         } else {
             accumulator = 0.0;
@@ -1369,6 +1379,54 @@ mod tests {
         menu.key(Scancode::Return);
         assert_eq!(menu.key(Scancode::Return), Some(PauseAction::Restart));
         assert_eq!(menu.key(Scancode::Escape), Some(PauseAction::Resume));
+    }
+    #[test]
+    fn pause_routes_sdl_events_only_when_focused_and_freezes_clock() {
+        use sdl2::keyboard::Mod;
+        fn key(code: Scancode, repeat: bool) -> Event {
+            Event::KeyDown {
+                timestamp: 0,
+                window_id: 1,
+                keycode: None,
+                scancode: Some(code),
+                keymod: Mod::NOMOD,
+                repeat,
+            }
+        }
+        let mut menu = PauseMenu::default();
+        menu.show(Some(PauseAction::Exit));
+        assert_eq!(menu.event(&key(Scancode::Return, false), false), None);
+        assert_eq!(menu.confirm, Some(PauseAction::Exit));
+        assert_eq!(menu.event(&key(Scancode::Return, true), true), None);
+        assert_eq!(menu.event(&key(Scancode::Escape, false), true), None);
+        assert_eq!(
+            menu.event(&key(Scancode::F5, false), true),
+            Some(PauseAction::Save)
+        );
+        assert_eq!(
+            menu.event(&key(Scancode::F9, false), true),
+            Some(PauseAction::Load)
+        );
+        assert_eq!(menu.event(&key(Scancode::W, false), true), None);
+        assert!(!simulation_active(true, menu.open, false));
+        assert!(!simulation_active(false, false, false));
+        assert!(!simulation_active(true, false, true));
+        assert!(simulation_active(true, false, false));
+        let start = Instant::now();
+        let mut clock = FrameClock { last: start };
+        assert_eq!(clock.sample(start + Duration::from_secs(10), false), 0.0);
+        clock.rebase(start + Duration::from_secs(20));
+        assert!(
+            clock.sample(
+                start + Duration::from_secs(20) + Duration::from_millis(16),
+                true
+            ) < STEP
+        );
+        menu.show(Some(PauseAction::Exit));
+        assert_eq!(
+            menu.event(&key(Scancode::Return, false), true),
+            Some(PauseAction::Exit)
+        );
     }
     use crate::world::{Player, Wall};
 

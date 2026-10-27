@@ -1245,12 +1245,24 @@ impl ProcessRuntime {
         }
         ids.into_iter()
             .map(|id| {
-                if kind == "destroy" {
-                    if let Some(process) = self.processes.get_mut(&id) {
+                let previous_lock = if kind == "destroy" {
+                    self.processes.get_mut(&id).map(|process| {
+                        let locked = process.locked;
                         process.locked = false;
+                        locked
+                    })
+                } else {
+                    None
+                };
+                let event = self.trigger(id);
+                if event.outcome != ProcessOutcome::Accepted {
+                    if let (Some(locked), Some(process)) =
+                        (previous_lock, self.processes.get_mut(&id))
+                    {
+                        process.locked = locked;
                     }
                 }
-                self.trigger(id)
+                event
             })
             .collect()
     }
@@ -1412,6 +1424,22 @@ mod tests {
         assert_eq!(
             runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
             ProcessOutcome::Busy
+        );
+    }
+
+    #[test]
+    fn rejected_destroy_trigger_does_not_unlock_its_process() {
+        let script = Script::parse(
+            "#proc1\nLock\n#action\nunknown 1\n#end\n#links\ndestroy 1 1 1\nfloor 2 2 1\n#end\n",
+        );
+        let mut runtime = ProcessRuntime::new(&script, &world());
+        assert_eq!(
+            runtime.activate_at("destroy", [1, 1])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        assert_eq!(
+            runtime.activate_at("floor", [2, 2])[0].outcome,
+            ProcessOutcome::Locked
         );
     }
     #[test]

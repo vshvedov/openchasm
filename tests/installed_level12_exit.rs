@@ -142,7 +142,7 @@ fn exit_unlocker_accepts_fifth_move_argument_and_commits_replacement() {
         game::GameInventory,
         inventory::WeaponDefinitions,
         save_format::ContentDigest,
-        session::{LevelSetup, Session, SessionInput},
+        session::{LevelSetup, ScriptedObjects, Session, SessionInput},
     };
     let mut source_runtime = ProcessRuntime::with_source_lights(
         &script,
@@ -230,5 +230,96 @@ fn exit_unlocker_accepts_fifth_move_argument_and_commits_replacement() {
     assert_eq!(light.sources[0].position_raw, [10240, 8192]);
     assert_eq!(light.sources[0].radius_raw, 576);
     assert_eq!(light.sources[0].delay_ms, 10);
-    assert!(session.snapshot(ContentDigest([0; 32])).is_err());
+    let snapshot = session.snapshot(ContentDigest([0; 32])).unwrap();
+    assert_eq!(
+        snapshot.light_sources.as_ref().unwrap().active[0].process_id,
+        32
+    );
+
+    // Construct a genuinely fresh baseline and exercise the same installed
+    // source procedure through Session so its committed lifecycle is journalled.
+    let baseline_world = session.world.clone();
+    let runtime = ProcessRuntime::with_source_lights(
+        &script,
+        &baseline_world,
+        ProcessCapabilities::default(),
+        &cells,
+        &poses,
+    )
+    .unwrap();
+    let mut baseline = Session::new(LevelSetup {
+        world: baseline_world,
+        processes: runtime,
+        actors: ActorState {
+            player_spawns: vec![],
+            actors: vec![],
+            unresolved: vec![],
+        },
+        actor_definitions: ActorDefinitions::parse(&inf).unwrap(),
+        game: GameInventory::new(
+            WeaponDefinitions::parse(&inf).unwrap(),
+            &instances,
+            &definitions,
+            Difficulty::Normal,
+        ),
+        rockets: RocketDefinitions::parse(&inf).unwrap(),
+        shot_blocking: [true; 128],
+        difficulty: Difficulty::Normal,
+    });
+    baseline.set_objects(ObjectCombat::new(
+        &instances,
+        &definitions,
+        &script,
+        Difficulty::Normal,
+    ));
+    let mut manifest = PresentationManifest::default();
+    manifest.allow([40, 31], 216);
+    baseline.set_scripted_objects(ScriptedObjects::new(
+        ObjectStates::new(&instances, &definitions).unwrap(),
+        definitions.clone(),
+        manifest,
+        &script,
+        false,
+    ));
+    let mut source = baseline.clone();
+    for (cell, id) in [([39, 37], 30), ([39, 26], 31)] {
+        assert_eq!(
+            source
+                .processes
+                .prepare_at("link", cell, id)
+                .unwrap()
+                .commit()
+                .outcome,
+            ProcessOutcome::Accepted
+        );
+    }
+    source.step(SessionInput::default());
+    let position = poses
+        .iter()
+        .find(|pose| pose.cell == [44, 31])
+        .map_or([44.5, 31.5], |pose| pose.position);
+    source.world.player.position = position;
+    source.step(SessionInput {
+        interact: true,
+        ..Default::default()
+    });
+    assert!(source
+        .light_sources
+        .as_ref()
+        .unwrap()
+        .active()
+        .any(|light| light.process_id == 32));
+    for _ in 0..3 {
+        source.step(SessionInput::default());
+    }
+    let digest = ContentDigest([1; 32]);
+    let snapshot = source.snapshot(digest).unwrap();
+    let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+    assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
+    source.step(SessionInput::default());
+    restored.step(SessionInput::default());
+    assert_eq!(
+        source.light_sources.as_ref().unwrap().snapshot(),
+        restored.light_sources.as_ref().unwrap().snapshot()
+    );
 }

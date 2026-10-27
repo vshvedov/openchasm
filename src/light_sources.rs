@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 const RAW_MAP_LIMIT: u16 = 64 * 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceLight {
     /// X/Y in raw 8.8 map units after remaster cell-center conversion.
     pub position_raw: [u16; 2],
@@ -62,7 +63,8 @@ pub enum LightSourceError {
     AlreadyActive,
     DuplicateProcess,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LightSourceProcessSnapshot {
     pub process_id: u16,
     /// Sources in authored action order.
@@ -70,7 +72,8 @@ pub struct LightSourceProcessSnapshot {
     /// Number of authoritative 60 Hz ticks since activation.
     pub elapsed_ticks: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LightSourcesSnapshot {
     pub active: Vec<LightSourceProcessSnapshot>,
 }

@@ -324,6 +324,8 @@ pub enum GridJournalEntry {
     Immediate { process_id: u16 },
     WindActivate { process_id: u16 },
     WindDeactivate { process_id: u16 },
+    SourceActivate { process_id: u16, tick: u64 },
+    SourceDeactivate { process_id: u16, tick: u64 },
 }
 const MAX_GRID_JOURNAL: usize = 4096;
 // Each rectangle is conservatively charged one full map regardless of area.
@@ -354,6 +356,7 @@ pub struct Session {
     pub hazards: Hazards,
     pub wind: WindField,
     pub light_sources: Option<LightSources>,
+    light_tick: u64,
     pending_light_errors: Vec<LightSourceError>,
     ambient: Option<AmbientGrid>,
     pending_wind_errors: Vec<WindError>,
@@ -396,6 +399,10 @@ pub struct SessionSnapshot {
     pub hazards: crate::hazards::HazardsSnapshot,
     pub wind: crate::wind::WindSnapshot,
     pub grid_journal: Vec<GridJournalEntry>,
+    #[serde(default)]
+    pub light_sources: Option<crate::light_sources::LightSourcesSnapshot>,
+    #[serde(default)]
+    pub light_tick: u64,
     pub ambient: Option<crate::ambient::AmbientSnapshot>,
     pub teleport: Option<crate::teleport::TeleportSnapshot>,
     pub wall_elevations: Vec<f32>,
@@ -467,13 +474,6 @@ impl Session {
                 "source light capability",
             ));
         }
-        if self
-            .light_sources
-            .as_ref()
-            .is_some_and(|lights| lights.active().next().is_some())
-        {
-            return Err(SessionSnapshotError::Unverifiable("active source lights"));
-        }
         let processes = self
             .processes
             .snapshot(&self.world)
@@ -525,6 +525,8 @@ impl Session {
             hazards: self.hazards.snapshot(),
             wind: self.wind.snapshot(),
             grid_journal: self.grid_journal.clone(),
+            light_sources: self.light_sources.as_ref().map(LightSources::snapshot),
+            light_tick: self.light_tick,
             ambient: self.ambient.as_ref().map(|a| a.snapshot()),
             teleport: self.teleports.as_ref().map(|(_, state)| state.snapshot()),
             wall_elevations: self.wall_elevations.clone(),
@@ -551,7 +553,8 @@ impl Session {
         if !self.pending_wind_errors.is_empty() || !self.pending_light_errors.is_empty() {
             return Err(SessionSnapshotError::PendingEffects);
         }
-        if self.light_sources.is_some() != self.processes.source_lights_enabled()
+        if self.light_tick != 0
+            || self.light_sources.is_some() != self.processes.source_lights_enabled()
             || self
                 .light_sources
                 .as_ref()
@@ -762,6 +765,19 @@ impl Session {
             .hazards
             .restore(&snapshot.hazards)
             .map_err(|_| SessionSnapshotError::Component("hazards"))?;
+        match (&mut candidate.light_sources, &snapshot.light_sources) {
+            (Some(target), Some(saved)) => {
+                target
+                    .restore(saved)
+                    .map_err(|_| SessionSnapshotError::Component("source lights"))?;
+                if !candidate.processes.snapshot_sources_match(saved) {
+                    return Err(SessionSnapshotError::Inconsistent("source lights"));
+                }
+            }
+            (None, None) if !candidate.processes.has_active_source_lights() => {}
+            _ => return Err(SessionSnapshotError::Capabilities),
+        }
+        candidate.light_tick = snapshot.light_tick;
         candidate.grid_journal.clone_from(&snapshot.grid_journal);
         candidate.grid_journal_overflow = false;
         candidate
@@ -940,6 +956,7 @@ impl Session {
             hazards: Hazards::default(),
             wind: WindField::new(),
             light_sources: source_lights_enabled.then(LightSources::default),
+            light_tick: 0,
             pending_light_errors: Vec::new(),
             ambient: None,
             pending_wind_errors: Vec::new(),
@@ -1093,6 +1110,13 @@ impl Session {
                         None => return false,
                     }
                 }
+                GridJournalEntry::SourceActivate { process_id, .. }
+                | GridJournalEntry::SourceDeactivate { process_id, .. } => {
+                    match self.processes.journal_sources(process_id) {
+                        Some(sources) => sources.len(),
+                        None => return false,
+                    }
+                }
                 GridJournalEntry::WindActivate { process_id }
                 | GridJournalEntry::WindDeactivate { process_id } => {
                     match self.processes.journal_wind(process_id) {
@@ -1147,6 +1171,9 @@ impl Session {
             return Err(invalid());
         }
         let mut work = 0usize;
+        let mut source_active =
+            BTreeMap::<u16, (u64, Vec<crate::light_sources::SourceLight>)>::new();
+        let mut previous_source_tick = 0;
         for entry in &snapshot.grid_journal {
             match *entry {
                 GridJournalEntry::Immediate { process_id } => {
@@ -1232,6 +1259,48 @@ impl Session {
                         return Err(invalid());
                     }
                 }
+                GridJournalEntry::SourceActivate { process_id, tick } => {
+                    if self.light_sources.is_none()
+                        || tick < previous_source_tick
+                        || tick > snapshot.light_tick
+                    {
+                        return Err(invalid());
+                    }
+                    previous_source_tick = tick;
+                    let sources = self
+                        .processes
+                        .journal_sources(process_id)
+                        .ok_or_else(invalid)?;
+                    work = work
+                        .checked_add(sources.len().checked_mul(4096).ok_or_else(invalid)?)
+                        .ok_or_else(invalid)?;
+                    if work > MAX_GRID_REPLAY_WORK
+                        || source_active
+                            .insert(process_id, (tick, sources.to_vec()))
+                            .is_some()
+                    {
+                        return Err(invalid());
+                    }
+                }
+                GridJournalEntry::SourceDeactivate { process_id, tick } => {
+                    if self.light_sources.is_none()
+                        || tick < previous_source_tick
+                        || tick > snapshot.light_tick
+                    {
+                        return Err(invalid());
+                    }
+                    previous_source_tick = tick;
+                    let sources = self
+                        .processes
+                        .journal_sources(process_id)
+                        .ok_or_else(invalid)?;
+                    work = work
+                        .checked_add(sources.len().checked_mul(4096).ok_or_else(invalid)?)
+                        .ok_or_else(invalid)?;
+                    if work > MAX_GRID_REPLAY_WORK || source_active.remove(&process_id).is_none() {
+                        return Err(invalid());
+                    }
+                }
                 GridJournalEntry::WindActivate { process_id } => {
                     let zones = self
                         .processes
@@ -1258,6 +1327,26 @@ impl Session {
                     }
                 }
             }
+        }
+        let expected_sources =
+            self.light_sources
+                .as_ref()
+                .map(|_| crate::light_sources::LightSourcesSnapshot {
+                    active: source_active
+                        .into_iter()
+                        .map(|(process_id, (tick, sources))| {
+                            crate::light_sources::LightSourceProcessSnapshot {
+                                process_id,
+                                sources,
+                                elapsed_ticks: snapshot.light_tick - tick,
+                            }
+                        })
+                        .collect(),
+                });
+        if expected_sources != snapshot.light_sources
+            || (self.light_sources.is_none() && snapshot.light_tick != 0)
+        {
+            return Err(invalid());
         }
         if wind.snapshot() != snapshot.wind
             || ambient.as_ref().map(AmbientGrid::snapshot) != snapshot.ambient
@@ -2034,18 +2123,25 @@ impl Session {
                     process_id,
                     sources,
                 } => match self.light_sources.as_mut() {
-                    Some(lights) => {
-                        if let Err(error) = lights.activate(*process_id, sources) {
-                            self.pending_light_errors.push(error);
-                        }
-                    }
+                    Some(lights) => match lights.activate(*process_id, sources) {
+                        Ok(()) => self.journal_push(GridJournalEntry::SourceActivate {
+                            process_id: *process_id,
+                            tick: self.light_tick,
+                        }),
+                        Err(error) => self.pending_light_errors.push(error),
+                    },
                     None => self
                         .pending_light_errors
                         .push(LightSourceError::InvalidDefinition),
                 },
                 ProcessEffect::SourceLightsDeactivated { process_id } => {
                     if let Some(lights) = &mut self.light_sources {
-                        lights.deactivate(*process_id);
+                        if lights.deactivate(*process_id) {
+                            self.journal_push(GridJournalEntry::SourceDeactivate {
+                                process_id: *process_id,
+                                tick: self.light_tick,
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -2117,6 +2213,11 @@ impl Session {
         // Existing effects age once per live tick. Pickups collected below
         // begin at full duration and affect AI on this same tick.
         if let Some(lights) = &mut self.light_sources {
+            if let Some(next) = self.light_tick.checked_add(1) {
+                self.light_tick = next;
+            } else {
+                self.grid_journal_overflow = true;
+            }
             lights.tick();
         }
         self.game.inventory.tick_effects();
@@ -3126,12 +3227,30 @@ mod tests {
         let envelope = save_format::decode(&encoded).unwrap();
         let original: serde_json::Value = serde_json::from_slice(envelope.payload).unwrap();
         let mut future = original.clone();
-        future["version"] = 2.into();
+        future["version"] = 3.into();
         let envelope = save_format::encode(digest, &serde_json::to_vec(&future).unwrap()).unwrap();
         assert!(matches!(
             session_codec::decode(&envelope, digest),
-            Err(session_codec::SessionCodecError::UnsupportedVersion(2))
+            Err(session_codec::SessionCodecError::UnsupportedVersion(3))
         ));
+        let mut legacy = original.clone();
+        legacy["version"] = 1.into();
+        legacy["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("light_sources");
+        legacy["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("light_tick");
+        for process in legacy["snapshot"]["processes"]["processes"]
+            .as_array_mut()
+            .unwrap()
+        {
+            process.as_object_mut().unwrap().remove("source_active");
+        }
+        let envelope = save_format::encode(digest, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(session_codec::decode(&envelope, digest).unwrap(), snapshot);
         let mut unknown = original.clone();
         unknown["snapshot"]["world"]["future"] = true.into();
         let envelope = save_format::encode(digest, &serde_json::to_vec(&unknown).unwrap()).unwrap();
@@ -3460,6 +3579,76 @@ mod tests {
         ));
         assert!(session.set_wall_material_catalog(catalog));
         session
+    }
+
+    #[test]
+    fn snapshot_restores_source_lifecycle_elapsed_time_and_rejects_forgery() {
+        let text = "#proc1\n#action\nnonstop\nsource 1 1 5 28 160\n#end\n#proc2\n#action\nlock 1\n#end\n#links\nlink 0 0 1\nlink 0 0 2\n#end\n";
+        let baseline = wall_change_session(text);
+        let mut source = baseline.clone();
+        source
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .unwrap();
+        source.apply_process_effects();
+        for _ in 0..5 {
+            source.step(SessionInput::default());
+        }
+        let digest = crate::save_format::ContentDigest([42; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        assert_eq!(
+            snapshot.light_sources.as_ref().unwrap().active[0].elapsed_ticks,
+            5
+        );
+        let encoded = crate::session_codec::encode(&snapshot).unwrap();
+        let snapshot = crate::session_codec::decode(&encoded, digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(snapshot, restored.snapshot(digest).unwrap());
+        source.step(SessionInput::default());
+        restored.step(SessionInput::default());
+        assert_eq!(
+            source.light_sources.as_ref().unwrap().snapshot(),
+            restored.light_sources.as_ref().unwrap().snapshot()
+        );
+        let mut forged = snapshot.clone();
+        forged.light_sources.as_mut().unwrap().active[0].elapsed_ticks += 1;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.light_sources.as_mut().unwrap().active[0].sources[0].brightness += 1;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.processes.processes[0].source_active = false;
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged.grid_journal.clear();
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        let mut forged = snapshot.clone();
+        forged
+            .grid_journal
+            .push(GridJournalEntry::SourceDeactivate {
+                process_id: 1,
+                tick: forged.light_tick + 1,
+            });
+        assert!(baseline.restore_from_baseline(&forged, digest).is_err());
+        restored
+            .try_staged_process("link", [0, 0], 2, &mut SessionEvents::default())
+            .unwrap();
+        restored.apply_process_effects();
+        assert!(restored
+            .light_sources
+            .as_ref()
+            .unwrap()
+            .active()
+            .next()
+            .is_none());
+        let ended = restored.snapshot(digest).unwrap();
+        assert_eq!(
+            baseline
+                .restore_from_baseline(&ended, digest)
+                .unwrap()
+                .snapshot(digest)
+                .unwrap(),
+            ended
+        );
     }
 
     #[test]

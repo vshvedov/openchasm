@@ -1437,6 +1437,8 @@ pub struct ProcessEntrySnapshot {
     pub locked: bool,
     pub hazard_active: bool,
     pub wind_active: bool,
+    #[serde(default)]
+    pub source_active: bool,
     pub wall_progress: Vec<f32>,
     pub object_progress: Vec<f32>,
     pub previous_cell_types: Vec<Option<u8>>,
@@ -1623,6 +1625,29 @@ impl ProcessRuntime {
             .filter(|p| p.supported && !p.wind_zones.is_empty())
             .map(|p| p.wind_zones.as_slice())
     }
+    pub(crate) fn journal_sources(&self, id: u16) -> Option<&[SourceLight]> {
+        self.processes
+            .get(&id)
+            .filter(|p| p.supported && !p.sources.is_empty())
+            .map(|p| p.sources.as_slice())
+    }
+    pub(crate) fn snapshot_sources_match(
+        &self,
+        snapshot: &crate::light_sources::LightSourcesSnapshot,
+    ) -> bool {
+        let active: Vec<_> = self
+            .processes
+            .iter()
+            .filter(|(_, p)| p.source_active)
+            .collect();
+        active.len() == snapshot.active.len()
+            && active.iter().all(|(&id, process)| {
+                snapshot
+                    .active
+                    .iter()
+                    .any(|entry| entry.process_id == id && entry.sources == process.sources)
+            })
+    }
     /// Validate host hazard/wind memberships and zones against compiled script
     /// state. This does not reconstruct the history-dependent wind grids.
     pub fn snapshot_effects_match(
@@ -1661,13 +1686,6 @@ impl ProcessRuntime {
         if !self.effects.is_empty() || self.staged_authorized {
             return Err(ProcessSnapshotError::PendingEffects);
         }
-        if self
-            .processes
-            .values()
-            .any(|p| !p.sources.is_empty() && !matches!(p.phase, Phase::Closed | Phase::Delay(_)))
-        {
-            return Err(ProcessSnapshotError::ActiveSourceLights);
-        }
         if world.walls.len() != self.elevations.len() {
             return Err(ProcessSnapshotError::WallIdentity);
         }
@@ -1689,6 +1707,7 @@ impl ProcessRuntime {
                     locked: p.locked,
                     hazard_active: p.hazard_active,
                     wind_active: p.wind_active,
+                    source_active: p.source_active,
                     wall_progress: p.motions.iter().map(|m| m.progress).collect(),
                     object_progress: p.object_motions.iter().map(|m| m.progress).collect(),
                     previous_cell_types: p.cell_changes.iter().map(|c| c.previous).collect(),
@@ -1752,14 +1771,6 @@ impl ProcessRuntime {
                 .processes
                 .get_mut(&entry.id)
                 .ok_or(ProcessSnapshotError::ProcessIdentity)?;
-            if !p.sources.is_empty()
-                && !matches!(
-                    entry.phase,
-                    ProcessPhaseSnapshot::Closed | ProcessPhaseSnapshot::Delay(_)
-                )
-            {
-                return Err(ProcessSnapshotError::ActiveSourceLights);
-            }
             if entry.wall_progress.len() != p.motions.len()
                 || entry.object_progress.len() != p.object_motions.len()
                 || entry.previous_cell_types.len() != p.cell_changes.len()
@@ -1777,6 +1788,15 @@ impl ProcessRuntime {
                 || matches!(entry.phase, ProcessPhaseSnapshot::Delay(t) if !t.is_finite() || t < 0.0 || t > p.delay)
                 || (entry.hazard_active && p.death_zones.is_empty())
                 || (entry.wind_active && p.wind_zones.is_empty())
+                || (entry.source_active
+                    && (p.sources.is_empty()
+                        || entry.locked
+                        || matches!(
+                            entry.phase,
+                            ProcessPhaseSnapshot::Closed
+                                | ProcessPhaseSnapshot::Delay(_)
+                                | ProcessPhaseSnapshot::Closing
+                        )))
             {
                 return Err(ProcessSnapshotError::InvalidValue);
             }
@@ -1792,6 +1812,7 @@ impl ProcessRuntime {
             p.locked = entry.locked;
             p.hazard_active = entry.hazard_active;
             p.wind_active = entry.wind_active;
+            p.source_active = entry.source_active;
             for (m, &v) in p.motions.iter_mut().zip(&entry.wall_progress) {
                 m.progress = v;
             }
@@ -3126,10 +3147,7 @@ mod tests {
         assert!(
             matches!(&runtime.take_effects()[..], [ProcessEffect::SourceLightsActivated { process_id:1, sources }] if sources[0].position_raw == [7552,7552])
         );
-        assert!(matches!(
-            runtime.snapshot(&world),
-            Err(ProcessSnapshotError::ActiveSourceLights)
-        ));
+        assert!(runtime.snapshot(&world).unwrap().processes[0].source_active);
         runtime.tick(&mut world, 0.5, false);
         assert_eq!(
             runtime.take_effects(),

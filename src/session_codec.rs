@@ -10,7 +10,7 @@ use std::io::{self, Write};
 pub const MAX_SESSION_PAYLOAD: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 65_536;
 const MAX_MAP_CELLS: usize = 4096;
-const SCHEMA_VERSION: u16 = 1;
+const SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug)]
 pub enum SessionCodecError {
@@ -76,6 +76,15 @@ fn validate_shape(s: &SessionSnapshot) -> Result<(), SessionCodecError> {
     ]
     .into_iter()
     .all(|n| n <= MAX_MAP_CELLS);
+    if s.light_sources.as_ref().is_some_and(|lights| {
+        lights.active.len() > MAX_ENTRIES
+            || lights
+                .active
+                .iter()
+                .any(|entry| entry.sources.len() > MAX_MAP_CELLS)
+    }) {
+        return Err(invalid());
+    }
     if !all_bounded
         || s.processes.processes.len() > MAX_ENTRIES
         || s.actors.actors.len() > MAX_ENTRIES
@@ -173,10 +182,35 @@ pub fn decode(bytes: &[u8], expected: ContentDigest) -> Result<SessionSnapshot, 
     if envelope.payload.len() > MAX_SESSION_PAYLOAD {
         return Err(SessionCodecError::PayloadTooLarge);
     }
-    let payload: Payload =
+    let mut payload: Payload =
         serde_json::from_slice(envelope.payload).map_err(|_| SessionCodecError::InvalidPayload)?;
-    if payload.version != SCHEMA_VERSION {
-        return Err(SessionCodecError::UnsupportedVersion(payload.version));
+    match payload.version {
+        1 => {
+            if payload.snapshot.light_tick != 0
+                || payload.snapshot.light_sources.is_some()
+                || payload
+                    .snapshot
+                    .processes
+                    .processes
+                    .iter()
+                    .any(|p| p.source_active)
+                || payload.snapshot.grid_journal.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        crate::session::GridJournalEntry::SourceActivate { .. }
+                            | crate::session::GridJournalEntry::SourceDeactivate { .. }
+                    )
+                })
+            {
+                return Err(SessionCodecError::InvalidPayload);
+            }
+            if payload.snapshot.capabilities.source_lights {
+                payload.snapshot.light_sources =
+                    Some(crate::light_sources::LightSourcesSnapshot::default());
+            }
+        }
+        SCHEMA_VERSION => {}
+        version => return Err(SessionCodecError::UnsupportedVersion(version)),
     }
     if payload.snapshot.content != envelope.content {
         return Err(SessionCodecError::Envelope(SaveError::ContentMismatch));

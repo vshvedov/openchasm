@@ -33,4 +33,5 @@ pub mod session;
 pub mod sound_definitions;
 pub mod teleport;
 pub mod vertical;
+pub mod wall_transitions;
 pub mod wind;

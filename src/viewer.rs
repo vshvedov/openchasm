@@ -810,6 +810,7 @@ pub fn run(
         HEIGHT as u32,
     )?;
     let mut event_pump = sdl.event_pump()?;
+    video.text_input().stop();
     let mut look = RelativeLook {
         focused: canvas.window().has_input_focus(),
         ..RelativeLook::default()
@@ -841,6 +842,18 @@ pub fn run(
     let mut checkpoint_notice: Option<(&'static str, f32)> = None;
     let mut completed = false;
     let mut pause = PauseMenu::default();
+    let mut console = crate::developer_console::Console::default();
+    let mut show_fps = true;
+    let mut mouse_sensitivity = MOUSE_SENSITIVITY;
+    let mut frame_limit = if std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1") {
+        None
+    } else {
+        Some(FRAME_DURATION)
+    };
+    let mut frame_stats = crate::frame_stats::FrameStats::new(Instant::now());
+    let profile = std::env::var("OPENCHASM_PROFILE").as_deref() == Ok("1");
+    let mut profile_samples = 0_u32;
+    let mut suppress_toggle_text = false;
     let mut minimap = minimap::Minimap::new(&session.world);
     let number_keys = [
         Scancode::Num1,
@@ -868,6 +881,8 @@ pub fn run(
                         ..
                     }
             ) {
+                console.close();
+                video.text_input().stop();
                 pause.show(Some(PauseAction::Exit));
                 sdl.mouse().set_relative_mouse_mode(false);
                 look.captured = false;
@@ -888,7 +903,7 @@ pub fn run(
                 }
             ) {
                 look.set_focus(false);
-                if !pause.open {
+                if !pause.open && !console.is_open() {
                     pause.show(None);
                 }
                 sdl.mouse().set_relative_mouse_mode(false);
@@ -909,8 +924,114 @@ pub fn run(
                 }
             ) {
                 look.set_focus(true);
-                if !pause.open && !capture_mouse(&mut look, &sdl.mouse()) {
+                if !pause.open && !console.is_open() && !capture_mouse(&mut look, &sdl.mouse()) {
                     eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
+                }
+                continue;
+            }
+            let console_toggle = matches!(
+                event,
+                Event::KeyDown {
+                    scancode: Some(Scancode::Grave),
+                    repeat: false,
+                    ..
+                }
+            );
+            let console_escape = console.is_open()
+                && matches!(
+                    event,
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Escape),
+                        repeat: false,
+                        ..
+                    }
+                );
+            if look.focused && (console_toggle || console_escape) {
+                if console.is_open() {
+                    console.close();
+                    video.text_input().stop();
+                    if !pause.open {
+                        capture_mouse(&mut look, &sdl.mouse());
+                    }
+                } else {
+                    console.toggle();
+                    video.text_input().start();
+                    sdl.mouse().set_relative_mouse_mode(false);
+                    look.release();
+                }
+                suppress_toggle_text = console_toggle;
+                clear_held_controls(&mut held, &mut mouse_fire, &mut look, &mut accumulator);
+                pending_interact = false;
+                pending_jump = false;
+                pending_weapon = None;
+                frame_clock.rebase(Instant::now());
+                suppress_gameplay = true;
+                continue;
+            }
+            if console.is_open() {
+                if !look.focused {
+                    continue;
+                }
+                if let Event::TextInput { ref text, .. } = event {
+                    if suppress_toggle_text && matches!(text.as_str(), "`" | "~") {
+                        suppress_toggle_text = false;
+                        continue;
+                    }
+                    suppress_toggle_text = false;
+                }
+                if let Some(command) = console.event(&event) {
+                    use crate::developer_console::Command;
+                    match command {
+                        Command::Fps(value) => {
+                            if let Some(value) = value {
+                                show_fps = value;
+                            }
+                            console.push(&format!("fps {}", if show_fps { "on" } else { "off" }));
+                        }
+                        Command::MaxFps(value) => {
+                            if let Some(value) = value {
+                                frame_limit = (value != 0)
+                                    .then(|| Duration::from_secs_f64(1.0 / f64::from(value)));
+                            }
+                            console.push(&match frame_limit {
+                                Some(limit) => format!("maxfps {:.0}", 1.0 / limit.as_secs_f64()),
+                                None => "maxfps 0 (uncapped)".to_owned(),
+                            });
+                        }
+                        Command::Sensitivity(value) => {
+                            if let Some(value) = value {
+                                mouse_sensitivity = value;
+                            }
+                            console
+                                .push(&format!("sensitivity {mouse_sensitivity:.5} radians/pixel"));
+                        }
+                        Command::Status => {
+                            let p = session.world.player;
+                            let metrics = frame_stats.metrics;
+                            console.push(&format!(
+                                "pos {:.3} {:.3} feet {:.3} yaw {:.3} pitch {:.3}",
+                                p.position[0],
+                                p.position[1],
+                                session.vertical.feet(),
+                                p.angle,
+                                session.pitch()
+                            ));
+                            console.push(&format!("{:.1} fps / {:.2} ms; sim {:.2} render {:.2} present {:.2}; max {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms));
+                        }
+                        Command::Restart => {
+                            restart_requested = true;
+                            console.push("Restarting level");
+                            console.close();
+                            video.text_input().stop();
+                            if !pause.open {
+                                capture_mouse(&mut look, &sdl.mouse());
+                            }
+                            suppress_gameplay = true;
+                        }
+                        Command::Quit => {
+                            running = false;
+                        }
+                    }
                 }
                 continue;
             }
@@ -1049,7 +1170,11 @@ pub fn run(
         if !running {
             break;
         }
-        let active = simulation_active(look.focused, pause.open, suppress_gameplay);
+        let active = simulation_active(
+            look.focused,
+            pause.open || console.is_open(),
+            suppress_gameplay,
+        );
         let elapsed = frame_clock.sample(Instant::now(), active);
         if active {
             accumulator += elapsed;
@@ -1161,12 +1286,13 @@ pub fn run(
             sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
         }
+        let simulation_started = Instant::now();
         let movement = held_movement(&held);
         let firing = mouse_fire;
         while accumulator >= STEP {
             // Deltas are motion, not velocity: consume exactly once per tick.
-            let yaw_delta = look.take_yaw();
-            let pitch_delta = look.take_pitch();
+            let yaw_delta = look.take_yaw() * (mouse_sensitivity / MOUSE_SENSITIVITY);
+            let pitch_delta = look.take_pitch() * (mouse_sensitivity / MOUSE_SENSITIVITY);
             animation_tick = animation_tick.saturating_add(1);
             let old_weapon = session.selected_weapon;
             let health_before = session.game.inventory.health;
@@ -1372,6 +1498,8 @@ pub fn run(
             accumulator -= STEP;
         }
         // Initialize or resynchronize even when no simulation tick ran.
+        let simulation_time = simulation_started.elapsed();
+        let render_started = Instant::now();
         audio.update_ambient(session.ambient_grid(), session.world.player.position, 0.0);
         let quake_power = session
             .scripted_objects
@@ -1523,9 +1651,23 @@ pub fn run(
             draw_pause_menu(&mut frame, &pause);
         } else if !look.focused {
             text(&mut frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
-        } else if !look.captured {
+        } else if !look.captured && !console.is_open() {
             text(&mut frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
         }
+        if show_fps {
+            text(
+                &mut frame,
+                WIDTH - 184,
+                8,
+                &format!(
+                    "FPS {:5.1}  {:5.1} MS",
+                    frame_stats.metrics.fps, frame_stats.metrics.frame_ms
+                ),
+            );
+        }
+        console.render(&mut frame, WIDTH, HEIGHT);
+        let render_time = render_started.elapsed();
+        let present_started = Instant::now();
         texture.with_lock(None, |bytes, pitch| {
             for (row, pixels) in bytes.chunks_mut(pitch).zip(frame.chunks(WIDTH)) {
                 for (dst, &pixel) in row[..WIDTH * 4].chunks_mut(4).zip(pixels) {
@@ -1536,11 +1678,24 @@ pub fn run(
         canvas.clear();
         canvas.copy(&texture, None, None)?;
         canvas.present();
-        if let Some(delay) = FRAME_DURATION.checked_sub(frame_start.elapsed()) {
+        if let Some(metrics) = frame_stats.record(
+            Instant::now(),
+            simulation_time,
+            render_time,
+            present_started.elapsed(),
+        ) {
+            profile_samples = profile_samples.wrapping_add(1);
+            if profile && profile_samples.is_multiple_of(4) {
+                eprintln!("frame profile: {:.1} fps, {:.2} ms/frame; sim {:.2}, render {:.2}, present {:.2}, max {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms);
+            }
+        }
+        if let Some(delay) = frame_limit.and_then(|limit| limit.checked_sub(frame_start.elapsed()))
+        {
             std::thread::sleep(delay);
         }
     }
     sdl.mouse().set_relative_mouse_mode(false);
+    video.text_input().stop();
     Ok(None)
 }
 

@@ -1,7 +1,9 @@
 mod archive;
 mod audio;
 mod content;
+mod developer_console;
 mod explosion_render;
+mod frame_stats;
 mod gltf_model;
 mod impact_render;
 mod launcher;

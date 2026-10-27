@@ -1439,6 +1439,119 @@ mod tests {
     }
 
     #[test]
+    fn installed_level_16_heart_replacements_preload_and_reset() {
+        use openchasm::object_states::{ObjectAction, ObjectStates};
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).expect("open game archive");
+        let map = crate::map::Map::parse(&resources.read("map/map.16").unwrap()).unwrap();
+        let definitions = ObjectDefinitions::parse(
+            &resources.read("chasm.inf").unwrap(),
+            &resources.read("map/resource.16").unwrap(),
+        )
+        .unwrap();
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let script_bytes = resources.read("map/process.16").unwrap();
+        let script = crate::process::Script::parse(std::str::from_utf8(&script_bytes).unwrap());
+        let process = script.processes.get(&7).unwrap();
+        let actions: Vec<_> = process
+            .actions
+            .iter()
+            .filter_map(|action| {
+                let cell = || {
+                    [
+                        action.arguments[0].parse().unwrap(),
+                        action.arguments[1].parse().unwrap(),
+                    ]
+                };
+                match action.name.as_str() {
+                    "explode" => Some(ObjectAction::Explode { cell: cell() }),
+                    "change" => Some(ObjectAction::Change {
+                        cell: cell(),
+                        raw_type: action.arguments[2].parse().unwrap(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(actions.len(), 5);
+        let mut states = ObjectStates::new(&objects::instances(&map), &definitions).unwrap();
+        let transitions = states.apply_batch(&actions).unwrap();
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|event| event.new_type)
+                .collect::<Vec<_>>(),
+            vec![202, 202, 202, 202, 200]
+        );
+        assert_eq!(
+            definitions.level_objects[usize::from(202_u8 - 163)].model_name,
+            "dummy.3o"
+        );
+        assert_eq!(
+            definitions.level_objects[usize::from(200_u8 - 163)].model_name,
+            "fch2.3o"
+        );
+        let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+        let original: Vec<_> = transitions
+            .iter()
+            .map(|event| {
+                let instance = scene
+                    .instances
+                    .iter()
+                    .find(|item| item.cell == Some(event.cell))
+                    .expect("source mesh must load");
+                (
+                    event.cell,
+                    instance.mesh,
+                    instance.object_definition_index,
+                    instance.position,
+                )
+            })
+            .collect();
+        for event in &transitions {
+            assert!(
+                scene.preload_level_object(&mut resources, &definitions, event.new_type),
+                "replacement type {} failed to load",
+                event.new_type
+            );
+            assert!(scene.replace_level_object(event.cell, event.new_type));
+            let instance = scene
+                .instances
+                .iter()
+                .find(|item| item.cell == Some(event.cell))
+                .unwrap();
+            assert_eq!(
+                instance.object_definition_index,
+                Some(usize::from(event.new_type - 163))
+            );
+        }
+        scene.reset_level_objects();
+        for (cell, mesh, definition, position) in original {
+            let instance = scene
+                .instances
+                .iter()
+                .find(|item| item.cell == Some(cell))
+                .unwrap();
+            assert_eq!(
+                (
+                    instance.mesh,
+                    instance.object_definition_index,
+                    instance.position
+                ),
+                (mesh, definition, position)
+            );
+            assert_eq!(instance.object_animation_seconds, 0.0);
+        }
+    }
+
+    #[test]
     fn gltf_depth_alpha_and_per_instance_animation() {
         let mut scene = gltf_scene(255);
         let camera = CameraView {

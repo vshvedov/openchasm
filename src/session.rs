@@ -14,6 +14,7 @@ use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::light_sources::{LightSourceError, LightSources};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
+use crate::motion_push::{self, EntityId, MotionProposal, MoverId, PushEntity, Translation};
 use crate::object_combat::{ObjectCombat, ObjectDestructionInfo};
 use crate::object_heights::ObjectHeightCatalog;
 use crate::object_states::{ObjectAction, ObjectStates, ObjectTransition, TransitionKind};
@@ -335,6 +336,7 @@ const MAX_GRID_REPLAY_WORK: usize = 16 * 1024 * 1024;
 pub struct Session {
     pub world: World,
     wall_collision_mode: WallCollisionMode,
+    prepared_motion: bool,
     teleports: Option<(Vec<Teleport>, TeleportState)>,
     object_heights: Option<SessionObjectHeights>,
     pub vertical: VerticalState,
@@ -425,6 +427,8 @@ pub struct SessionSnapshotCapabilities {
     pub powerups: bool,
     pub quake_presentation: bool,
     pub source_lights: bool,
+    #[serde(default)]
+    pub prepared_motion: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionSnapshotError {
@@ -439,6 +443,7 @@ impl Session {
     fn snapshot_capabilities(&self) -> SessionSnapshotCapabilities {
         SessionSnapshotCapabilities {
             wall_collision_mode: self.wall_collision_mode,
+            prepared_motion: self.prepared_motion,
             wall_materials: self.wall_materials.is_some(),
             teleports: self.teleports.is_some(),
             object_heights: self.object_heights.is_some(),
@@ -935,6 +940,7 @@ impl Session {
             elevation_by_cell: vec![0.0; 64 * 64],
             world: setup.world,
             wall_collision_mode: WallCollisionMode::TwoSided,
+            prepared_motion: false,
             teleports: None,
             object_heights: None,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
@@ -966,6 +972,11 @@ impl Session {
             rockets: setup.rockets,
             shot_blocking: setup.shot_blocking,
         }
+    }
+    /// Enable the provisional collision-checked process translation path.
+    /// Configure before making a restart or durable snapshot.
+    pub fn set_prepared_motion(&mut self, enabled: bool) {
+        self.prepared_motion = enabled;
     }
     /// Opt into model-height collision using original x-major map cells.
     /// Missing heights remain blocking. Call before the restart snapshot.
@@ -2099,6 +2110,168 @@ impl Session {
                 && self.wall_elevations.get(i).copied().unwrap_or(0.0) < needed;
         }
     }
+    /// Stage one process's geometry and all affected entity positions. Every
+    /// interval must succeed before any authoritative state is published.
+    fn advance_prepared_motion(&mut self, id: u16, dt: f32) {
+        let mut collision_world = self.world.clone();
+        if collision_world.walls.len() != self.base_wall_blocking.len() {
+            return;
+        }
+        for (wall, base) in collision_world
+            .walls
+            .iter_mut()
+            .zip(&self.base_wall_blocking)
+        {
+            // This also protects actors when the player's elevation has made
+            // the corresponding live wall temporarily nonblocking.
+            wall.blocks_movement = *base;
+        }
+        let objects: Vec<_> = self.processes.objects().copied().collect();
+        let mut cells = BTreeMap::new();
+        let mut circles = Vec::new();
+        let mut object_z = BTreeMap::new();
+        for object in &objects {
+            if object.blocking_radius <= 0.0 {
+                continue;
+            }
+            if object.cell[0] >= 64
+                || object.cell[1] >= 64
+                || cells.insert(object.cell, circles.len()).is_some()
+            {
+                return;
+            }
+            circles.push(CollisionCircle {
+                center: object.position,
+                radius: object.blocking_radius,
+            });
+            let bounds = self
+                .object_heights
+                .as_ref()
+                .and_then(|heights| {
+                    let raw = self.processes.cell_type(object.cell).unwrap_or(
+                        heights.initial_raw_cells
+                            [usize::from(object.cell[0]) * 64 + usize::from(object.cell[1])],
+                    );
+                    let bounds = heights.catalog.get(raw)?;
+                    let z = [
+                        bounds.bottom + object.elevation_raw / 64.0,
+                        bounds.top + object.elevation_raw / 64.0,
+                    ];
+                    (z[0].is_finite()
+                        && z[1].is_finite()
+                        && z[0] >= -4096.0
+                        && z[1] <= 4096.0
+                        && z[0] < z[1])
+                        .then_some(z)
+                })
+                .unwrap_or([-4096.0, 4096.0]);
+            object_z.insert(object.cell, bounds);
+        }
+        let mut entities = vec![PushEntity {
+            id: EntityId::Player,
+            position: self.world.player.position,
+            radius: 0.18,
+            vertical: [self.vertical.feet(), self.vertical.head()],
+        }];
+        let mut actor_indices = BTreeMap::new();
+        for (index, actor) in self.actors.actors.iter().enumerate() {
+            if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive) {
+                continue;
+            }
+            let Ok(source) = u32::try_from(actor.source_index) else {
+                return;
+            };
+            let Some(definition) = self.actor_definitions.entries.get(actor.definition_index)
+            else {
+                return;
+            };
+            if actor_indices.insert(source, index).is_some() {
+                return;
+            }
+            entities.push(PushEntity {
+                id: EntityId::Actor(source),
+                position: actor.position,
+                radius: (definition.wall_radius as f32 / 256.0).clamp(0.05, 2.0),
+                vertical: [0.0, 1.0],
+            });
+        }
+        let Ok(prepared) = self.processes.prepare_motion_step(&mut self.world, id, dt) else {
+            return;
+        };
+        if prepared
+            .new_effects()
+            .iter()
+            .any(|effect| !matches!(effect, ProcessEffect::ObjectPose { .. }))
+        {
+            return;
+        }
+        for interval in prepared.intervals() {
+            let mut translations = Vec::new();
+            for &(index, delta) in &interval.walls {
+                translations.push(Translation {
+                    mover: MoverId::Wall(index),
+                    delta,
+                    vertical: [-4096.0, 4096.0],
+                });
+            }
+            for &(cell, delta) in &interval.objects {
+                if let Some(&index) = cells.get(&cell) {
+                    translations.push(Translation {
+                        mover: MoverId::Circle(index),
+                        delta,
+                        vertical: object_z[&cell],
+                    });
+                }
+            }
+            let Ok(MotionProposal::Committed(result)) =
+                motion_push::propose(&collision_world, &circles, &entities, &translations)
+            else {
+                return;
+            };
+            collision_world = result.world;
+            circles = result.circles;
+            entities = result.entities;
+        }
+        let close = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= 0.001;
+        if collision_world
+            .walls
+            .iter()
+            .zip(&prepared.proposed_world().walls)
+            .any(|(a, b)| !close(a.a, b.a) || !close(a.b, b.b))
+        {
+            return;
+        }
+        for (&cell, &index) in &cells {
+            let Some(object) = prepared.proposed_object(cell) else {
+                return;
+            };
+            if !close(circles[index].center, object.position) {
+                return;
+            }
+        }
+        let mut player = None;
+        let mut moved_actors = Vec::new();
+        for entity in entities {
+            match entity.id {
+                EntityId::Player => player = Some(entity.position),
+                EntityId::Actor(source) => {
+                    let Some(&index) = actor_indices.get(&source) else {
+                        return;
+                    };
+                    moved_actors.push((index, entity.position));
+                }
+            }
+        }
+        let Some(player) = player else {
+            return;
+        };
+        if prepared.commit(player).is_err() {
+            return;
+        }
+        for (index, position) in moved_actors {
+            self.actors.actors[index].position = position;
+        }
+    }
     fn apply_process_effects(&mut self) -> Vec<ProcessEffect> {
         let effects = self.processes.take_effects();
         for effect in &effects {
@@ -2529,15 +2702,19 @@ impl Session {
             events.quake_changes.clear();
             attempts.clear();
         }
-        if self.scripted_objects.is_none() {
+        if self.scripted_objects.is_none() && !self.prepared_motion {
             attempts.extend(self.processes.tick(&mut self.world, DT, input.interact));
         } else {
             let commands = self
                 .processes
                 .collect_tick_commands(self.world.player.position, input.interact);
             for command in commands {
-                if matches!(command.kind.as_str(), "return" | "returnf") {
-                    self.processes.dispatch_tick_command(&command);
+                if self.scripted_objects.is_none()
+                    || matches!(command.kind.as_str(), "return" | "returnf")
+                {
+                    if let Some(event) = self.processes.dispatch_tick_command(&command) {
+                        attempts.push(event);
+                    }
                 } else {
                     let event = self
                         .try_staged_process(
@@ -2553,7 +2730,14 @@ impl Session {
                     attempts.push(event);
                 }
             }
-            self.processes.advance_motions(&mut self.world, DT);
+            if self.prepared_motion {
+                let ids: Vec<_> = self.processes.process_ids().collect();
+                for id in ids {
+                    self.advance_prepared_motion(id, DT);
+                }
+            } else {
+                self.processes.advance_motions(&mut self.world, DT);
+            }
             for id in self.processes.ready_delayed() {
                 // Failed revalidation leaves the deadline pending for retry.
                 if let Err((outcome, _)) = self.try_staged_process("due", [0, 0], id, &mut events) {
@@ -3206,6 +3390,116 @@ mod tests {
         });
         session.set_mission(MissionPlan::parse(&script, text));
         session
+    }
+
+    fn push_session(property: &str, action: &str, pin: bool) -> Session {
+        let text =
+            format!("#proc1\n{property}\n#action\n{action}\n#end\n#links\nlink 0 0 1\n#end\n");
+        let mut session = mission_session(&text);
+        session.world.player.position = [1.3, 1.0];
+        session.world.walls = vec![crate::world::Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 2.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([1, 0]),
+        }];
+        if pin {
+            session.world.walls.push(crate::world::Wall {
+                a: [1.8, 0.0],
+                b: [1.8, 2.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([2, 0]),
+            });
+        }
+        session.base_wall_blocking = vec![true; session.world.walls.len()];
+        session.wall_elevations = vec![0.0; session.world.walls.len()];
+        session.processes = ProcessRuntime::new(&Script::parse(&text), &session.world);
+        session.set_prepared_motion(true);
+        assert_eq!(
+            session.processes.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        session
+    }
+
+    #[test]
+    fn prepared_motion_pushes_player_and_rolls_back_pinned_step() {
+        let mut session = push_session("", "move 1 0 128 0", false);
+        session.advance_prepared_motion(1, 1.0);
+        assert!(session.world.player.position[0] > 1.67);
+        assert!((session.world.walls[0].a[0] - 1.5).abs() < 0.001);
+        let mut pinned = push_session("", "move 1 0 128 0", true);
+        let before = pinned.processes.snapshot(&pinned.world).unwrap();
+        pinned.advance_prepared_motion(1, 1.0);
+        assert_eq!(pinned.world.player.position, [1.3, 1.0]);
+        assert_eq!(pinned.world.walls[0].a, [1.0, 0.0]);
+        assert_eq!(pinned.processes.snapshot(&pinned.world).unwrap(), before);
+    }
+
+    #[test]
+    fn prepared_motion_snapshot_preserves_mode_and_moved_geometry() {
+        let mut baseline = push_session("", "move 1 0 128 0", false);
+        let text = "#proc1\n#action\nmove 1 0 128 0\n#end\n#links\nlink 0 0 1\n#end\n";
+        baseline.processes = ProcessRuntime::new(&Script::parse(text), &baseline.world);
+        let mut source = baseline.clone();
+        source.processes.activate_at("link", [0, 0]);
+        source.advance_prepared_motion(1, 0.2);
+        let digest = crate::save_format::ContentDigest([32; 32]);
+        let saved = source.snapshot(digest).unwrap();
+        assert!(saved.capabilities.prepared_motion);
+        let restored = baseline.restore_from_baseline(&saved, digest).unwrap();
+        assert_eq!(restored.snapshot(digest).unwrap(), saved);
+        baseline.set_prepared_motion(false);
+        assert_eq!(
+            baseline.restore_from_baseline(&saved, digest).err(),
+            Some(SessionSnapshotError::Capabilities)
+        );
+    }
+
+    #[test]
+    fn prepared_motion_pushes_actor_and_freezes_unsupported_processes() {
+        let mut session = push_session("", "move 1 0 128 0", false);
+        session.world.player.position = [5.0, 5.0];
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 64,
+            actor_radius: 64,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement: Monster {
+                position: [333, 256],
+                id: 101,
+                angle: 0,
+                flags: 2,
+            },
+            position: [1.3, 1.0],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.advance_prepared_motion(1, 1.0);
+        assert!(session.actors.actors[0].position[0] > 1.74);
+        for (property, action) in [
+            ("Mortal", "move 1 0 128 0"),
+            ("CheckGo", "move 1 0 128 0"),
+            ("", "rotate 1 0 0 0 90"),
+        ] {
+            let mut frozen = push_session(property, action, false);
+            frozen.step(SessionInput::default());
+            assert_eq!(frozen.world.walls[0].a, [1.0, 0.0]);
+        }
     }
 
     #[test]

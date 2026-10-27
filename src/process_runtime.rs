@@ -1539,6 +1539,10 @@ pub enum ProcessGeometryError {
 }
 
 impl ProcessRuntime {
+    /// Process IDs in deterministic execution order.
+    pub fn process_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.processes.keys().copied()
+    }
     /// Stage one process tick without applying player obstruction checks. This
     /// opt-in foundation requires the host to collision-check every interval.
     /// Unsupported flags and geometry fail closed; legacy ticking is unchanged.

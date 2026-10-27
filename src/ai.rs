@@ -450,6 +450,24 @@ impl EnemyAi {
         })
     }
 
+    /// Whether the ranged attack's muzzle geometry is visible on this frame.
+    /// The local reconstruction enables it only around the midpoint of slot 5;
+    /// melee, idle, unknown metadata and dead/inactive actors never show it.
+    pub fn ranged_fire_visible(&self, source_index: usize) -> bool {
+        let Some(brain) = self.brains.get(&source_index) else {
+            return false;
+        };
+        let Some(phase) = brain.attack_phase else {
+            return false;
+        };
+        if brain.mode != Mode::Attacking || phase.slot != 5 || phase.frame_count == 0 {
+            return false;
+        }
+        let frame = ((u64::from(phase.elapsed_ticks) * 5) / 18)
+            .min(u64::from(phase.frame_count - 1)) as u32;
+        frame.abs_diff(phase.frame_count / 2) <= 2
+    }
+
     /// Alert an actor to a position, for example when damaged out of sight.
     /// Disabled and dead actors do not respond.
     pub fn alert(&mut self, source_index: usize, position: [f32; 2]) -> bool {
@@ -1252,6 +1270,51 @@ mod tests {
             .is_empty());
         assert_eq!(ai.mode(0), Some(Mode::Idle));
     }
+    #[test]
+    fn ranged_fire_geometry_only_shows_near_ranged_clip_midpoint() {
+        let (state, _) = actor(100, 7);
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        assert!(!ai.ranged_fire_visible(0));
+        assert!(!ai.ranged_fire_visible(99));
+        let brain = ai.brains.get_mut(&0).unwrap();
+        brain.mode = Mode::Attacking;
+        brain.attack_phase = Some(AttackPhase {
+            slot: 5,
+            frame_count: 12,
+            elapsed_ticks: 0,
+            fired: false,
+        });
+        assert!(!ai.ranged_fire_visible(0));
+        ai.brains
+            .get_mut(&0)
+            .unwrap()
+            .attack_phase
+            .as_mut()
+            .unwrap()
+            .elapsed_ticks = 15; // frame 4
+        assert!(ai.ranged_fire_visible(0));
+        ai.brains
+            .get_mut(&0)
+            .unwrap()
+            .attack_phase
+            .as_mut()
+            .unwrap()
+            .elapsed_ticks = 33; // frame 9
+        assert!(!ai.ranged_fire_visible(0));
+        ai.brains
+            .get_mut(&0)
+            .unwrap()
+            .attack_phase
+            .as_mut()
+            .unwrap()
+            .slot = 6;
+        assert!(!ai.ranged_fire_visible(0));
+        let brain = ai.brains.get_mut(&0).unwrap();
+        brain.attack_phase.as_mut().unwrap().slot = 5;
+        brain.mode = Mode::Dead;
+        assert!(!ai.ranged_fire_visible(0));
+    }
+
     #[test]
     fn metadata_drives_run_then_melee_midpoint_and_completion() {
         let (mut state, mut defs) = actor(100, 7);

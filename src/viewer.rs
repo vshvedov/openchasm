@@ -715,6 +715,10 @@ fn sync_actor_scene(
             mode != Mode::Inactive,
         );
         objects.set_actor_animation(actor.source_index, animation, delta_seconds);
+        objects.set_actor_shooting(
+            actor.source_index,
+            session.ai.ranged_fire_visible(actor.source_index),
+        );
         let attack_frame = session
             .ai
             .attack_animation(actor.source_index)

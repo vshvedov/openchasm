@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
 const NEAR: f32 = 0.05;
-const ACTOR_ANIMATION_FPS: f64 = 18.0;
+const ACTOR_ANIMATION_FPS: f64 = 1000.0 / 60.0;
 const GLTF_OBJECT_FPS: f64 = 20.0;
 const GLTF_ACTOR_FPS: f64 = 1000.0 / 60.0;
 
@@ -44,18 +44,25 @@ fn actor_gltf_frame(
     clip.first_frame as usize + frame
 }
 
-fn intact_actor_primitive(name: &str, mode: ActorAnimationMode) -> bool {
+fn intact_actor_primitive(name: &str, shooting: bool) -> bool {
     let stem = name.strip_suffix(" transparent").unwrap_or(name);
     if stem.ends_with(" removed") {
         return false;
     }
     if stem.ends_with(" not shooting") {
-        return mode != ActorAnimationMode::Attack;
+        return !shooting;
     }
     if stem.ends_with(" shooting") {
-        return mode == ActorAnimationMode::Attack;
+        return shooting;
     }
     true
+}
+
+/// Original CAR groups are a bitmask; group zero denotes the body.
+fn intact_car_polygon(group: u8, shooting: bool) -> bool {
+    let visible = 1 | 4 | 16 | 64 | if shooting { 128 } else { 0 };
+    let groups = if group == 0 { 64 } else { group };
+    groups & visible != 0
 }
 
 /// Shared camera pose for all world-space renderers.
@@ -139,6 +146,7 @@ struct Instance {
     animation_mode: ActorAnimationMode,
     animation_seconds: f64,
     attack_frame: Option<(usize, u32)>,
+    shooting: bool,
     visible: bool,
 }
 
@@ -621,7 +629,7 @@ fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: 
     let dy = instance.position[1] - camera.player.position[1];
     for primitive in &model.primitives {
         if instance.actor_source_index.is_some()
-            && !intact_actor_primitive(&primitive.name, instance.animation_mode)
+            && !intact_actor_primitive(&primitive.name, instance.shooting)
         {
             continue;
         }
@@ -841,6 +849,7 @@ impl ObjectScene {
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     attack_frame: None,
+                    shooting: false,
                     visible: true,
                 });
             }
@@ -971,6 +980,7 @@ impl ObjectScene {
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     attack_frame: None,
+                    shooting: false,
                     visible: true,
                 });
             }
@@ -1261,6 +1271,19 @@ impl ObjectScene {
         true
     }
 
+    /// Show authored firing-only geometry for a ranged attack phase.
+    pub fn set_actor_shooting(&mut self, source_index: usize, shooting: bool) -> bool {
+        let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.actor_source_index == Some(source_index))
+        else {
+            return false;
+        };
+        instance.shooting = shooting;
+        true
+    }
+
     /// Set the exact authoritative attack slot and zero-based local frame.
     /// Passing None clears the override. Missing or out-of-range data returns
     /// false and keeps the actor in its base pose instead of substituting a
@@ -1450,6 +1473,7 @@ impl ObjectScene {
                             animation_mode: ActorAnimationMode::Idle,
                             animation_seconds: 0.0,
                             attack_frame: None,
+                            shooting: false,
                             visible: true,
                         })
                     })
@@ -1489,7 +1513,7 @@ impl ObjectScene {
             for polygon in &mesh.model.polygons {
                 // The default pose shows intact body/head/hands, excluding
                 // detached parts and attack-only effects.
-                if mesh.car_uv && polygon.group != 0 && polygon.group & (1 | 4 | 16) == 0 {
+                if mesh.car_uv && !intact_car_polygon(polygon.group, instance.shooting) {
                     continue;
                 }
                 let count = polygon.vertex_count();
@@ -1693,6 +1717,7 @@ pub(crate) mod tests {
             animation_mode: ActorAnimationMode::Idle,
             animation_seconds: 0.0,
             attack_frame: None,
+            shooting: false,
             visible: true,
         };
         ObjectScene {
@@ -1714,23 +1739,32 @@ pub(crate) mod tests {
         assert_eq!(actor_gltf_frame(&clips, ActorAnimationMode::Death, 5.0), 6);
         assert!(parse_gltf_clips(b"0 6 2\n", 7).is_err());
         assert!(parse_gltf_clips(b"0 0 1\n0 1 1\n", 7).is_err());
-        assert!(intact_actor_primitive(
-            "faust hand left",
-            ActorAnimationMode::Idle
-        ));
-        assert!(!intact_actor_primitive(
-            "faust hand left removed",
-            ActorAnimationMode::Idle
-        ));
-        assert!(!intact_actor_primitive(
-            "faust shooting transparent",
-            ActorAnimationMode::Idle
-        ));
-        assert!(intact_actor_primitive(
-            "faust shooting transparent",
-            ActorAnimationMode::Attack
-        ));
+        assert!(intact_actor_primitive("faust hand left", false));
+        assert!(!intact_actor_primitive("faust hand left removed", false));
+        assert!(!intact_actor_primitive("faust shooting transparent", false));
+        assert!(intact_actor_primitive("faust shooting transparent", true));
     }
+    #[test]
+    fn monster_firing_geometry_follows_ranged_phase_for_both_formats() {
+        assert!(intact_car_polygon(0, false));
+        assert!(intact_car_polygon(1, false));
+        assert!(!intact_car_polygon(2, false));
+        assert!(!intact_car_polygon(128, false));
+        assert!(intact_car_polygon(128, true));
+        assert!(intact_car_polygon(128 | 1, false));
+        assert!(!intact_actor_primitive("faust shooting", false));
+        assert!(intact_actor_primitive("faust shooting", true));
+        assert!(intact_actor_primitive("faust not shooting", false));
+        assert!(!intact_actor_primitive("faust not shooting", true));
+        let path = std::path::Path::new("assets/csm.bin");
+        if path.is_file() {
+            let mut resources = ResourceSet::open(path).unwrap();
+            let car = crate::monster::Monster::parse(&resources.read("monster/mongf.car").unwrap())
+                .unwrap();
+            assert!(car.model.polygons.iter().any(|p| p.group == 128));
+        }
+    }
+
     #[test]
     fn installed_faust_actor_is_visible_and_uses_original_animations() {
         let path = std::path::Path::new("assets/csm.bin");
@@ -2288,6 +2322,8 @@ pub(crate) mod tests {
         };
         let x = |mode, time| actor_vertices(&mesh, mode, time)[0].position[0];
         assert_eq!(x(ActorAnimationMode::Idle, 0.0), 10);
+        assert_eq!(x(ActorAnimationMode::Idle, 0.059), 10);
+        assert_eq!(x(ActorAnimationMode::Idle, 0.061), 11);
         assert_eq!(x(ActorAnimationMode::Idle, 1.0 / ACTOR_ANIMATION_FPS), 11);
         assert_eq!(x(ActorAnimationMode::Run, 3.0 / ACTOR_ANIMATION_FPS), 0);
         assert_eq!(x(ActorAnimationMode::Attack, 0.0), 10); // idle fallback
@@ -2380,6 +2416,7 @@ pub(crate) mod tests {
             animation_mode: ActorAnimationMode::Idle,
             animation_seconds: 0.0,
             attack_frame: None,
+            shooting: false,
             visible: true,
         };
         let mut scene = ObjectScene {
@@ -2423,6 +2460,7 @@ pub(crate) mod tests {
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     attack_frame: None,
+                    shooting: false,
                     visible: true,
                 },
                 Instance {
@@ -2440,6 +2478,7 @@ pub(crate) mod tests {
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     attack_frame: None,
+                    shooting: false,
                     visible: true,
                 },
             ],

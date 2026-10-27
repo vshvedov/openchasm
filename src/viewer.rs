@@ -84,13 +84,11 @@ impl RelativeLook {
         self.pending_dx = 0;
         self.pending_dy = 0;
     }
-    fn relative_motion(&mut self, dx: i32, dy: i32) {
-        if !self.focused || !self.captured {
-            return;
-        }
-        // Native pointer locking may deliver an initial recentering delta
-        // after the mode switch, despite clearing previously queued deltas.
-        if std::mem::take(&mut self.discard_capture_motion) {
+    fn relative_motion(&mut self, dx: i32, dy: i32, accept: bool) {
+        // Consume the transition even in a suppressed/menu-closing frame, so
+        // the first subsequent gameplay movement is not discarded.
+        let discard = std::mem::take(&mut self.discard_capture_motion);
+        if discard || !accept || !self.focused || !self.captured {
             return;
         }
         self.motion(dx);
@@ -116,11 +114,19 @@ impl RelativeLook {
     }
 }
 
-fn capture_mouse(look: &mut RelativeLook, mouse: &sdl2::mouse::MouseUtil) -> bool {
-    look.capture_with(|| {
+fn capture_mouse(
+    look: &mut RelativeLook,
+    mouse: &sdl2::mouse::MouseUtil,
+    events: &sdl2::EventPump,
+) -> bool {
+    let captured = look.capture_with(|| {
         mouse.set_relative_mouse_mode(true);
         mouse.relative_mouse_mode()
-    })
+    });
+    // SDL flushes queued motion on capture but leaves accumulated raw counts.
+    // Drain those explicitly before accepting the next gameplay batch.
+    let _ = events.relative_mouse_state();
+    captured
 }
 
 /// Return the next owned weapon with ammunition; simulation still validates
@@ -1351,7 +1357,7 @@ pub fn run(
         focused: window.has_input_focus(),
         ..RelativeLook::default()
     };
-    if look.focused && !capture_mouse(&mut look, &sdl.mouse()) {
+    if look.focused && !capture_mouse(&mut look, &sdl.mouse(), &event_pump) {
         eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
     }
     let mut held = HashSet::new();
@@ -1449,7 +1455,11 @@ pub fn run(
         let mut advance_requested = false;
         let mut checkpoint_commands = Vec::new();
         let mut suppress_gameplay = false;
-        for event in event_pump.poll_iter() {
+        while let Some(event) = event_pump.poll_event() {
+            // Old launcher/level windows can leave focus events in SDL's queue.
+            if event.get_window_id().is_some_and(|id| id != window.id()) {
+                continue;
+            }
             if matches!(
                 event,
                 Event::Quit { .. }
@@ -1509,7 +1519,7 @@ pub fn run(
                 if !pause.open
                     && !console.is_open()
                     && !graphics_menu.is_open()
-                    && !capture_mouse(&mut look, &sdl.mouse())
+                    && !capture_mouse(&mut look, &sdl.mouse(), &event_pump)
                 {
                     eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
                 }
@@ -1550,7 +1560,7 @@ pub fn run(
                     console.close();
                     video.text_input().stop();
                     if !pause.open && !graphics_menu.is_open() {
-                        capture_mouse(&mut look, &sdl.mouse());
+                        capture_mouse(&mut look, &sdl.mouse(), &event_pump);
                     }
                 } else {
                     console.toggle();
@@ -1750,7 +1760,7 @@ pub fn run(
                             console.close();
                             video.text_input().stop();
                             if !pause.open && !graphics_menu.is_open() {
-                                capture_mouse(&mut look, &sdl.mouse());
+                                capture_mouse(&mut look, &sdl.mouse(), &event_pump);
                             }
                             suppress_gameplay = true;
                         }
@@ -1776,7 +1786,7 @@ pub fn run(
                             frame_clock.rebase(Instant::now());
                             suppress_gameplay = true;
                             if !pause.open {
-                                capture_mouse(&mut look, &sdl.mouse());
+                                capture_mouse(&mut look, &sdl.mouse(), &event_pump);
                             }
                         }
                     }
@@ -1800,7 +1810,7 @@ pub fn run(
                             pending_interact = false;
                             pending_jump = false;
                             pending_weapon = None;
-                            if !capture_mouse(&mut look, &sdl.mouse()) {
+                            if !capture_mouse(&mut look, &sdl.mouse(), &event_pump) {
                                 eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
                             }
                             frame_clock.rebase(Instant::now());
@@ -1896,7 +1906,7 @@ pub fn run(
                         mouse_fire = true;
                     } else {
                         // The click that captures the cursor must not also shoot.
-                        if !capture_mouse(&mut look, &sdl.mouse()) {
+                        if !capture_mouse(&mut look, &sdl.mouse(), &event_pump) {
                             eprintln!("relative mouse capture unavailable; use arrow keys to turn");
                             mouse_fire = true;
                         }
@@ -1924,12 +1934,21 @@ pub fn run(
                         pending_weapon = Some(next);
                     }
                 }
-                Event::MouseMotion { xrel, yrel, .. } => {
-                    look.relative_motion(xrel, yrel);
-                }
                 _ => {}
             }
         }
+        // SDL's renderer can rescale MouseMotion event deltas to its logical
+        // resolution. The accumulator retains the original relative counts,
+        // matching the original input path and keeping sensitivity independent
+        // of render resolution, window size and presentation backend. Reading
+        // every frame also drains movement made while menus or focus pause us.
+        let relative = event_pump.relative_mouse_state();
+        let accept_motion = simulation_active(
+            look.focused,
+            pause.open || console.is_open() || graphics_menu.is_open(),
+            suppress_gameplay,
+        );
+        look.relative_motion(relative.x(), relative.y(), accept_motion);
         if graphics_changed {
             match graphics
                 .validate()
@@ -2523,22 +2542,35 @@ pub fn run(
 mod tests {
     use super::*;
     #[test]
+    fn suppressed_transition_batch_does_not_discard_first_real_mouse_motion() {
+        let mut look = RelativeLook {
+            focused: true,
+            ..Default::default()
+        };
+        assert!(look.capture_with(|| true));
+        look.relative_motion(400, 300, false);
+        look.relative_motion(20, -20, true);
+        assert!((look.take_yaw() + 20.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
+        assert!((look.take_pitch() - 20.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
+    }
+
+    #[test]
     fn capture_recenter_does_not_turn_the_camera() {
         let mut look = RelativeLook {
             focused: true,
             ..RelativeLook::default()
         };
         assert!(look.capture_with(|| true));
-        look.relative_motion(-341, -185);
+        look.relative_motion(-341, -185, true);
         assert_eq!(look.take_yaw(), 0.0);
         assert_eq!(look.take_pitch(), 0.0);
-        look.relative_motion(10, -4);
+        look.relative_motion(10, -4, true);
         assert!((look.take_yaw() + 10.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         assert!((look.take_pitch() - 4.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         look.release();
-        look.relative_motion(500, 500);
+        look.relative_motion(500, 500, true);
         assert!(look.capture_with(|| true));
-        look.relative_motion(200, 100);
+        look.relative_motion(200, 100, true);
         assert_eq!(look.take_yaw(), 0.0);
         assert_eq!(look.take_pitch(), 0.0);
     }

@@ -101,3 +101,23 @@ fn main() -> Result<(), String> {
 ```
 
 For integration, replace the solid color with the existing `u32` image. Copy row by row respecting SDL's texture pitch and the selected pixel format. Clear held keys/buttons and accumulated mouse deltas on focus loss; route input to menus before simulation; apply sensitivity and optional invert-Y once to the tick input. Avoid storing platform window handles or OS events in the server simulation.
+
+## Current SDL relative-count path
+
+The prototype above predates the current input implementation. Its event-delta
+path and 0.002 coefficient are historical; the client now uses the original
+pi/1024 radians per SDL relative count (see movement-evidence.md).
+
+SDL's renderer enables relative logical-size scaling by default. Its motion-event
+watch divides deltas by the logical/output scale, carrying fractional remainders.
+On this Linux window, 20 injected (1,-1) counts produced about 11 counts of look
+through SDL presentation and 20 through GPU presentation. This makes event-based
+sensitivity depend on resolution and presentation backend.
+
+SDL accumulates relative counts before its renderer event watch. The client now
+reads that accumulator once after event polling and drains it on inactive frames.
+MouseMotion events are not also applied. Capture explicitly drains old accumulated
+counts (changing SDL relative mode only flushes queued motion events), and consumes
+the transition batch even if gameplay is suppressed or the batch is empty. Focus
+messages belonging to another SDL window are ignored. Counts are consumed once
+by the fixed simulation input, without frame-time or viewport scaling.

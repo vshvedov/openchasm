@@ -33,3 +33,15 @@ must restore its corresponding snapshot.
 The optional installed-corpus test checks 76 rows in maps 01–19, including all
 six level-17 rows with the extra field. It does not establish map traversal or
 prove that flagged expansion teleports work.
+
+`Session::set_teleports` opts the player into this behavior and selects a rearm
+policy; fresh sessions remain disabled. After movement, a successful teleport
+updates position and yaw, resets vertical velocity at the provisional flat
+floor, then runs destination pickups and floor links in that tick. It emits
+`SessionEvents::teleport`; blocked destinations and unsupported extra fields
+are reported as `teleport_failure`. Clearance checks represented live actor
+and object circles plus blocking walls, map edges and the provisional ceiling.
+Source floor triggers are not fired on a successful teleport. Destination
+floor entry is reset even when source and destination share a cell. AI and
+other entities do not teleport yet; wind currently applies before teleport,
+unlike the reference's provisional order.

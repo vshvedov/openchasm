@@ -23,6 +23,7 @@ use crate::process_runtime::{
 use crate::process_transaction::{PresentationManifest, ProcessTransaction};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
 use crate::quake::{QuakeField, QuakeZone};
+use crate::teleport::{RearmPolicy, Teleport, TeleportEvent, TeleportFailure, TeleportState};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
 use crate::wind::{WindError, WindField};
 use crate::world::{CollisionCircle, Input, WallCollisionMode, World};
@@ -108,6 +109,9 @@ pub struct SessionEvents {
     pub process_effects: Vec<ProcessEffect>,
     pub hazard_damage: Vec<HazardDamage>,
     pub vertical: VerticalEvents,
+    /// A committed player teleport or an explicitly rejected attempt.
+    pub teleport: Option<TeleportEvent>,
+    pub teleport_failure: Option<TeleportFailure>,
     /// Invalid or duplicate wind activation, if emitted by a process.
     pub wind_errors: Vec<WindError>,
 }
@@ -176,6 +180,7 @@ impl ScriptedObjects {
 pub struct Session {
     pub world: World,
     wall_collision_mode: WallCollisionMode,
+    teleports: Option<(Vec<Teleport>, TeleportState)>,
     pub vertical: VerticalState,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
@@ -224,6 +229,7 @@ impl Session {
             elevation_by_cell: vec![0.0; 64 * 64],
             world: setup.world,
             wall_collision_mode: WallCollisionMode::TwoSided,
+            teleports: None,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
             processes: setup.processes,
             actors: setup.actors,
@@ -247,6 +253,12 @@ impl Session {
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Opt into player teleports; configure before taking a restart snapshot.
+    /// The host must present teleport events and keep floor geometry in sync.
+    pub fn set_teleports(&mut self, definitions: Vec<Teleport>, policy: RearmPolicy) {
+        self.teleports = Some((definitions, TeleportState::new(policy)));
+    }
+
     /// Choose the wall policy for player and wind-driven movement. Defaults to
     /// two-sided. Authored sides apply only to walls the process runtime proves
     /// static; moving-wall obstruction remains conservative. Snapshot clones
@@ -1059,6 +1071,75 @@ impl Session {
                         .move_circle(position, displacement, radius, &obstacles)
                 };
         }
+        // Teleport after movement and before pickup, floor links and combat.
+        // Destination clearance is conservative and uses provisional flat floors.
+        if let Some((definitions, state)) = &mut self.teleports {
+            let mut obstacles: Vec<CollisionCircle> = self
+                .actors
+                .actors
+                .iter()
+                .filter_map(|actor| {
+                    if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive)
+                    {
+                        return None;
+                    }
+                    let radius = self
+                        .actor_definitions
+                        .entries
+                        .get(actor.definition_index)
+                        .map(|def| (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0))
+                        .unwrap_or(2.0);
+                    Some(CollisionCircle {
+                        center: actor.position,
+                        radius,
+                    })
+                })
+                .collect();
+            let destination_head = self.vertical.config().body_height;
+            obstacles.extend(
+                self.processes
+                    .objects()
+                    .filter(|object| {
+                        object.blocking_radius > 0.0
+                            && object.elevation_raw / 64.0 < destination_head
+                    })
+                    .map(|object| CollisionCircle {
+                        center: object.position,
+                        radius: object.blocking_radius,
+                    }),
+            );
+            let world = &self.world;
+            let base = &self.base_wall_blocking;
+            let elevations = &self.wall_elevations;
+            let outcome = state.tick(definitions, world.player.position, |destination| {
+                const RADIUS: f32 = 0.18;
+                destination
+                    .iter()
+                    .all(|v| *v >= RADIUS && *v <= 64.0 - RADIUS)
+                    && destination_head <= 2.0
+                    && world.disc_is_clear(destination, RADIUS, &obstacles, |index, _| {
+                        base.get(index).copied().unwrap_or(true)
+                            && elevations.get(index).copied().unwrap_or(0.0)
+                                < (destination_head * 64.0).max(80.0)
+                    })
+            });
+            match outcome {
+                Ok(Some(event)) => {
+                    self.world.player.position = event.destination;
+                    self.world.player.angle = event.angle_radians;
+                    self.vertical = VerticalState::with_config(0.0, self.vertical.config())
+                        .expect("existing vertical configuration is valid");
+                    self.sync_wall_blocking();
+                    // A teleport is a new floor entry, even when both positions
+                    // happen to be in the same cell. No source floor is fired.
+                    self.processes
+                        .collect_tick_commands([f32::NAN, f32::NAN], false);
+                    events.teleport = Some(event);
+                }
+                Ok(None) => {}
+                Err(error) => events.teleport_failure = Some(error),
+            }
+        }
         // First stage only inventory/pickup data. The larger simulation snapshot
         // is needed only on ticks where a collection actually occurs.
         let pickup_backup = if self.scripted_objects.is_some() {
@@ -1646,6 +1727,129 @@ mod tests {
         session.set_mission(MissionPlan::parse(&script, text));
         session
     }
+    #[test]
+    fn teleport_resets_vertical_and_dispatches_only_destination_floor() {
+        use crate::teleport::{self, RearmPolicy};
+        let text="#mess1\nDelay 1\nTextA: 0 0 \"Source\"\n#end\n#mess2\nDelay 1\nTextA: 0 0 \"Destination\"\n#end\n#proc1\nOnMessage 1\n#end\n#proc2\nOnMessage 2\n#end\n#links\nfloor 0 0 1\nfloor 2 0 2\n#end\n";
+        let mut session = mission_session(text);
+        session.set_teleports(
+            teleport::parse("#teleports\ntcenter 0 0 2 0 3\n#end\n").unwrap(),
+            RearmPolicy::ReferenceContinuous,
+        );
+        let events = session.step(SessionInput {
+            jump: true,
+            ..Default::default()
+        });
+        assert!(events.teleport.is_some());
+        assert_eq!(session.world.player.position, [2.5, 0.5]);
+        assert_eq!(session.world.player.angle, 0.0);
+        assert_eq!(session.vertical.feet(), 0.0);
+        assert_eq!(session.vertical.velocity(), 0.0);
+        assert!(session.vertical.grounded());
+        assert_eq!(events.mission, vec![MissionEvent::ShowMessage(2)]);
+        assert!(session.step(SessionInput::default()).teleport.is_none());
+    }
+
+    #[test]
+    fn teleport_collects_destination_pickup_and_snapshot_preserves_rearm() {
+        use crate::inventory::Pickup;
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::teleport::{self, RearmPolicy};
+        let mut session = mission_session("");
+        let def = ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 128,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "armor.3o".into(),
+            animation_name: None,
+        };
+        let obj = ObjectInstance {
+            kind: ObjectKind::Item,
+            definition_index: 0,
+            grid_cell: [2, 0],
+            position: [2.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        session.game = GameInventory::new(
+            session.game.weapons.clone(),
+            &[obj],
+            &ObjectDefinitions {
+                items: vec![def],
+                level_objects: vec![],
+            },
+            Difficulty::Normal,
+        );
+        // The second source is at the destination; the opt-in policy gates it.
+        session.set_teleports(
+            teleport::parse("#teleports\ntcenter 0 0 2 0 3\ntcenter 2 0 3 0 3\n#end\n").unwrap(),
+            RearmPolicy::AfterLeavingSources,
+        );
+        let events = session.step(SessionInput::default());
+        assert!(events.teleport.is_some());
+        assert!(events
+            .pickups
+            .iter()
+            .any(|pickup| pickup.pickup == Pickup::Armor));
+        let mut restart = session.clone();
+        assert!(session.step(SessionInput::default()).teleport.is_none());
+        assert!(restart.step(SessionInput::default()).teleport.is_none());
+        assert_eq!(session.world.player.position, [2.5, 0.5]);
+    }
+
+    #[test]
+    fn teleport_destination_collision_and_unknown_flags_fail_without_moving() {
+        use crate::teleport::{self, RearmPolicy, TeleportFailure};
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.walls.push(Wall {
+            a: [2.5, 0.0],
+            b: [2.5, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        session.set_teleports(
+            teleport::parse("#teleports\ntcenter 0 0 2 0 3\n#end\n").unwrap(),
+            RearmPolicy::AfterLeavingSources,
+        );
+        let before = session.clone();
+        let e = session.step(SessionInput::default());
+        assert_eq!(
+            e.teleport_failure,
+            Some(TeleportFailure::DestinationBlocked { index: 0 })
+        );
+        assert_eq!(session.world.player.position, before.world.player.position);
+        session.world.walls[0].blocks_movement = false;
+        session.base_wall_blocking[0] = false;
+        assert!(
+            session.step(SessionInput::default()).teleport.is_some(),
+            "blocked attempt must not consume trigger"
+        );
+        let mut unknown = mission_session("");
+        unknown.set_teleports(
+            teleport::parse("#teleports\ntcenter 0 0 2 0 3 2\n#end\n").unwrap(),
+            RearmPolicy::ReferenceContinuous,
+        );
+        let e = unknown.step(SessionInput::default());
+        assert_eq!(
+            e.teleport_failure,
+            Some(TeleportFailure::UnsupportedExtra { index: 0, value: 2 })
+        );
+        assert_eq!(unknown.world.player.position, [0.5, 0.5]);
+    }
+
     #[test]
     fn invisibility_pickup_suppresses_idle_acquisition_until_expiry() {
         use crate::inventory::Pickup;

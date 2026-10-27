@@ -14,9 +14,11 @@ use crate::object_render::{
     ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot, Translucency,
 };
 use crate::planes::PlaneRenderer;
+use crate::presentation::{BackendChoice, Presentation};
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
 use crate::remaster_light::{LightingError, RemasterLightMap, ShadowTexture};
 use crate::texture::CelImage;
+use crate::ui::{OverlayPixel, UiPixel};
 use crate::weapon_render::{WeaponAnimationClock, WeaponPose, WeaponRenderer};
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
@@ -28,7 +30,6 @@ use sdl2::{
     event::{Event, WindowEvent},
     keyboard::Scancode,
     mouse::{MouseButton, MouseWheelDirection},
-    pixels::PixelFormatEnum,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
@@ -267,10 +268,10 @@ fn simulation_active(focused: bool, menu_open: bool, suppress_gameplay: bool) ->
     focused && !menu_open && !suppress_gameplay
 }
 
-fn draw_pause_menu(frame: &mut [u32], menu: &PauseMenu) {
+fn draw_pause_menu<C: UiPixel>(frame: &mut [C], menu: &PauseMenu) {
     for y in 85..315 {
         for x in 125..515 {
-            frame[y * WIDTH + x] = 0x101820;
+            frame[y * WIDTH + x] = C::from_rgb(0x101820);
         }
     }
     text(frame, 155, 100, "PAUSED");
@@ -360,16 +361,12 @@ impl DamageFeedback {
     }
 }
 
-fn apply_damage_tint(frame: &mut [u32], alpha: u8) {
+fn apply_damage_tint<C: UiPixel>(frame: &mut [C], alpha: u8) {
     if alpha == 0 {
         return;
     }
-    let alpha = u32::from(alpha.min(128));
     for pixel in frame {
-        let red = ((*pixel >> 16) & 255) * (255 - alpha) / 255 + alpha;
-        let green = ((*pixel >> 8) & 255) * (255 - alpha) / 255;
-        let blue = (*pixel & 255) * (255 - alpha) / 255;
-        *pixel = (red << 16) | (green << 8) | blue;
+        *pixel = pixel.tint_rgb(0xff0000, alpha.min(128));
     }
 }
 
@@ -478,7 +475,7 @@ impl From<CelImage> for ViewerTexture {
     }
 }
 
-fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
+fn text<C: UiPixel>(frame: &mut [C], x: usize, y: usize, message: &str) {
     for (i, ch) in message.chars().enumerate() {
         if let Some(glyph) = BASIC_FONTS.get(ch) {
             for (dy, row) in glyph.iter().enumerate() {
@@ -486,7 +483,7 @@ fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
                     let px = x + i * 8 + dx;
                     let py = y + dy;
                     if px < WIDTH && py < HEIGHT && row & (1 << dx) != 0 {
-                        frame[py * WIDTH + px] = 0xffffff;
+                        frame[py * WIDTH + px] = C::from_rgb(0xffffff);
                     }
                 }
             }
@@ -845,7 +842,7 @@ impl FrameScene<'_> {
     }
 }
 
-fn draw_header(frame: &mut [u32], label: &str) {
+fn draw_header<C: UiPixel>(frame: &mut [C], label: &str) {
     text(frame, 8, 8, label);
     text(
         frame,
@@ -1100,6 +1097,173 @@ impl LightingCache {
     }
 }
 
+struct UiFrame<'a> {
+    hud: Option<&'a crate::hud::Hud>,
+    session: &'a Session,
+    damage_flash: u8,
+    minimap: &'a minimap::Minimap,
+    show_help: bool,
+    label: &'a str,
+    reflection_ticks: u8,
+    current_message: Option<&'a [String]>,
+    teleport_notice: Option<&'a str>,
+    checkpoint_notice: Option<&'a str>,
+    shot_feedback: Option<&'a str>,
+    completed: bool,
+    pause: &'a PauseMenu,
+    look: &'a RelativeLook,
+    console: &'a crate::developer_console::Console,
+    graphics_menu: &'a GraphicsMenu,
+    graphics: &'a GraphicsSettings,
+    show_fps: bool,
+    metrics: crate::frame_stats::Metrics,
+}
+impl UiFrame<'_> {
+    fn draw<C: UiPixel>(&self, frame: &mut [C]) {
+        let Self {
+            hud,
+            session,
+            damage_flash,
+            minimap,
+            show_help,
+            label,
+            reflection_ticks,
+            current_message,
+            teleport_notice,
+            checkpoint_notice,
+            shot_feedback,
+            completed,
+            pause,
+            look,
+            console,
+            graphics_menu,
+            graphics,
+            show_fps,
+            metrics,
+        } = *self;
+        apply_damage_tint(frame, damage_flash);
+        minimap.draw(frame, WIDTH, HEIGHT, &session.world);
+        if show_help {
+            draw_header(frame, label);
+        }
+        let cx = WIDTH / 2;
+        let cy = HEIGHT / 2;
+        for offset in -3isize..=3 {
+            frame[cy * WIDTH + (cx as isize + offset) as usize] = C::from_rgb(0xffffff);
+            frame[(cy as isize + offset) as usize * WIDTH + cx] = C::from_rgb(0xffffff);
+        }
+        let inventory = &session.game.inventory;
+        let hud_top = if let Some(hud) = &hud {
+            hud.render(
+                frame,
+                WIDTH,
+                HEIGHT,
+                crate::hud::HudState {
+                    health: u32::from(inventory.health),
+                    armor: u32::from(inventory.armor),
+                    ammo: u32::from(inventory.ammo[session.selected_weapon]),
+                    weapon: session.selected_weapon,
+                },
+            );
+            if inventory.keys.iter().any(|key| *key) {
+                text(
+                    frame,
+                    WIDTH - 96,
+                    HEIGHT - 76,
+                    &format!(
+                        "KEYS {}{}{}",
+                        if inventory.keys[0] { "R" } else { "-" },
+                        if inventory.keys[1] { "G" } else { "-" },
+                        if inventory.keys[2] { "B" } else { "-" }
+                    ),
+                );
+            }
+            HEIGHT - 64
+        } else {
+            text(
+                frame,
+                8,
+                HEIGHT - 18,
+                &format!(
+                    "HEALTH {}  ARMOR {}  WEAPON {}  AMMO {}  KEYS {}{}{}",
+                    inventory.health,
+                    inventory.armor,
+                    session.selected_weapon + 1,
+                    inventory.ammo[session.selected_weapon],
+                    if inventory.keys[0] { "R" } else { "-" },
+                    if inventory.keys[1] { "G" } else { "-" },
+                    if inventory.keys[2] { "B" } else { "-" }
+                ),
+            );
+            HEIGHT
+        };
+        let effects = &session.game.protective_powerups;
+        let status = powerup_status(
+            inventory.invisibility_ticks_remaining,
+            effects.reflector_ticks_remaining,
+            effects.chojin_ticks_remaining,
+        );
+        if !status.is_empty() {
+            text(frame, 8, hud_top.saturating_sub(12), &status);
+        }
+        if reflection_ticks > 0 {
+            text(
+                frame,
+                WIDTH / 2,
+                hud_top.saturating_sub(24),
+                "PROJECTILE REFLECTED",
+            );
+        }
+        if let Some(lines) = current_message {
+            for (row, line) in lines.iter().enumerate().take(6) {
+                text(frame, 8, 52 + row * 10, line);
+            }
+        }
+        if let Some(message) = teleport_notice {
+            text(frame, 8, hud_top.saturating_sub(48), message);
+        }
+        if let Some(message) = checkpoint_notice {
+            text(frame, 8, hud_top.saturating_sub(36), message);
+        }
+        if let Some(message) = shot_feedback {
+            text(frame, 8, hud_top.saturating_sub(24), message);
+        }
+        if completed {
+            text(
+                frame,
+                WIDTH / 2 - 112,
+                HEIGHT / 2 + 35,
+                "LEVEL COMPLETE - ENTER TO CONTINUE",
+            );
+        }
+        if inventory.health == 0 {
+            text(
+                frame,
+                WIDTH / 2 - 80,
+                HEIGHT / 2 + 35,
+                "YOU DIED - R TO RESTART",
+            );
+        }
+        if pause.open {
+            draw_pause_menu(frame, pause);
+        } else if !look.focused {
+            text(frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
+        } else if !look.captured && !console.is_open() && !graphics_menu.is_open() {
+            text(frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
+        }
+        if show_fps {
+            text(
+                frame,
+                WIDTH - 184,
+                8,
+                &format!("FPS {:5.1}  {:5.1} MS", metrics.fps, metrics.frame_ms),
+            );
+        }
+        graphics_menu.render(frame, WIDTH, HEIGHT, graphics);
+        console.render(frame, WIDTH, HEIGHT);
+    }
+}
+
 pub struct ClientFeedback {
     pub hud: Option<crate::hud::Hud>,
     pub map: crate::map::Map,
@@ -1161,33 +1325,24 @@ pub fn run(
         .collect();
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
-    let window = video
-        .window(
-            "OpenChasm - early gameplay preview",
-            WIDTH as u32,
-            HEIGHT as u32,
-        )
-        .resizable()
-        .position_centered()
-        .build()?;
-    // Let SDL choose its preferred presentation backend, falling back to
-    // software when no accelerated driver is available. Scene rasterization
-    // remains CPU-based; only the final texture scaling/blit is delegated.
-    let mut canvas = window.into_canvas().build()?;
-    if std::env::var("OPENCHASM_PROFILE").as_deref() == Ok("1") {
-        eprintln!("presentation renderer: {}", canvas.info().name);
-    }
-    canvas.set_logical_size(WIDTH as u32, HEIGHT as u32)?;
-    let texture_creator = canvas.texture_creator();
-    let mut texture = texture_creator.create_texture_streaming(
-        PixelFormatEnum::ARGB8888,
+    let mut window_builder = video.window(
+        "OpenChasm - early gameplay preview",
         WIDTH as u32,
         HEIGHT as u32,
-    )?;
+    );
+    window_builder
+        .resizable()
+        .position_centered()
+        .allow_highdpi();
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    window_builder.metal_view();
+    let window = window_builder.build()?;
+    let mut presentation =
+        Presentation::new(&window, WIDTH, HEIGHT, BackendChoice::from_environment()?)?;
     let mut event_pump = sdl.event_pump()?;
     video.text_input().stop();
     let mut look = RelativeLook {
-        focused: canvas.window().has_input_focus(),
+        focused: window.has_input_focus(),
         ..RelativeLook::default()
     };
     if look.focused && !capture_mouse(&mut look, &sdl.mouse()) {
@@ -1195,7 +1350,8 @@ pub fn run(
     }
     let mut held = HashSet::new();
     let mut mouse_fire = false;
-    let mut frame = vec![0; WIDTH * HEIGHT];
+    let mut frame = vec![0u32; WIDTH * HEIGHT];
+    let mut ui_overlay = Vec::<OverlayPixel>::new();
     let mut hdr_frame = vec![LinearRgb::default(); WIDTH * HEIGHT];
     let mut rgb_transparency = Translucency::new(WIDTH * HEIGHT);
     let mut hdr_transparency = Translucency::new(WIDTH * HEIGHT);
@@ -1245,6 +1401,10 @@ pub fn run(
     let mut completed = false;
     let mut pause = PauseMenu::default();
     let mut console = crate::developer_console::Console::default();
+    if let Some(notice) = presentation.take_notice() {
+        eprintln!("{notice}");
+        console.push(&notice);
+    }
     let mut show_fps = graphics.show_fps;
     let mut mouse_sensitivity = graphics.sensitivity;
     let frame_limit = effective_fps_limit(graphics.max_fps, uncapped_override);
@@ -1481,6 +1641,19 @@ pub fn run(
                                 graphics_changed = true;
                             }
                             console.push(&format!("graphics {:?}", graphics.preset));
+                        }
+                        Command::Renderer(value) => {
+                            if let Some(choice) = value {
+                                presentation.set_backend(choice)?;
+                                if let Some(notice) = presentation.take_notice() {
+                                    eprintln!("{notice}");
+                                    console.push(&notice);
+                                }
+                                frame_clock.rebase(Instant::now());
+                                accumulator = 0.0;
+                                pending_simulation_time = Duration::ZERO;
+                            }
+                            console.push(&format!("renderer {}", presentation.backend_name()));
                         }
                         Command::ToneMap(value) => {
                             if let Some(value) = value {
@@ -2172,7 +2345,8 @@ pub fn run(
         } else {
             scene.draw(&mut frame, &mut depth, &mut rgb_transparency, profile)
         };
-        if graphics.uses_hdr() {
+        let use_gpu = presentation.is_gpu();
+        if graphics.uses_hdr() && !use_gpu {
             let started = profile_start(profile);
             if graphics.bloom > 0.0 {
                 bloom.apply(&mut hdr_frame, graphics.bloom, color_pipeline.exposure())?;
@@ -2184,147 +2358,93 @@ pub fn run(
             stage_totals.accumulate(stage_timings);
             stage_frames = stage_frames.saturating_add(1);
         }
-        apply_damage_tint(&mut frame, damage_feedback.flash);
-        minimap.draw(&mut frame, WIDTH, HEIGHT, &session.world);
-        if graphics.show_help {
-            draw_header(&mut frame, label);
-        }
-        let cx = WIDTH / 2;
-        let cy = HEIGHT / 2;
-        for offset in -3isize..=3 {
-            frame[cy * WIDTH + (cx as isize + offset) as usize] = 0xffffff;
-            frame[(cy as isize + offset) as usize * WIDTH + cx] = 0xffffff;
-        }
-        let inventory = &session.game.inventory;
-        let hud_top = if let Some(hud) = &hud {
-            hud.render(
-                &mut frame,
-                WIDTH,
-                HEIGHT,
-                crate::hud::HudState {
-                    health: u32::from(inventory.health),
-                    armor: u32::from(inventory.armor),
-                    ammo: u32::from(inventory.ammo[session.selected_weapon]),
-                    weapon: session.selected_weapon,
-                },
-            );
-            if inventory.keys.iter().any(|key| *key) {
-                text(
-                    &mut frame,
-                    WIDTH - 96,
-                    HEIGHT - 76,
-                    &format!(
-                        "KEYS {}{}{}",
-                        if inventory.keys[0] { "R" } else { "-" },
-                        if inventory.keys[1] { "G" } else { "-" },
-                        if inventory.keys[2] { "B" } else { "-" }
-                    ),
-                );
-            }
-            HEIGHT - 64
-        } else {
-            text(
-                &mut frame,
-                8,
-                HEIGHT - 18,
-                &format!(
-                    "HEALTH {}  ARMOR {}  WEAPON {}  AMMO {}  KEYS {}{}{}",
-                    inventory.health,
-                    inventory.armor,
-                    session.selected_weapon + 1,
-                    inventory.ammo[session.selected_weapon],
-                    if inventory.keys[0] { "R" } else { "-" },
-                    if inventory.keys[1] { "G" } else { "-" },
-                    if inventory.keys[2] { "B" } else { "-" }
-                ),
-            );
-            HEIGHT
+        let ui = UiFrame {
+            hud: hud.as_ref(),
+            session: &session,
+            damage_flash: damage_feedback.flash,
+            minimap: &minimap,
+            show_help: graphics.show_help,
+            label,
+            reflection_ticks,
+            current_message: current_message.as_ref().map(|(lines, _)| lines.as_slice()),
+            teleport_notice: teleport_notice
+                .as_ref()
+                .map(|(message, _)| message.as_str()),
+            checkpoint_notice: checkpoint_notice.map(|(message, _)| message),
+            shot_feedback: shot_feedback.map(|(message, _)| message),
+            completed,
+            pause: &pause,
+            look: &look,
+            console: &console,
+            graphics_menu: &graphics_menu,
+            graphics: &graphics,
+            show_fps,
+            metrics: frame_stats.metrics,
         };
-        let effects = &session.game.protective_powerups;
-        let status = powerup_status(
-            inventory.invisibility_ticks_remaining,
-            effects.reflector_ticks_remaining,
-            effects.chojin_ticks_remaining,
-        );
-        if !status.is_empty() {
-            text(&mut frame, 8, hud_top.saturating_sub(12), &status);
+        if use_gpu {
+            ui_overlay.resize(WIDTH * HEIGHT, OverlayPixel::default());
+            ui_overlay.fill(OverlayPixel::default());
+            ui.draw(&mut ui_overlay);
+        } else {
+            ui.draw(&mut frame);
         }
-        if reflection_ticks > 0 {
-            text(
-                &mut frame,
-                WIDTH / 2,
-                hud_top.saturating_sub(24),
-                "PROJECTILE REFLECTED",
-            );
-        }
-        if let Some((lines, _)) = &current_message {
-            for (row, line) in lines.iter().enumerate().take(6) {
-                text(&mut frame, 8, 52 + row * 10, line);
-            }
-        }
-        if let Some((message, _)) = &teleport_notice {
-            text(&mut frame, 8, hud_top.saturating_sub(48), message);
-        }
-        if let Some((message, _)) = checkpoint_notice {
-            text(&mut frame, 8, hud_top.saturating_sub(36), message);
-        }
-        if let Some((message, _)) = shot_feedback {
-            text(&mut frame, 8, hud_top.saturating_sub(24), message);
-        }
-        if completed {
-            text(
-                &mut frame,
-                WIDTH / 2 - 112,
-                HEIGHT / 2 + 35,
-                "LEVEL COMPLETE - ENTER TO CONTINUE",
-            );
-        }
-        if inventory.health == 0 {
-            text(
-                &mut frame,
-                WIDTH / 2 - 80,
-                HEIGHT / 2 + 35,
-                "YOU DIED - R TO RESTART",
-            );
-        }
-        if pause.open {
-            draw_pause_menu(&mut frame, &pause);
-        } else if !look.focused {
-            text(&mut frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
-        } else if !look.captured && !console.is_open() && !graphics_menu.is_open() {
-            text(&mut frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
-        }
-        if show_fps {
-            text(
-                &mut frame,
-                WIDTH - 184,
-                8,
-                &format!(
-                    "FPS {:5.1}  {:5.1} MS",
-                    frame_stats.metrics.fps, frame_stats.metrics.frame_ms
-                ),
-            );
-        }
-        graphics_menu.render(&mut frame, WIDTH, HEIGHT, &graphics);
-        console.render(&mut frame, WIDTH, HEIGHT);
         let render_time = render_started.elapsed();
         let present_started = Instant::now();
-        texture.with_lock(None, |bytes, pitch| {
-            for (row, pixels) in bytes.chunks_mut(pitch).zip(frame.chunks(WIDTH)) {
-                for (dst, &pixel) in row[..WIDTH * 4].chunks_mut(4).zip(pixels) {
-                    dst.copy_from_slice(&(pixel | 0xff00_0000).to_ne_bytes());
+        let mut backend_notice = None;
+        let presented = if use_gpu {
+            #[cfg(feature = "gpu")]
+            let packed_overlay = OverlayPixel::as_packed(&ui_overlay);
+            #[cfg(not(feature = "gpu"))]
+            let packed_overlay: &[[f32; 4]] = &[];
+            let result = if graphics.uses_hdr() {
+                presentation.present_hdr(
+                    &hdr_frame,
+                    graphics.color_settings(),
+                    graphics.bloom,
+                    packed_overlay,
+                )
+            } else {
+                presentation.present_rgb(&frame, packed_overlay)
+            };
+            match result {
+                Ok(presented) => presented,
+                Err(error) => {
+                    backend_notice = Some(format!("GPU presentation failed; using SDL: {error}"));
+                    presentation.fallback_to_sdl()?;
+                    if graphics.uses_hdr() {
+                        if graphics.bloom > 0.0 {
+                            bloom.apply(
+                                &mut hdr_frame,
+                                graphics.bloom,
+                                color_pipeline.exposure(),
+                            )?;
+                        }
+                        color_pipeline.encode_frame(&hdr_frame, &mut frame)?;
+                    }
+                    ui.draw(&mut frame);
+                    presentation.present_sdl(&frame)?;
+                    true
                 }
             }
-        })?;
-        canvas.clear();
-        canvas.copy(&texture, None, None)?;
-        canvas.present();
-        if let Some(metrics) = frame_stats.record(
-            Instant::now(),
-            simulation_time,
-            render_time,
-            present_started.elapsed(),
-        ) {
+        } else {
+            presentation.present_sdl(&frame)?;
+            true
+        };
+        if let Some(notice) = backend_notice {
+            eprintln!("{notice}");
+            console.push(&notice);
+        }
+        if let Some(metrics) = presented
+            .then(|| {
+                frame_stats.record(
+                    Instant::now(),
+                    simulation_time,
+                    render_time,
+                    present_started.elapsed(),
+                )
+            })
+            .flatten()
+        {
             profile_samples = profile_samples.wrapping_add(1);
             if profile && profile_samples.is_multiple_of(4) {
                 let ms = |value| RenderTimings::ms_per_frame(value, stage_frames);

@@ -1,5 +1,6 @@
 //! Client-only, provisional explored-wall map. The reference reveals opaque
 //! walls in view over time; exact remaster visibility and zoom are unknown.
+use crate::ui::UiPixel;
 use crate::world::World;
 const RAYS: usize = 160;
 const LEFT: i32 = 12;
@@ -109,7 +110,7 @@ impl Minimap {
         self.observation = Some(ObservationKey::new(world));
     }
     /// Draw current positions of discovered walls and a heading marker.
-    pub fn draw(&self, frame: &mut [u32], width: usize, height: usize, world: &World) {
+    pub fn draw<C: UiPixel>(&self, frame: &mut [C], width: usize, height: usize, world: &World) {
         if !self.open
             || width.checked_mul(height) != Some(frame.len())
             || self.visible.len() != world.walls.len()
@@ -152,7 +153,7 @@ impl Minimap {
         line(frame, width, height, right, tip, 0x6dff70);
     }
 }
-fn put(frame: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: u32) {
+fn put<C: UiPixel>(frame: &mut [C], width: usize, height: usize, x: i32, y: i32, color: u32) {
     if (LEFT..LEFT + WIDTH).contains(&x)
         && (TOP..TOP + HEIGHT).contains(&y)
         && x >= 0
@@ -160,11 +161,18 @@ fn put(frame: &mut [u32], width: usize, height: usize, x: i32, y: i32, color: u3
         && (x as usize) < width
         && (y as usize) < height
     {
-        frame[y as usize * width + x as usize] = color;
+        frame[y as usize * width + x as usize] = C::from_rgb(color);
     }
 }
 /// Clip first so huge or invalid endpoints cannot produce unbounded iteration.
-fn line(frame: &mut [u32], width: usize, height: usize, a: [f32; 2], b: [f32; 2], color: u32) {
+fn line<C: UiPixel>(
+    frame: &mut [C],
+    width: usize,
+    height: usize,
+    a: [f32; 2],
+    b: [f32; 2],
+    color: u32,
+) {
     if !a
         .iter()
         .chain(b.iter())
@@ -260,11 +268,11 @@ mod tests {
         let mut map = Minimap::new(&world);
         map.observe(&world);
         map.open = true;
-        let mut first = vec![0; 640 * 400];
+        let mut first = vec![0u32; 640 * 400];
         map.draw(&mut first, 640, 400, &world);
         world.walls[0].a[0] = 4.0;
         world.walls[0].b[0] = 4.0;
-        let mut moved = vec![0; 640 * 400];
+        let mut moved = vec![0u32; 640 * 400];
         map.draw(&mut moved, 640, 400, &world);
         assert_ne!(first, moved);
         world.walls[0].a[0] = f32::NAN;

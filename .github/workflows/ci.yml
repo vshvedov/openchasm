@@ -15,6 +15,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake libasound2-dev libwayland-dev wayland-protocols libxkbcommon-dev libx11-dev libxext-dev libxfixes-dev libxinerama-dev libxss-dev libxcursor-dev libxrandr-dev libxi-dev libdbus-1-dev
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --no-default-features --lib
+      - name: Check optional GPU client
+        run: cargo clippy --locked --features gpu --all-targets -- -D warnings
+      # Tests compile the GPU client on each native platform. Offscreen tests
+      # may skip without an adapter; this is not physical GPU validation.
+      - name: Test optional GPU client
+        run: cargo test --locked --features gpu

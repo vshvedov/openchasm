@@ -53,3 +53,9 @@ The 2022 Steam release archive is an uncompressed tar file; the earlier DOS inst
 Resource containers, map/image decoders, the movement/geometry prototype, and the window/renderer live in separate modules. The movement update is driven by inputs on a fixed tick and does not depend on window APIs. This is a starting separation for a future authoritative server; there is **no networking protocol or multiplayer implementation yet**, and deterministic cross-platform simulation has not been established. Loose-directory loading gives future original content a development path, though it currently expects the same resource layout and formats.
 
 Next work includes validating floor and ceiling rendering, materials and transparency, original collision and movement, 3D objects, object animation and collision, the remaining map scripts, enemies and combat, and audio. Cross-platform CI is configured for synthetic tests; game-data checks require a locally installed copy. Cross-platform behavior has not yet been tested on Windows or macOS.
+
+An experimental GPU post-processing backend is available with
+`cargo build --release --locked --features gpu`. It moves colour correction, bloom
+and UI composition to Vulkan/Metal/DX12; world rasterization remains on the CPU.
+Use `OPENCHASM_RENDERER=software` to choose SDL, or `renderer software` /
+`renderer gpu` in the console to switch during play. Default builds retain SDL.

@@ -1,5 +1,6 @@
 //! Bounded client-side developer console. The host owns mouse/text-input routing
 //! and applies returned commands; no console command mutates simulation directly.
+use crate::ui::UiPixel;
 use std::collections::VecDeque;
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
@@ -23,6 +24,7 @@ const COMMANDS: &[&str] = &[
     "sensitivity",
     "options",
     "graphics",
+    "renderer",
     "tonemap",
     "gamma",
     "brightness",
@@ -43,6 +45,7 @@ pub enum Command {
     Sensitivity(Option<f32>),
     Options,
     Graphics(Option<crate::graphics_settings::VisualPreset>),
+    Renderer(Option<crate::presentation::BackendChoice>),
     ToneMap(Option<bool>),
     Gamma(Option<f32>),
     Brightness(Option<f32>),
@@ -228,7 +231,7 @@ impl Console {
         let args: Vec<_> = parts.collect();
         match command.as_str() {
             "help" | "cmdlist" if args.is_empty() => self
-                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity options graphics tonemap gamma brightness saturation bloom"),
+                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity options graphics renderer tonemap gamma brightness saturation bloom"),
             "clear" if args.is_empty() => self.lines.clear(),
             "echo" => self.push(
                 trimmed
@@ -285,6 +288,18 @@ impl Console {
                 if let Some(value) = value { return Some(Command::Graphics(value)); }
                 self.push("usage: graphics [legacy|remaster|enhanced]");
             }
+            "renderer" => {
+                use crate::presentation::BackendChoice;
+                let value = match args.as_slice() {
+                    [] => Some(None),
+                    [v] if v.eq_ignore_ascii_case("auto") => Some(Some(BackendChoice::Auto)),
+                    [v] if v.eq_ignore_ascii_case("gpu") => Some(Some(BackendChoice::Gpu)),
+                    [v] if v.eq_ignore_ascii_case("software") => Some(Some(BackendChoice::Software)),
+                    _ => None,
+                };
+                if let Some(value) = value { return Some(Command::Renderer(value)); }
+                self.push("usage: renderer [auto|gpu|software]");
+            }
             "tonemap" => {
                 let value = match args.as_slice() {
                     [] => Some(None),
@@ -321,7 +336,7 @@ impl Console {
     }
 
     /// Dark overlay occupying the top half of the frame, with bounded drawing.
-    pub fn render(&self, frame: &mut [u32], width: usize, height: usize) {
+    pub fn render<C: UiPixel>(&self, frame: &mut [C], width: usize, height: usize) {
         if !self.open
             || width == 0
             || height < 2
@@ -333,7 +348,7 @@ impl Console {
         for pixel in frame.iter_mut().take(width * overlay) {
             // Keep the scene faintly visible without letting HUD text compete
             // with the console's output at the same pixel positions.
-            *pixel = ((*pixel >> 4) & 0x0f0f0f) + 0x0c1014;
+            *pixel = pixel.dim_shift_bias(4, 0x0c1014);
         }
         let prompt_y = overlay.saturating_sub(10);
         let rows = prompt_y.saturating_sub(2) / 9;
@@ -354,12 +369,19 @@ impl Console {
         }
     }
 }
-fn put(frame: &mut [u32], width: usize, height: usize, x: usize, y: usize, color: u32) {
+fn put<C: UiPixel>(frame: &mut [C], width: usize, height: usize, x: usize, y: usize, color: u32) {
     if x < width && y < height {
-        frame[y * width + x] = color;
+        frame[y * width + x] = C::from_rgb(color);
     }
 }
-fn draw_text(frame: &mut [u32], width: usize, height: usize, x: usize, y: usize, text: &str) {
+fn draw_text<C: UiPixel>(
+    frame: &mut [C],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    text: &str,
+) {
     for (i, ch) in text.chars().enumerate().take(width / 8 + 1) {
         let glyph = BASIC_FONTS
             .get(ch)
@@ -427,6 +449,13 @@ mod tests {
         let mut c = Console::default();
         assert_eq!(submit(&mut c, "fps on"), Some(Command::Fps(Some(true))));
         assert_eq!(submit(&mut c, "fps"), Some(Command::Fps(None)));
+        assert_eq!(submit(&mut c, "renderer"), Some(Command::Renderer(None)));
+        assert_eq!(
+            submit(&mut c, "renderer gpu"),
+            Some(Command::Renderer(Some(
+                crate::presentation::BackendChoice::Gpu
+            )))
+        );
         assert_eq!(
             submit(&mut c, "showhelp on"),
             Some(Command::HelpOverlay(Some(true)))
@@ -485,11 +514,11 @@ mod tests {
         assert!(c.toggle());
         c.event(&event);
         assert_eq!(c.input, "hello");
-        let mut frame = vec![0xffffff; 80 * 40];
+        let mut frame = vec![0xffffffu32; 80 * 40];
         c.render(&mut frame, 80, 40);
         assert_eq!(frame[39 * 80], 0xffffff);
         assert_ne!(frame[0], 0xffffff);
-        c.render(&mut [], usize::MAX, 10);
+        c.render::<u32>(&mut [], usize::MAX, 10);
         c.close();
         assert!(!c.is_open());
     }

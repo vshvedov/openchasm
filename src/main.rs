@@ -7,6 +7,8 @@ mod developer_console;
 mod explosion_render;
 mod frame_stats;
 mod gltf_model;
+#[cfg(feature = "gpu")]
+mod gpu_present;
 mod graphics_settings;
 mod hud;
 mod impact_render;
@@ -15,6 +17,7 @@ mod lighting_worker;
 mod object_height_loader;
 mod object_render;
 mod planes;
+mod presentation;
 mod projectile_render;
 mod projectile_trails;
 mod remaster_light;
@@ -23,6 +26,7 @@ mod scene_restore;
 mod sky;
 mod texture;
 mod trail_motion;
+mod ui;
 mod viewer;
 mod weapon_render;
 

@@ -69,3 +69,22 @@ completed result; newer pending snapshots replace older ones. Rendering uses
 the latest completed field, so shadows may lag moving geometry while a build
 finishes. Worker creation failure falls back to synchronous rebuilds with a
 reported error.
+
+## Optional GPU post-processing
+
+Native Linux testing selected Intel UHD 620 Vulkan for the optional GPU feature.
+The same binary's SDL HDR path measured about 34.5 FPS at the spawn view; the
+initial GPU path measured about 35.5 FPS in neutral HDR and about 35 FPS with
+bloom enabled. These initial figures showed cheap GPU bloom, but little neutral
+throughput gain. CPU phase profiling identified about 3.73 ms in validation plus
+packing; fusing preparation and vectorizing overlay checks reduced that to
+about 1.14 ms. The extra CPU overlay copy was removed using a checked Pod slice
+cast. Later complete-frame measurements varied with CPU raster cost, so the
+phase saving does not establish a fixed FPS gain or 60 FPS.
+
+World rasterization remains on the CPU. GPU phase logs measure CPU validation,
+upload, acquisition and submission/wait costs; they are not GPU timestamp
+measurements. GPU buffers and application scratch are reused, while queue
+uploads may allocate driver staging storage. Native checks also switched GPU
+to SDL and back while paused in the console, retaining player pose. A dummy-SDL
+readback test verifies red/green/blue/black channel preservation in the fallback.

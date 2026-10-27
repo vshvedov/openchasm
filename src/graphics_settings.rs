@@ -1,5 +1,6 @@
 //! Validated client graphics settings and keyboard options menu.
 use crate::color_pipeline::ColorSettings;
+use crate::ui::UiPixel;
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use sdl2::{event::Event, keyboard::Keycode};
 use serde::{Deserialize, Serialize};
@@ -301,9 +302,9 @@ impl GraphicsMenu {
             _ => MenuAction::None,
         }
     }
-    pub fn render(
+    pub fn render<C: UiPixel>(
         &self,
-        frame: &mut [u32],
+        frame: &mut [C],
         width: usize,
         height: usize,
         settings: &GraphicsSettings,
@@ -312,7 +313,7 @@ impl GraphicsMenu {
             return;
         }
         for pixel in frame.iter_mut() {
-            *pixel = ((*pixel & 0xfefefe) >> 1) & 0x7f7f7f;
+            *pixel = pixel.dim_shift_bias(1, 0);
         }
         let rows = [
             format!("PRESET: {}", settings.preset.name()),
@@ -364,7 +365,7 @@ fn onoff(value: bool) -> &'static str {
         "OFF"
     }
 }
-fn draw(frame: &mut [u32], width: usize, height: usize, x: usize, y: usize, text: &str) {
+fn draw<C: UiPixel>(frame: &mut [C], width: usize, height: usize, x: usize, y: usize, text: &str) {
     for (i, ch) in text.chars().enumerate() {
         if let Some(glyph) = BASIC_FONTS.get(ch.to_ascii_uppercase()) {
             for (dy, row) in glyph.iter().enumerate() {
@@ -372,7 +373,7 @@ fn draw(frame: &mut [u32], width: usize, height: usize, x: usize, y: usize, text
                     let px = x + i * 8 + dx;
                     let py = y + dy;
                     if px < width && py < height && row & (1 << dx) != 0 {
-                        frame[py * width + px] = 0xffffff;
+                        frame[py * width + px] = C::from_rgb(0xffffff);
                     }
                 }
             }
@@ -492,7 +493,7 @@ mod tests {
             MenuAction::Changed
         );
         assert!(!settings.tone_mapping);
-        let mut frame = vec![0xffffff; 320 * 200];
+        let mut frame = vec![0xffffffu32; 320 * 200];
         menu.render(&mut frame, 320, 200, &settings);
         assert_ne!(frame[0], 0xffffff);
         assert_eq!(

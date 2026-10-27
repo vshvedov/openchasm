@@ -4,6 +4,16 @@ The goal remains a fully playable cross-platform Rust reimplementation using own
 
 The latest user priorities are the original game's look, enemy animation, blocked first-map routes, aspect ratio and smooth performance. A visible FPS counter and a Quake-style tilde console are implemented and have passed live Linux input checks. Release profiling found a render bottleneck, with measured improvements from about 36 to 39 FPS after removing sky overdraw and about 50 FPS with near-first wall shading at the verified 75-degree FOV. Recent commits correct projection scale, verified FOV and a mirrored camera basis, add authored lighting, repair monster timing/firing meshes, fix open-sky shots and a level-16 teleport, and extend the installed-data early-level route checks. See [fidelity audit](fidelity-audit.md) and [performance measurements](performance.md) for evidence and limits.
 
+## Current gameplay priority
+
+The latest manual report finds slow movement/mouselook and incorrect enemy
+attack/facing behavior. Verify the original movement equations and mouse
+coefficient, add running with autorun enabled by default, and expose an
+independent Quake 1 movement option. Gameplay mode and velocity must belong to
+authoritative simulation and snapshots. Diagnose installed enemy encounters,
+including mesh orientation, acquisition and committed attacks. These gameplay
+fixes take priority over further GPU optimization.
+
 ## Faithful baseline
 
 - Calibrate lighting and palette/colour response against controlled original-game views. Executable analysis has now verified the 75-degree vertical world FOV, separate weapon FOV and sRGB/HDR/ACES chain. The projection defaults and linear HDR colour chain are implemented; generated lighting, static shadows and distance response are implemented from executable evidence, while precision, sampling/coverage details, model coordinates and transient sources still need calibration.
@@ -21,7 +31,7 @@ The first selectable enhanced presentation adds bloom to the linear HDR path, al
 3. Bloom and colour controls with a documented linear/sRGB pipeline, separate from the HUD.
 4. Optional dynamic shadows and other lighting improvements once measured and supported across platforms.
 
-A GPU backend is a candidate for true rotated-camera perspective, shared translucent composition and more expensive effects. Keep simulation and resource identity independent of graphics APIs; extract render snapshots incrementally and validate Linux, macOS and Windows surface/device behavior. The existing software renderer remains useful for fallback and comparison. The initial enhanced profile is a small bloom option, not a completed modern renderer. No GPU backend is implemented yet.
+A GPU backend is a candidate for true rotated-camera perspective, shared translucent composition and more expensive effects. Keep simulation and resource identity independent of graphics APIs; extract render snapshots incrementally and validate Linux, macOS and Windows surface/device behavior. The existing software renderer remains useful for fallback and comparison. The initial enhanced profile is a small bloom option, not a completed modern renderer. An optional GPU post/bloom/UI backend is implemented; genuine 3D world rendering remains planned.
 
 ## Remaining game work
 

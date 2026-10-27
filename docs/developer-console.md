@@ -46,3 +46,9 @@ The original graphical status bar is loaded from the selected content. The large
 development control overlay is hidden by default; `showhelp on` displays it and
 `showhelp off` hides it again. This preference is saved with graphics settings.
 Missing HUD assets fall back to the text status display.
+
+`renderer` reports the active backend. `renderer software` selects the SDL path;
+`renderer gpu` or `renderer auto` tries the optional GPU backend, falling back
+to SDL when unavailable. Backend switches retain the session. This selection
+is session-local; `OPENCHASM_RENDERER=auto|gpu|software` selects startup behavior.
+Build with `--features gpu` to include GPU post-processing.

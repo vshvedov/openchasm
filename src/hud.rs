@@ -10,6 +10,7 @@
 //! more state than this initial interface supplies and are not synthesized.
 use crate::content::ResourceSet;
 use crate::texture::CelImage;
+use crate::ui::UiPixel;
 use std::io::{self, Cursor};
 
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -176,10 +177,16 @@ impl Hud {
         })
     }
 
-    /// Render into display RGB (0x00RRGGBB), without allocating. Invalid frame
+    /// Render into display RGB or a deferred UI overlay without allocating. Invalid frame
     /// dimensions or length leave the frame untouched. Small frames clip the
     /// original minimum scale of two rather than inventing a fractional scale.
-    pub fn render(&self, frame: &mut [u32], width: usize, height: usize, state: HudState) {
+    pub fn render<C: UiPixel>(
+        &self,
+        frame: &mut [C],
+        width: usize,
+        height: usize,
+        state: HudState,
+    ) {
         let Some(count) = width.checked_mul(height) else {
             return;
         };
@@ -229,7 +236,13 @@ impl Hud {
         self.number(&mut canvas, left + 315 * scale, state.armor, 25);
     }
 
-    fn number(&self, canvas: &mut Canvas<'_>, anchor: i64, value: u32, threshold: u32) {
+    fn number<C: UiPixel>(
+        &self,
+        canvas: &mut Canvas<'_, C>,
+        anchor: i64,
+        value: u32,
+        threshold: u32,
+    ) {
         let mut remaining = value;
         let mut right = anchor;
         let row = if value < threshold { 20 } else { 0 };
@@ -261,13 +274,13 @@ fn face_column(health: u32) -> Option<usize> {
     }
 }
 
-struct Canvas<'a> {
-    frame: &'a mut [u32],
+struct Canvas<'a, C: UiPixel> {
+    frame: &'a mut [C],
     width: usize,
     height: usize,
     scale: i64,
 }
-impl Canvas<'_> {
+impl<C: UiPixel> Canvas<'_, C> {
     fn blit(&mut self, image: &Image, source: [usize; 4], x: i64, y: i64) {
         let [sx, sy, w, h] = source;
         let x0 = x.max(0).min(self.width as i64) as usize;
@@ -280,7 +293,7 @@ impl Canvas<'_> {
                 let src_x = sx + ((dx as i64 - x) / self.scale) as usize;
                 let pixel = image.pixels[src_y * image.width + src_x];
                 if pixel >> 24 >= 128 {
-                    self.frame[dy * self.width + dx] = pixel & 0x00ff_ffff;
+                    self.frame[dy * self.width + dx] = C::from_rgb(pixel & 0x00ff_ffff);
                 }
             }
         }
@@ -316,9 +329,31 @@ mod tests {
         }
     }
     #[test]
+    fn overlay_blit_preserves_atlas_holes_and_covers_opaque_black() {
+        use crate::ui::OverlayPixel;
+        let image = Image {
+            width: 4,
+            height: 1,
+            pixels: vec![0, 0xff00_0000, 0x7fff_ffff, 0x8011_2233],
+        };
+        let mut frame = [OverlayPixel::default(); 4];
+        Canvas {
+            frame: &mut frame,
+            width: 4,
+            height: 1,
+            scale: 1,
+        }
+        .blit(&image, [0, 0, 4, 1], 0, 0);
+        assert_eq!(frame[0], OverlayPixel::default());
+        assert_eq!(frame[1].packed(), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(frame[2], OverlayPixel::default());
+        assert_eq!(frame[3], OverlayPixel::from_rgb(0x112233));
+    }
+
+    #[test]
     fn original_scale_centers_bar_without_stretching() {
         let hud = synthetic();
-        let mut frame = vec![0xabcdef; 1920 * 1080];
+        let mut frame = vec![0xabcdefu32; 1920 * 1080];
         hud.render(&mut frame, 1920, 1080, HudState::default());
         assert_eq!(frame[984 * 1920 + 480], 0x123456);
         assert_eq!(frame[983 * 1920 + 480], 0xabcdef);
@@ -328,7 +363,7 @@ mod tests {
     #[test]
     fn digits_use_authored_spacing_low_row_and_right_anchors() {
         let hud = synthetic();
-        let mut frame = vec![0; 640 * 400];
+        let mut frame = vec![0u32; 640 * 400];
         hud.render(
             &mut frame,
             640,
@@ -356,7 +391,7 @@ mod tests {
         let mut faces = image(182, 52, 0);
         faces.pixels[4 * 26] = 0xffff_0000;
         hud.faces = Some(faces);
-        let mut frame = vec![0xabcdef; 640 * 400];
+        let mut frame = vec![0xabcdefu32; 640 * 400];
         hud.render(&mut frame, 640, 400, HudState::default());
         assert_eq!(frame[336 * 640 + 80], 0xabcdef);
         assert_eq!(frame[336 * 640 + 82], 0x112233);
@@ -379,7 +414,7 @@ mod tests {
     fn tiny_odd_and_invalid_frames_are_safe() {
         let hud = synthetic();
         for (w, h) in [(1, 1), (319, 11), (641, 401)] {
-            let mut frame = vec![0; w * h];
+            let mut frame = vec![0u32; w * h];
             hud.render(
                 &mut frame,
                 w,
@@ -393,7 +428,7 @@ mod tests {
             );
             assert!(frame.iter().any(|&p| p != 0));
         }
-        let mut frame = [0xabc; 7];
+        let mut frame = [0xabcu32; 7];
         for (w, h) in [(2, 4), (0, 7), (usize::MAX, 2), (32769, 1)] {
             hud.render(&mut frame, w, h, HudState::default());
             assert_eq!(frame, [0xabc; 7]);
@@ -401,7 +436,7 @@ mod tests {
     }
     #[test]
     fn palette_zero_and_255_remain_transparent() {
-        let mut bytes = vec![0; 800 + 3];
+        let mut bytes = vec![0u8; 800 + 3];
         bytes[..2].copy_from_slice(&[0x19, 0x91]);
         bytes[2..4].copy_from_slice(&3u16.to_le_bytes());
         bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -423,7 +458,7 @@ mod tests {
                 hud.weapons.pixels[y * 224 + x] = 0xff112233;
             }
         }
-        let mut frame = vec![0; 640 * 400];
+        let mut frame = vec![0u32; 640 * 400];
         hud.render(
             &mut frame,
             640,
@@ -453,7 +488,7 @@ mod tests {
         }
         let mut resources = ResourceSet::open(&path).unwrap();
         let hud = Hud::load(&mut resources).unwrap();
-        let mut frame = vec![0x102030; 640 * 400];
+        let mut frame = vec![0x102030u32; 640 * 400];
         hud.render(
             &mut frame,
             640,

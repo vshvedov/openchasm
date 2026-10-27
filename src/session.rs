@@ -424,6 +424,7 @@ pub struct Session {
     pub vertical: VerticalState,
     movement: MovementState,
     pitch: f32,
+    god_mode: bool,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
     pub actor_definitions: ActorDefinitions,
@@ -472,6 +473,8 @@ pub struct SessionSnapshot {
     pub movement: MovementSnapshot,
     #[serde(default)]
     pub pitch: f32,
+    #[serde(default)]
+    pub god_mode: bool,
     pub processes: crate::process_runtime::ProcessRuntimeSnapshot,
     pub actors: crate::actors::ActorStateSnapshot,
     pub ai: crate::ai::EnemyAiSnapshot,
@@ -590,6 +593,7 @@ impl Session {
             vertical: self.vertical.snapshot(),
             movement: self.movement.snapshot(),
             pitch: self.pitch,
+            god_mode: self.god_mode,
             processes,
             actors: self
                 .actors
@@ -734,6 +738,7 @@ impl Session {
         }
         let mut candidate = self.clone();
         candidate.pitch = snapshot.pitch;
+        candidate.god_mode = snapshot.god_mode;
         candidate.world = replayed_world;
         candidate.base_wall_blocking = replayed_blocking;
         candidate
@@ -1100,6 +1105,7 @@ impl Session {
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
             movement: MovementState::default(),
             pitch: 0.0,
+            god_mode: false,
             processes: setup.processes,
             actors: setup.actors,
             actor_definitions: setup.actor_definitions,
@@ -1130,6 +1136,34 @@ impl Session {
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Whether player damage is disabled independently of timed powerups.
+    pub fn god_mode(&self) -> bool {
+        self.god_mode
+    }
+
+    /// Toggle damage immunity without changing health or resurrecting a dead player.
+    pub fn set_god_mode(&mut self, enabled: bool) {
+        self.god_mode = enabled;
+    }
+
+    /// Own every weapon slot and refill it to its authored ammunition limit.
+    /// Preserve a valid selection and all non-weapon inventory, including death.
+    pub fn give_all_weapons(&mut self) {
+        self.game.inventory.weapons.fill(true);
+        for (ammo, definition) in self
+            .game
+            .inventory
+            .ammo
+            .iter_mut()
+            .zip(&self.game.weapons.0)
+        {
+            *ammo = definition.ammo_limit;
+        }
+        if self.selected_weapon >= self.game.inventory.weapons.len() {
+            self.selected_weapon = 0;
+        }
+    }
+
     /// Use authored map tiles for projectile and hitscan plane contacts.
     /// Tiles 62/63 and invalid texture indices are open, matching the renderer.
     /// Call before creating the restart/save baseline; content fingerprints must
@@ -2654,6 +2688,7 @@ impl Session {
         // Follows the independent reconstruction; original-game rounding and
         // protection mechanics still require direct validation.
         if self.game.inventory.health == 0
+            || self.god_mode
             || self.game.protective_powerups.chojin_ticks_remaining > 0
         {
             return 0;
@@ -9268,6 +9303,206 @@ mod tests {
         assert_eq!(lower.ai.mode(7), Some(Mode::Idle));
         assert!(!lower.world.walls[0].blocks_movement);
     }
+    #[test]
+    fn god_mode_preserves_health_and_armor_until_disabled_without_resurrection() {
+        let mut session = mission_session("");
+        assert!(!session.god_mode());
+        session.game.inventory.armor = 50;
+        session.set_god_mode(true);
+        for damage in [0, 1, 20, u16::MAX] {
+            assert_eq!(session.apply_player_damage(damage), 0);
+        }
+        assert_eq!(
+            (session.game.inventory.health, session.game.inventory.armor),
+            (100, 50)
+        );
+        // A timed protection expiring or being disabled cannot disable god mode.
+        session.set_protective_powerups_enabled(false);
+        session.step(SessionInput::default());
+        assert!(session.god_mode());
+        assert_eq!(session.apply_player_damage(20), 0);
+        session.set_god_mode(false);
+        assert_eq!(session.apply_player_damage(20), 5);
+        assert_eq!(
+            (session.game.inventory.health, session.game.inventory.armor),
+            (95, 30)
+        );
+        session.apply_player_damage(u16::MAX);
+        session.set_god_mode(true);
+        session.give_all_weapons();
+        session.step(SessionInput::default());
+        assert_eq!(session.game.inventory.health, 0);
+    }
+
+    #[test]
+    fn god_mode_blocks_enemy_hitscan_projectiles_and_self_explosions() {
+        let mut session = mission_session("");
+        session.game.inventory.armor = 50;
+        session.set_god_mode(true);
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        session.resolve_enemy_instant(
+            EnemyAttack {
+                source_index: 7,
+                damage: 20,
+                kind: EnemyAttackKind::Ranged {
+                    rocket_id: 0,
+                    instant: true,
+                    origin: [2.5, 0.5],
+                    target: [0.5, 0.5],
+                },
+            },
+            0,
+            [2.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert!(session.apply_explosion(
+            Explosion {
+                owner: Owner::Player,
+                center: [0.5, 0.5, 0.5],
+                radius: 2.0,
+                damage: 100
+            },
+            ExplosionOrigin::Mine { mine_id: 0 },
+            None,
+            &mut events,
+            &mut attempts,
+        ));
+        assert_eq!(events.damage, 0);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            animation_name: String::new(),
+            model_name: "arrow.3o".into(),
+            power: 20,
+            raw_fields: vec![1, 0, 120, 0, 20, 0],
+        }]);
+        session
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Enemy { source_index: 7 },
+                    rocket_id: 0,
+                    origin: [1.5, 0.5],
+                    direction: [-1.0, 0.0],
+                },
+                &session.rockets,
+            )
+            .unwrap();
+        let mut player_impacts = 0;
+        for _ in 0..15 {
+            let events = session.step(SessionInput::default());
+            assert_eq!(events.damage, 0);
+            player_impacts += events
+                .projectile_impacts
+                .iter()
+                .filter(|impact| impact.target == ImpactTarget::Player)
+                .count();
+        }
+        assert_eq!(player_impacts, 1);
+        assert_eq!(
+            (session.game.inventory.health, session.game.inventory.armor),
+            (100, 50)
+        );
+    }
+
+    #[test]
+    fn god_mode_hazard_snapshot_continues_and_missing_flag_defaults_off() {
+        use crate::process_runtime::ProcessCapabilities;
+        let text =
+            "#proc1\n#action\nnonstop\ndeath 0 0 0 0 0 128 30\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let mut baseline = mission_session(text);
+        baseline.processes = ProcessRuntime::with_hazards(
+            &Script::parse(text),
+            &baseline.world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+        );
+        let mut session = baseline.clone();
+        session.game.inventory.armor = 100;
+        session.set_god_mode(true);
+        for _ in 0..10 {
+            assert_eq!(session.step(SessionInput::default()).damage, 0);
+        }
+        let digest = crate::save_format::ContentDigest([31; 32]);
+        let snapshot = session.snapshot(digest).unwrap();
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        let decoded = serde_json::from_value(json.clone()).unwrap();
+        let mut restored = baseline.restore_from_baseline(&decoded, digest).unwrap();
+        assert!(restored.god_mode());
+        let mut hazard_contacts = 0;
+        for _ in 0..20 {
+            let events = session.step(SessionInput::default());
+            hazard_contacts += events.hazard_damage.len();
+            assert_eq!(events.damage, 0);
+            assert_eq!(restored.step(SessionInput::default()).damage, 0);
+            assert_eq!(
+                session.snapshot(digest).unwrap(),
+                restored.snapshot(digest).unwrap()
+            );
+        }
+        assert!(hazard_contacts > 0);
+        assert_eq!(
+            (
+                restored.game.inventory.health,
+                restored.game.inventory.armor
+            ),
+            (100, 100)
+        );
+        session.set_god_mode(false);
+        restored.set_god_mode(false);
+        let mut damage = 0;
+        for _ in 0..20 {
+            damage += session.step(SessionInput::default()).damage;
+            restored.step(SessionInput::default());
+        }
+        assert!(damage > 0);
+        assert_eq!(
+            session.snapshot(digest).unwrap(),
+            restored.snapshot(digest).unwrap()
+        );
+        json.as_object_mut().unwrap().remove("god_mode");
+        let legacy: SessionSnapshot = serde_json::from_value(json).unwrap();
+        assert!(!legacy.god_mode);
+        // A saved false flag overrides even a baseline with god mode enabled.
+        baseline.set_god_mode(true);
+        assert!(!baseline
+            .restore_from_baseline(&legacy, digest)
+            .unwrap()
+            .god_mode());
+    }
+
+    #[test]
+    fn all_weapons_uses_exact_authored_ammo_limits_and_preserves_other_inventory() {
+        let mut session = mission_session("");
+        let limits = [0, 1, 7, 25, 100, 255, 1000, u16::MAX];
+        for (definition, limit) in session.game.weapons.0.iter_mut().zip(limits) {
+            definition.ammo_limit = limit;
+        }
+        session.game.inventory.health = 73;
+        session.game.inventory.armor = 41;
+        session.game.inventory.keys = [true, false, true];
+        session.processes.set_keys(session.game.inventory.keys);
+        session.game.inventory.invisibility_ticks_remaining = 13;
+        session.ai.set_player_invisible(true);
+        session.selected_weapon = 7;
+        let mut expected = session.game.inventory.snapshot();
+        expected.weapons.fill(true);
+        expected.ammo = limits;
+        session.give_all_weapons();
+        assert_eq!(session.game.inventory.snapshot(), expected);
+        assert_eq!(session.selected_weapon, 7);
+        session.give_all_weapons();
+        assert_eq!(session.game.inventory.snapshot(), expected);
+        session.selected_weapon = usize::MAX;
+        session.give_all_weapons();
+        assert_eq!(session.selected_weapon, 0);
+        let digest = crate::save_format::ContentDigest([32; 32]);
+        let snapshot = session.snapshot(digest).unwrap();
+        let restored = session.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.game.inventory.snapshot(), expected);
+    }
+
     #[test]
     fn armor_absorbs_full_hit_and_uses_quarter_health_rounding() {
         for (health, armor, amount, expected_health, expected_armor, expected_damage) in [

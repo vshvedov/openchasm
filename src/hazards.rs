@@ -38,7 +38,71 @@ fn contains(zone: &DeathZone, position: [f32; 2], feet: f32, head: f32) -> bool 
         && head > zone.z_bottom_raw as f32 / 64.0
         && feet < zone.z_top_raw as f32 / 64.0
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HazardEntrySnapshot {
+    pub process_id: u16,
+    pub zones: Vec<DeathZone>,
+    pub ticks: u8,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HazardsSnapshot {
+    pub active: Vec<HazardEntrySnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HazardsSnapshotError {
+    InvalidZone,
+    InvalidTicks,
+    DuplicateProcess,
+}
+
 impl Hazards {
+    pub fn snapshot(&self) -> HazardsSnapshot {
+        HazardsSnapshot {
+            active: self
+                .active
+                .iter()
+                .map(|(&process_id, h)| HazardEntrySnapshot {
+                    process_id,
+                    zones: h.zones.clone(),
+                    ticks: h.ticks,
+                })
+                .collect(),
+        }
+    }
+    pub fn restore(&mut self, snapshot: &HazardsSnapshot) -> Result<(), HazardsSnapshotError> {
+        let mut active = BTreeMap::new();
+        for h in &snapshot.active {
+            if h.ticks >= PERIOD_TICKS {
+                return Err(HazardsSnapshotError::InvalidTicks);
+            }
+            if h.zones.is_empty()
+                || h.zones.iter().any(|z| {
+                    z.min_cell[0] > z.max_cell[0]
+                        || z.min_cell[1] > z.max_cell[1]
+                        || z.max_cell[0] >= 64
+                        || z.max_cell[1] >= 64
+                        || z.z_bottom_raw > z.z_top_raw
+                })
+            {
+                return Err(HazardsSnapshotError::InvalidZone);
+            }
+            if active
+                .insert(
+                    h.process_id,
+                    ActiveHazard {
+                        zones: h.zones.clone(),
+                        ticks: h.ticks,
+                    },
+                )
+                .is_some()
+            {
+                return Err(HazardsSnapshotError::DuplicateProcess);
+            }
+        }
+        self.active = active;
+        Ok(())
+    }
+
     /// Apply lifecycle events before advancing this tick.
     pub fn apply_effect(&mut self, effect: &ProcessEffect) {
         match effect {
@@ -106,6 +170,39 @@ mod tests {
             unresolved: vec![],
         }
     }
+    #[test]
+    fn snapshot_preserves_damage_tick_and_rejects_invalid_atomically() {
+        let zone = DeathZone {
+            min_cell: [1, 1],
+            max_cell: [2, 2],
+            z_bottom_raw: 0,
+            z_top_raw: 128,
+            damage_raw: 25,
+        };
+        let mut hazards = Hazards::default();
+        hazards.apply_effect(&ProcessEffect::HazardActivated {
+            process_id: 7,
+            zones: vec![zone],
+        });
+        for _ in 0..19 {
+            hazards.tick([1.5, 1.5], 0.0, 1.0, &actors());
+        }
+        let snapshot = hazards.snapshot();
+        let mut restored = Hazards::default();
+        restored.restore(&snapshot).unwrap();
+        let mut invalid = snapshot.clone();
+        invalid.active[0].ticks = PERIOD_TICKS;
+        assert_eq!(
+            restored.restore(&invalid),
+            Err(HazardsSnapshotError::InvalidTicks)
+        );
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(
+            restored.tick([1.5, 1.5], 0.0, 1.0, &actors()),
+            hazards.tick([1.5, 1.5], 0.0, 1.0, &actors())
+        );
+    }
+
     #[test]
     fn damages_at_three_hertz_and_stops_after_deactivation() {
         let mut hazards = Hazards::default();

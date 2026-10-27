@@ -47,7 +47,25 @@ impl Default for QuakeField {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuakeSnapshot {
+    pub cells: Vec<u32>,
+}
+
 impl QuakeField {
+    pub fn snapshot(&self) -> QuakeSnapshot {
+        QuakeSnapshot {
+            cells: self.cells.clone(),
+        }
+    }
+    pub fn restore(&mut self, snapshot: &QuakeSnapshot) -> Result<(), &'static str> {
+        if snapshot.cells.len() != SIDE * SIDE {
+            return Err("invalid quake grid length");
+        }
+        self.cells.clone_from(&snapshot.cells);
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -97,6 +115,20 @@ mod tests {
             power,
         }
     }
+    #[test]
+    fn snapshot_preserves_grid_and_rejects_short_input() {
+        let mut field = QuakeField::new();
+        field.apply_batch(&[zone([1, 1], [2, 2], 100)]).unwrap();
+        let snapshot = field.snapshot();
+        let mut target = QuakeField::new();
+        target.restore(&snapshot).unwrap();
+        assert_eq!(target.snapshot(), snapshot);
+        let mut bad = snapshot.clone();
+        bad.cells.pop();
+        assert!(target.restore(&bad).is_err());
+        assert_eq!(target.snapshot(), snapshot);
+    }
+
     #[test]
     fn level_16_heart_then_later_stop_clears_the_same_region() {
         let mut field = QuakeField::new();

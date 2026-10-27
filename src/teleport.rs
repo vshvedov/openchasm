@@ -152,7 +152,28 @@ pub struct TeleportState {
     policy: RearmPolicy,
     waiting_for_exit: bool,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TeleportSnapshot {
+    pub policy: RearmPolicy,
+    pub waiting_for_exit: bool,
+}
+
 impl TeleportState {
+    pub fn snapshot(&self) -> TeleportSnapshot {
+        TeleportSnapshot {
+            policy: self.policy,
+            waiting_for_exit: self.waiting_for_exit,
+        }
+    }
+    pub fn restore(&mut self, snapshot: TeleportSnapshot) -> Result<(), &'static str> {
+        if snapshot.policy == RearmPolicy::ReferenceContinuous && snapshot.waiting_for_exit {
+            return Err("continuous policy cannot wait for exit");
+        }
+        self.policy = snapshot.policy;
+        self.waiting_for_exit = snapshot.waiting_for_exit;
+        Ok(())
+    }
+
     pub fn new(policy: RearmPolicy) -> Self {
         Self {
             policy,
@@ -213,6 +234,24 @@ impl TeleportState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_rearm_policy_and_rejects_impossible_state() {
+        let snapshot = TeleportSnapshot {
+            policy: RearmPolicy::AfterLeavingSources,
+            waiting_for_exit: true,
+        };
+        let mut state = TeleportState::default();
+        state.restore(snapshot).unwrap();
+        assert_eq!(state.snapshot(), snapshot);
+        assert!(state
+            .restore(TeleportSnapshot {
+                policy: RearmPolicy::ReferenceContinuous,
+                waiting_for_exit: true
+            })
+            .is_err());
+        assert_eq!(state.snapshot(), snapshot);
+    }
+
     #[test]
     fn parses_mixed_units_and_preserves_unknown_sixth_field() {
         let p=parse("#teleports\ntcenter 16 44 5 32 3\ntcenter 8 15 2220 7168 4\ntcenter 41 53 37 16 2 2\n#end\n").unwrap();

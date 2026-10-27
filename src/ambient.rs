@@ -32,7 +32,28 @@ pub struct AmbientGrid {
     // X-major, matching Map's on-disk and public indexing.
     cells: [u8; MAP_SIDE * MAP_SIDE],
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbientSnapshot {
+    pub cells: Vec<u8>,
+}
+
 impl AmbientGrid {
+    pub fn snapshot(&self) -> AmbientSnapshot {
+        AmbientSnapshot {
+            cells: self.cells.to_vec(),
+        }
+    }
+    /// Preserve authored raw IDs, including values outside the script range.
+    pub fn restore(&mut self, snapshot: &AmbientSnapshot) -> Result<(), &'static str> {
+        let cells: [u8; MAP_SIDE * MAP_SIDE] = snapshot
+            .cells
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid ambient grid length")?;
+        self.cells = cells;
+        Ok(())
+    }
+
     /// Copy authored ambient sound IDs, preserving even unusual raw IDs.
     pub fn from_map(map: &Map) -> Self {
         let mut cells = [0; MAP_SIDE * MAP_SIDE];
@@ -89,6 +110,20 @@ mod tests {
             sound_id,
         }
     }
+    #[test]
+    fn snapshot_preserves_authored_ids_and_rejects_short_grid() {
+        let mut field = AmbientGrid::from_map(&map());
+        field.apply(&[region([2, 3], [2, 3], 4)]).unwrap();
+        let snapshot = field.snapshot();
+        let mut target = AmbientGrid::from_map(&map());
+        target.restore(&snapshot).unwrap();
+        assert_eq!(target.snapshot(), snapshot);
+        let mut bad = snapshot.clone();
+        bad.cells.pop();
+        assert!(target.restore(&bad).is_err());
+        assert_eq!(target.snapshot(), snapshot);
+    }
+
     #[test]
     fn map_ids_and_coordinates_are_preserved() {
         let grid = AmbientGrid::from_map(&map());

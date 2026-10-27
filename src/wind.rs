@@ -61,7 +61,62 @@ impl Default for WindField {
         Self::new()
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindSnapshot {
+    pub cells: Vec<[i16; 2]>,
+    pub actor_cells: Vec<[i16; 2]>,
+    pub active: Vec<(u16, Vec<WindZone>)>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindSnapshotError {
+    GridLength,
+    InvalidVector,
+    InvalidZone,
+    DuplicateProcess,
+}
+
 impl WindField {
+    /// Store actual grids: activation/clear history cannot be reconstructed
+    /// from the active zone list when overlapping processes are deactivated.
+    pub fn snapshot(&self) -> WindSnapshot {
+        WindSnapshot {
+            cells: self.cells.clone(),
+            actor_cells: self.actor_cells.clone(),
+            active: self
+                .active
+                .iter()
+                .map(|(&id, zones)| (id, zones.clone()))
+                .collect(),
+        }
+    }
+    pub fn restore(&mut self, snapshot: &WindSnapshot) -> Result<(), WindSnapshotError> {
+        if snapshot.cells.len() != SIDE * SIDE || snapshot.actor_cells.len() != SIDE * SIDE {
+            return Err(WindSnapshotError::GridLength);
+        }
+        if snapshot
+            .cells
+            .iter()
+            .chain(&snapshot.actor_cells)
+            .flatten()
+            .any(|n| !(-128..=127).contains(n))
+        {
+            return Err(WindSnapshotError::InvalidVector);
+        }
+        let mut active = BTreeMap::new();
+        for (id, zones) in &snapshot.active {
+            if zones.is_empty() || zones.iter().any(|z| !z.valid()) {
+                return Err(WindSnapshotError::InvalidZone);
+            }
+            if active.insert(*id, zones.clone()).is_some() {
+                return Err(WindSnapshotError::DuplicateProcess);
+            }
+        }
+        self.cells.clone_from(&snapshot.cells);
+        self.actor_cells.clone_from(&snapshot.actor_cells);
+        self.active = active;
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             cells: vec![[0, 0]; SIDE * SIDE],
@@ -209,6 +264,36 @@ mod tests {
             actor_only: false,
         }
     }
+    #[test]
+    fn snapshot_preserves_overwrite_clear_history_atomically() {
+        let mut field = WindField::new();
+        field.activate(1, &[zone([1, 1], [2, 1], [4, 0])]).unwrap();
+        field.activate(2, &[zone([2, 1], [3, 1], [8, 0])]).unwrap();
+        field.deactivate(1);
+        let snapshot = field.snapshot();
+        let mut restored = WindField::new();
+        restored.restore(&snapshot).unwrap();
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.cell([2, 1]), Some([0, 0]));
+        assert_eq!(restored.cell([3, 1]), Some([8, 0]));
+        let mut bad = snapshot.clone();
+        bad.active.push(bad.active[0].clone());
+        assert_eq!(
+            restored.restore(&bad),
+            Err(WindSnapshotError::DuplicateProcess)
+        );
+        assert_eq!(restored.snapshot(), snapshot);
+        bad = snapshot.clone();
+        bad.actor_cells[0][0] = 128;
+        assert_eq!(
+            restored.restore(&bad),
+            Err(WindSnapshotError::InvalidVector)
+        );
+        assert_eq!(restored.snapshot(), snapshot);
+        restored.deactivate(2);
+        assert_eq!(restored.cell([3, 1]), Some([0, 0]));
+    }
+
     #[test]
     fn bilinear_sampling_and_displacement_use_cell_centers() {
         let mut field = WindField::new();

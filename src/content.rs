@@ -3,7 +3,11 @@
 //! Discovery labels installation locations, not license entitlements. In particular,
 //! the local demo and full release have been observed to contain identical archives.
 use crate::archive::Archive;
-use std::collections::{BTreeMap, HashSet};
+#[allow(dead_code)] // Fingerprinting is wired by the future save host.
+#[path = "content_trace.rs"]
+mod content_trace;
+pub use content_trace::{ResourceTrace, TraceError};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -153,8 +157,15 @@ fn vdf_values(text: &str, wanted: &str) -> Vec<String> {
 
 /// Read a game-owned tar archive or an independently authored loose-file tree.
 /// Paths are portable forward-slash resource names and cannot escape the root.
-pub enum ResourceSet {
-    Archive(Archive),
+pub struct ResourceSet {
+    source: ResourceSource,
+    trace: Option<ResourceTrace>,
+}
+enum ResourceSource {
+    Archive {
+        archive: Archive,
+        names: BTreeSet<String>,
+    },
     Directory {
         root: PathBuf,
         entries: BTreeMap<String, PathBuf>,
@@ -167,23 +178,65 @@ impl ResourceSet {
             let root = path.canonicalize()?;
             let mut entries = BTreeMap::new();
             index_dir(&root, &root, &mut entries)?;
-            Ok(Self::Directory { root, entries })
+            Ok(Self {
+                source: ResourceSource::Directory { root, entries },
+                trace: None,
+            })
         } else {
-            Archive::open(path).map(Self::Archive)
+            Archive::open(path).map(|archive| {
+                let names = archive.names().map(str::to_owned).collect();
+                Self {
+                    source: ResourceSource::Archive { archive, names },
+                    trace: None,
+                }
+            })
         }
     }
 
     pub fn names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
-        match self {
-            Self::Archive(archive) => Box::new(archive.names()),
-            Self::Directory { entries, .. } => Box::new(entries.keys().map(String::as_str)),
+        match &self.source {
+            ResourceSource::Archive { archive, .. } => Box::new(archive.names()),
+            ResourceSource::Directory { entries, .. } => {
+                Box::new(entries.keys().map(String::as_str))
+            }
         }
     }
 
+    /// Start a separate trace for the next level; never silently discard one.
+    #[allow(dead_code)]
+    pub fn begin_trace(&mut self) -> Result<(), TraceError> {
+        if self.trace.is_some() {
+            return Err(TraceError::AlreadyStarted);
+        }
+        self.trace = Some(ResourceTrace::default());
+        Ok(())
+    }
+    /// Access metadata/preloaded-input recording while the trace is active.
+    #[allow(dead_code)]
+    pub fn trace_mut(&mut self) -> Result<&mut ResourceTrace, TraceError> {
+        self.trace.as_mut().ok_or(TraceError::NotStarted)
+    }
+    /// End recording. `finish` on the returned trace validates and hashes it.
+    #[allow(dead_code)]
+    pub fn take_trace(&mut self) -> Result<ResourceTrace, TraceError> {
+        self.trace.take().ok_or(TraceError::NotStarted)
+    }
     pub fn read(&mut self, name: &str) -> io::Result<Vec<u8>> {
-        match self {
-            Self::Archive(archive) => archive.read(name),
-            Self::Directory { root, entries } => {
+        let absent = self.trace.is_some()
+            && match &self.source {
+                ResourceSource::Archive { names, .. } => !names.contains(name),
+                ResourceSource::Directory { entries, .. } => !entries.contains_key(name),
+            };
+        let result = self.read_inner(name);
+        if let Some(trace) = &mut self.trace {
+            trace.record_read(name, &result, absent);
+        }
+        result
+    }
+    fn read_inner(&mut self, name: &str) -> io::Result<Vec<u8>> {
+        match &mut self.source {
+            ResourceSource::Archive { archive, .. } => archive.read(name),
+            ResourceSource::Directory { root, entries } => {
                 let path = entries.get(name).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -319,6 +372,112 @@ mod tests {
             content.read("../map/resource.01").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+        fs::remove_dir_all(temp).unwrap();
+    }
+    fn write_tar(path: &Path, name: &str, bytes: &[u8]) {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let size = format!("{:011o}\0", bytes.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        let checksum: u64 = header.iter().map(|v| u64::from(*v)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        let mut tar = header.to_vec();
+        tar.extend_from_slice(bytes);
+        tar.resize(512 + bytes.len().div_ceil(512) * 512 + 1024, 0);
+        fs::write(path, tar).unwrap();
+    }
+    #[test]
+    fn trace_matches_archive_and_directory_and_tracks_fallbacks() {
+        let temp = temp();
+        let dir = temp.join("loose");
+        fs::create_dir_all(dir.join("map")).unwrap();
+        fs::write(dir.join("map/map.01"), b"owned").unwrap();
+        let tar = temp.join("data.tar");
+        write_tar(&tar, "map/map.01", b"owned");
+        let mut a = ResourceSet::open(&tar).unwrap();
+        let mut b = ResourceSet::open(&dir).unwrap();
+        for source in [&mut a, &mut b] {
+            source.begin_trace().unwrap();
+            assert_eq!(source.read("map/map.01").unwrap(), b"owned");
+            assert!(source.read("map/missing").is_err());
+            source
+                .trace_mut()
+                .unwrap()
+                .add_metadata("rules", b"v1")
+                .unwrap();
+        }
+        assert_eq!(
+            a.take_trace().unwrap().finish().unwrap(),
+            b.take_trace().unwrap().finish().unwrap()
+        );
+        b.begin_trace().unwrap();
+        b.read("map/map.01").unwrap();
+        b.trace_mut().unwrap().add_metadata("rules", b"v1").unwrap();
+        assert!(matches!(a.take_trace(), Err(TraceError::NotStarted)));
+        let without_missing = b.take_trace().unwrap().finish().unwrap();
+        a.begin_trace().unwrap();
+        a.read("map/map.01").unwrap();
+        a.read("map/missing").unwrap_err();
+        a.trace_mut().unwrap().add_metadata("rules", b"v1").unwrap();
+        assert_ne!(without_missing, a.take_trace().unwrap().finish().unwrap());
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    fn trace_rejects_changed_resources_and_io_errors() {
+        let temp = temp();
+        fs::write(temp.join("a"), b"first").unwrap();
+        let mut source = ResourceSet::open(&temp).unwrap();
+        source.begin_trace().unwrap();
+        assert!(matches!(
+            source.begin_trace(),
+            Err(TraceError::AlreadyStarted)
+        ));
+        source.read("a").unwrap();
+        fs::write(temp.join("a"), b"second").unwrap();
+        source.read("a").unwrap();
+        assert_eq!(
+            source.take_trace().unwrap().finish(),
+            Err(TraceError::ResourceChanged)
+        );
+        source.begin_trace().unwrap();
+        fs::remove_file(temp.join("a")).unwrap();
+        assert!(source.read("a").is_err());
+        assert_eq!(
+            source.take_trace().unwrap().finish(),
+            Err(TraceError::ResourceIo)
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    fn trace_distinguishes_exact_case_metadata_and_preloaded_bytes() {
+        let temp = temp();
+        fs::write(temp.join("a"), b"x").unwrap();
+        let mut source = ResourceSet::open(&temp).unwrap();
+        source.begin_trace().unwrap();
+        source
+            .trace_mut()
+            .unwrap()
+            .record_preloaded("a", b"x")
+            .unwrap();
+        source.read("a").unwrap();
+        source.read("A").unwrap_err();
+        source
+            .trace_mut()
+            .unwrap()
+            .add_metadata("difficulty", b"normal")
+            .unwrap();
+        let a = source.take_trace().unwrap().finish().unwrap();
+        source.begin_trace().unwrap();
+        source.read("a").unwrap();
+        source.read("A").unwrap_err();
+        source
+            .trace_mut()
+            .unwrap()
+            .add_metadata("difficulty", b"hard")
+            .unwrap();
+        assert_ne!(a, source.take_trace().unwrap().finish().unwrap());
         fs::remove_dir_all(temp).unwrap();
     }
 }

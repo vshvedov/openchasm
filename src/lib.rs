@@ -16,6 +16,7 @@ pub mod game;
 pub mod hazards;
 pub mod mission;
 pub mod object_combat;
+pub mod object_states;
 pub mod pickups;
 pub mod projectiles;
 pub mod session;

@@ -15,12 +15,21 @@ use openchasm::{
     process::Script,
     process_runtime::{ProcessCapabilities, ProcessObject, ProcessOutcome, ProcessRuntime},
     session::{LevelSetup, Session, SessionInput},
-    world::{Input, Player, Wall, World},
+    world::{Input, Player, Wall, WallCollisionMode, World},
 };
 use std::path::PathBuf;
 
 #[test]
 fn spawn_can_walk_to_offset_switch_and_unlock_gate() {
+    run_walk(WallCollisionMode::TwoSided);
+}
+
+#[test]
+fn spawn_can_walk_to_offset_switch_and_unlock_gate_with_authored_sides() {
+    run_walk(WallCollisionMode::AuthoredSides);
+}
+
+fn run_walk(mode: WallCollisionMode) {
     let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
     let path = explicit
         .as_ref()
@@ -120,6 +129,15 @@ fn spawn_can_walk_to_offset_switch_and_unlock_gate() {
         shot_blocking: [true; 128],
         difficulty: Difficulty::Normal,
     });
+    assert!(
+        session
+            .processes
+            .static_wall_mask()
+            .iter()
+            .any(|is_static| *is_static),
+        "installed map should exercise the static mask"
+    );
+    session.set_wall_collision_mode(mode);
     let initially = session.processes.activate_at("floor", [20, 12]);
     assert!(initially
         .iter()

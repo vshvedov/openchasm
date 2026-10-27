@@ -16,12 +16,21 @@ use openchasm::{
     process_runtime::{ProcessCapabilities, ProcessObject, ProcessRuntime},
     process_transaction::PresentationManifest,
     session::{LevelSetup, ScriptedObjects, Session, SessionInput},
-    world::{Player, Wall, World},
+    world::{Player, Wall, WallCollisionMode, World},
 };
 use std::path::PathBuf;
 
 #[test]
 fn military_base_floor_replaces_grates_and_moves_doors_atomically() {
+    run_process(WallCollisionMode::TwoSided);
+}
+
+#[test]
+fn military_base_floor_replacements_with_authored_sides() {
+    run_process(WallCollisionMode::AuthoredSides);
+}
+
+fn run_process(mode: WallCollisionMode) {
     let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
     let path = explicit
         .as_ref()
@@ -123,6 +132,12 @@ fn military_base_floor_replaces_grates_and_moves_doors_atomically() {
         shot_blocking: [true; 128],
         difficulty: Difficulty::Normal,
     });
+    assert!(session
+        .processes
+        .static_wall_mask()
+        .iter()
+        .any(|is_static| *is_static));
+    session.set_wall_collision_mode(mode);
     session.set_objects(ObjectCombat::new(
         &instances,
         &definitions,

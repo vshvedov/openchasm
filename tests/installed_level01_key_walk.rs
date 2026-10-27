@@ -18,12 +18,21 @@ use openchasm::{
     process_runtime::{ProcessCapabilities, ProcessObject, ProcessRuntime},
     process_transaction::PresentationManifest,
     session::{LevelSetup, ScriptedObjects, Session, SessionInput},
-    world::{Input, Player, Wall, World},
+    world::{Input, Player, Wall, WallCollisionMode, World},
 };
 use std::path::PathBuf;
 
 #[test]
 fn spawn_can_reach_first_green_key() {
+    run_walk(WallCollisionMode::TwoSided);
+}
+
+#[test]
+fn spawn_can_reach_first_green_key_with_authored_sides() {
+    run_walk(WallCollisionMode::AuthoredSides);
+}
+
+fn run_walk(mode: WallCollisionMode) {
     let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
     let path = explicit
         .as_ref()
@@ -123,6 +132,15 @@ fn spawn_can_reach_first_green_key() {
         shot_blocking: [true; 128],
         difficulty: Difficulty::Normal,
     });
+    assert!(
+        session
+            .processes
+            .static_wall_mask()
+            .iter()
+            .any(|is_static| *is_static),
+        "installed map should exercise the static mask"
+    );
+    session.set_wall_collision_mode(mode);
     session.set_objects(ObjectCombat::new(
         &instances,
         &definitions,

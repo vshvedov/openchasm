@@ -386,6 +386,7 @@ struct Raster<'a> {
     height: usize,
     palette: &'a [u32; 256],
     translucent: Option<Translucency>,
+    instance_light: f32,
 }
 impl Raster<'_> {
     fn put(&mut self, pixel: usize, distance: f32, rgb: u32, alpha: u8) {
@@ -447,7 +448,9 @@ impl Raster<'_> {
                 }
                 let rgb = self.palette[index as usize];
                 let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
-                let channel = |base: u32| (base as f32 * attenuation) as u32;
+                let channel = |base: u32| {
+                    ((base as f32 * attenuation * (1.0 + self.instance_light)) as u32).min(255)
+                };
                 let rgb = (channel((rgb >> 16) & 255) << 16)
                     | (channel((rgb >> 8) & 255) << 8)
                     | channel(rgb & 255);
@@ -520,9 +523,10 @@ impl Raster<'_> {
                     continue;
                 }
                 let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
-                let rgb = ((f32::from(rgba[0]) * attenuation) as u32) << 16
-                    | ((f32::from(rgba[1]) * attenuation) as u32) << 8
-                    | (f32::from(rgba[2]) * attenuation) as u32;
+                let channel = |base: u8| {
+                    ((f32::from(base) * attenuation * (1.0 + self.instance_light)) as u32).min(255)
+                };
+                let rgb = channel(rgba[0]) << 16 | channel(rgba[1]) << 8 | channel(rgba[2]);
                 self.put(pixel, distance, rgb, rgba[3]);
             }
         }
@@ -1297,6 +1301,22 @@ impl ObjectScene {
         camera: CameraView,
         mines: &[openchasm::explosives::Mine],
     ) {
+        self.render_with_mines_and_lights(frame, depth, width, height, camera, mines, None);
+    }
+
+    /// Light each object or actor at its instance position. This preserves
+    /// alpha/depth behavior; spatial variation across a mesh is not yet modeled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_mines_and_lights(
+        &self,
+        frame: &mut [u32],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        mines: &[openchasm::explosives::Mine],
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+    ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
@@ -1314,6 +1334,7 @@ impl ObjectScene {
             height,
             palette: &self.palette,
             translucent: None,
+            instance_light: 0.0,
         };
         let mine_instances: Vec<_> = self
             .mine_mesh
@@ -1350,6 +1371,7 @@ impl ObjectScene {
             if !instance.visible {
                 continue;
             }
+            raster.instance_light = lights.map_or(0.0, |lights| lights.sample(instance.position));
             let mesh = &self.meshes[instance.mesh];
             let dx = instance.position[0] - player.position[0];
             let dy = instance.position[1] - player.position[1];
@@ -1420,6 +1442,53 @@ impl ObjectScene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn instance_light_brightens_translucent_mesh_without_changing_depth() {
+        use openchasm::light_sources::{
+            LightSourceProcessSnapshot, LightSourcesSnapshot, SourceLight,
+        };
+        let scene = gltf_scene(128);
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+        };
+        let lights =
+            openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&LightSourcesSnapshot {
+                active: vec![LightSourceProcessSnapshot {
+                    process_id: 1,
+                    elapsed_ticks: 0,
+                    sources: vec![SourceLight {
+                        position_raw: [512, 0],
+                        radius_raw: 256,
+                        brightness: 255,
+                        delay_ms: 0,
+                    }],
+                }],
+            });
+        let mut base = vec![0; 64 * 64];
+        let mut lit = base.clone();
+        let mut base_depth = vec![f32::INFINITY; base.len()];
+        let mut lit_depth = base_depth.clone();
+        scene.render(&mut base, &mut base_depth, 64, 64, camera);
+        scene.render_with_mines_and_lights(
+            &mut lit,
+            &mut lit_depth,
+            64,
+            64,
+            camera,
+            &[],
+            Some(&lights),
+        );
+        assert!(lit.iter().zip(&base).any(|(light, normal)| light > normal));
+        assert_eq!(lit_depth, base_depth);
+        let mut unlit = vec![0; 64 * 64];
+        let mut unlit_depth = vec![f32::INFINITY; unlit.len()];
+        scene.render_with_mines_and_lights(&mut unlit, &mut unlit_depth, 64, 64, camera, &[], None);
+        assert_eq!(base, unlit);
+    }
     fn gltf_scene(alpha: u8) -> ObjectScene {
         let image = GltfImage {
             width: 1,
@@ -2332,6 +2401,7 @@ mod tests {
             height: 4,
             palette: &palette,
             translucent: None,
+            instance_light: 0.0,
         };
         raster.triangle(triangle, &model, 0);
         assert_eq!(raster.frame[0], 0x123456);
@@ -2390,6 +2460,7 @@ mod tests {
                 height: 4,
                 palette: &palette,
                 translucent: None,
+                instance_light: 0.0,
             };
             // The two surfaces cross: their order reverses across the triangle.
             let draws = [(tri(1.0, 4.0, 1.0), &red), (tri(4.0, 1.0, 4.0), &blue)];
@@ -2435,6 +2506,7 @@ mod tests {
             height: 1,
             palette: &palette,
             translucent: None,
+            instance_light: 0.0,
         };
         raster.put(0, 3.0, 0xff0000, 128);
         raster.put(0, 1.0, 0x0000ff, 255);

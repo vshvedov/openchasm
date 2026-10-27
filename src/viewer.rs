@@ -423,6 +423,7 @@ struct RenderWorld<'a> {
     eye_height: f32,
     yaw_offset: f32,
     mines: &'a [openchasm::explosives::Mine],
+    lights: Option<&'a openchasm::dynamic_light::DynamicLightSampler>,
 }
 
 // Authored quake power has no documented unit. Scale linearly up to a small
@@ -465,7 +466,11 @@ fn render(
         eye_height: scene.eye_height,
     };
     if let Some(planes) = planes {
-        planes.render(frame, WIDTH, HEIGHT, camera);
+        if scene.lights.is_some() {
+            planes.render_lit(frame, WIDTH, HEIGHT, camera, scene.lights);
+        } else {
+            planes.render(frame, WIDTH, HEIGHT, camera);
+        }
     } else {
         for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
             row.fill(if y < HEIGHT / 2 { 0x303847 } else { 0x38312b });
@@ -490,7 +495,14 @@ fn render(
             let top = origin.max(0.0).min(HEIGHT as f32) as usize;
             let bottom = (origin + half * 2.0).max(0.0).min(HEIGHT as f32) as usize;
             let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
-            let channel = |base: u32| ((base as f32 * attenuation) as u32).min(255);
+            let point = [
+                camera.player.position[0] + direction[0] * distance,
+                camera.player.position[1] + direction[1] * distance,
+            ];
+            // Provisional linear XY falloff brightens the existing distance
+            // shading; it does not reproduce original lightmaps or occlusion.
+            let light = scene.lights.map_or(0.0, |lights| lights.sample(point));
+            let channel = |base: u32| ((base as f32 * attenuation * (1.0 + light)) as u32).min(255);
             let color = (channel(75 + texture * 37 % 110) << 16)
                 | (channel(70 + texture * 23 % 100) << 8)
                 | channel(65 + texture * 13 % 90);
@@ -517,7 +529,17 @@ fn render(
         }
     }
     if let Some(objects) = objects {
-        if scene.mines.is_empty() {
+        if scene.lights.is_some() {
+            objects.render_with_mines_and_lights(
+                frame,
+                depth,
+                WIDTH,
+                HEIGHT,
+                camera,
+                scene.mines,
+                scene.lights,
+            );
+        } else if scene.mines.is_empty() {
             objects.render(frame, depth, WIDTH, HEIGHT, camera);
         } else {
             objects.render_with_mines(frame, depth, WIDTH, HEIGHT, camera, scene.mines);
@@ -1237,6 +1259,7 @@ pub fn run(
                 eye_height: camera.eye_height,
                 yaw_offset,
                 mines: session.mines(),
+                lights: None,
             },
             &textures,
             Some(&planes),
@@ -1495,6 +1518,7 @@ mod tests {
                 eye_height: 1.0,
                 yaw_offset: 0.0,
                 mines: &[],
+                lights: None,
             },
             &textures,
             None,
@@ -1504,6 +1528,64 @@ mod tests {
         let visible_in_front = frame[(HEIGHT / 2 + 10) * WIDTH + WIDTH / 2];
         assert!(visible_behind & 0xff0000 > 0, "{visible_behind:06x}");
         assert!(visible_in_front & 0x0000ff > 0, "{visible_in_front:06x}");
+    }
+
+    #[test]
+    fn wall_lighting_uses_hit_position_and_preserves_depth() {
+        use openchasm::light_sources::{
+            LightSourceProcessSnapshot, LightSourcesSnapshot, SourceLight,
+        };
+        let world = World {
+            walls: vec![Wall {
+                cell: None,
+                a: [3.0, 1.0],
+                b: [3.0, 3.0],
+                texture: 1,
+                blocks_movement: true,
+            }],
+            player: Player {
+                position: [1.0, 2.0],
+                angle: 0.0,
+            },
+        };
+        let lights =
+            openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&LightSourcesSnapshot {
+                active: vec![LightSourceProcessSnapshot {
+                    process_id: 1,
+                    elapsed_ticks: 0,
+                    sources: vec![SourceLight {
+                        position_raw: [3 * 256, 2 * 256],
+                        radius_raw: 256,
+                        brightness: 255,
+                        delay_ms: 0,
+                    }],
+                }],
+            });
+        let mut base = vec![0; WIDTH * HEIGHT];
+        let mut lit = base.clone();
+        let mut base_depth = vec![f32::INFINITY; base.len()];
+        let mut lit_depth = base_depth.clone();
+        let scene = |lights| RenderWorld {
+            world: &world,
+            elevations: &[],
+            eye_height: 1.0,
+            yaw_offset: 0.0,
+            mines: &[],
+            lights,
+        };
+        render(&mut base, &mut base_depth, scene(None), &[], None, None);
+        render(
+            &mut lit,
+            &mut lit_depth,
+            scene(Some(&lights)),
+            &[],
+            None,
+            None,
+        );
+        let pixel = HEIGHT / 2 * WIDTH + WIDTH / 2;
+        assert!(lit[pixel] > base[pixel]);
+        assert_eq!(lit_depth, base_depth);
+        assert_eq!(lit[0], base[0]);
     }
 
     #[test]
@@ -1537,6 +1619,7 @@ mod tests {
                 eye_height: 0.75,
                 yaw_offset: 0.0,
                 mines: &[],
+                lights: None,
             },
             &[],
             None,
@@ -1552,6 +1635,7 @@ mod tests {
                 eye_height: 1.15,
                 yaw_offset: 0.0,
                 mines: &[],
+                lights: None,
             },
             &[],
             None,
@@ -1591,6 +1675,7 @@ mod tests {
                 eye_height: 1.0,
                 yaw_offset: 0.0,
                 mines: &[],
+                lights: None,
             },
             &textures,
             None,
@@ -1632,6 +1717,7 @@ mod tests {
                 eye_height: 1.0,
                 yaw_offset: 0.0,
                 mines: &[],
+                lights: None,
             },
             &textures,
             None,

@@ -51,6 +51,18 @@ impl PlaneRenderer {
     /// plane and projected wall height as the geometry preview. Invalid or
     /// off-map intersections retain a plain background.
     pub fn render(&self, frame: &mut [u32], width: usize, height: usize, camera: CameraView) {
+        self.render_lit(frame, width, height, camera, None);
+    }
+
+    /// Dynamic light adds a provisional boost at each world intersection.
+    pub fn render_lit(
+        &self,
+        frame: &mut [u32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+    ) {
         let position = camera.player.position;
         let angle = camera.player.angle;
         if !camera.eye_height.is_finite()
@@ -122,7 +134,9 @@ impl PlaneRenderer {
                     self.textures[usize::from(id) * FLOOR_TEXTURE_SIDE * FLOOR_TEXTURE_SIDE
                         + ty * FLOOR_TEXTURE_SIDE
                         + tx];
-                let shade = |channel| ((channel as f32 * attenuation) as u32).min(255);
+                let light = lights.map_or(0.0, |lights| lights.sample([world_x, world_y]));
+                let shade =
+                    |channel| ((channel as f32 * attenuation * (1.0 + light)) as u32).min(255);
                 *pixel = (shade((texel >> 16) & 255) << 16)
                     | (shade((texel >> 8) & 255) << 8)
                     | shade(texel & 255);
@@ -174,6 +188,44 @@ mod tests {
         assert_eq!(image[4] & 0xff00ff, 0);
         assert!(image[7 * 8 + 4] & 0xff0000 > 0);
         assert_eq!(image[7 * 8 + 4] & 0x00ffff, 0);
+    }
+
+    #[test]
+    fn dynamic_light_uses_plane_intersections_and_leaves_sky_unchanged() {
+        use openchasm::light_sources::{
+            LightSourceProcessSnapshot, LightSourcesSnapshot, SourceLight,
+        };
+        let (map, floors, palette) = fixtures(0, 62);
+        let renderer = PlaneRenderer::new(&map, &floors, &palette);
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [16.5, 16.5],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+        };
+        let light =
+            openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&LightSourcesSnapshot {
+                active: vec![LightSourceProcessSnapshot {
+                    process_id: 1,
+                    elapsed_ticks: 0,
+                    sources: vec![SourceLight {
+                        position_raw: [18 * 256, 16 * 256 + 128],
+                        radius_raw: 256,
+                        brightness: 255,
+                        delay_ms: 0,
+                    }],
+                }],
+            });
+        let mut original = vec![0; 8 * 8];
+        let mut lit = original.clone();
+        renderer.render(&mut original, 8, 8, camera);
+        renderer.render_lit(&mut lit, 8, 8, camera, Some(&light));
+        assert!(lit[7 * 8 + 4] > original[7 * 8 + 4]);
+        assert_eq!(lit[4], original[4]);
+        let mut no_lights = vec![0; 64];
+        renderer.render_lit(&mut no_lights, 8, 8, camera, None);
+        assert_eq!(original, no_lights);
     }
 
     #[test]

@@ -481,6 +481,10 @@ pub fn run(
             pending_interact = false;
             pending_jump = false;
             pending_weapon = None;
+            let rocket_type = session.game.weapons.0[session.selected_weapon].rocket_type;
+            for id in crate::audio::gameplay_sound_ids(&events, rocket_type) {
+                audio.play(id);
+            }
             if let Some((_, remaining)) = &mut current_message {
                 *remaining -= STEP;
             }

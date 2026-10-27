@@ -79,6 +79,10 @@ pub fn gameplay_sound_ids(events: &openchasm::session::SessionEvents, rocket_typ
     if events.vertical.jumped {
         ids.push(12);
     }
+    // Stable by authored teleport index, including across checkpoint reloads.
+    if let Some(teleport) = events.teleport {
+        ids.push(17 + (teleport.index % 3) as u8);
+    }
     let sound_for = |rocket: usize| {
         u8::try_from(rocket)
             .ok()
@@ -215,7 +219,7 @@ impl Audio {
     pub fn new(resources: &mut ResourceSet, inf: &[u8]) -> Self {
         let mut sounds = BTreeMap::new();
         for (id, path) in sound_names(inf) {
-            if matches!(id, 12 | 21..=28 | 30..=50 | 51..=58 | 60 | 61 | 62 | 63 | 72) {
+            if matches!(id, 12 | 17..=19 | 21..=28 | 30..=50 | 51..=58 | 60 | 61 | 62 | 63 | 72) {
                 if let Ok(bytes) = resources.read(&path) {
                     sounds.insert(id, Arc::from(bytes));
                 }
@@ -484,7 +488,7 @@ mod tests {
         }
         let mut archive = crate::archive::Archive::open(&path).unwrap();
         let names = sound_names(&archive.read("chasm.inf").unwrap());
-        for id in [12, 30, 38, 40, 72] {
+        for id in [12, 17, 18, 19, 30, 38, 40, 72] {
             let bytes = archive
                 .read(names.get(&id).expect("mapped sample"))
                 .unwrap();
@@ -569,6 +573,25 @@ mod tests {
                 .unwrap();
             let decoder = rodio::Decoder::try_from(Cursor::new(bytes)).unwrap();
             assert!(decoder.take(1024).count() > 0);
+        }
+    }
+    #[test]
+    fn teleport_sound_selection_is_deterministic_and_only_on_success() {
+        use openchasm::teleport::{TeleportEvent, TeleportFailure};
+        let mut events = openchasm::session::SessionEvents {
+            teleport_failure: Some(TeleportFailure::DestinationBlocked { index: 1 }),
+            ..Default::default()
+        };
+        assert!(gameplay_sound_ids(&events, 0).is_empty());
+        events.teleport_failure = None;
+        for index in 0..6 {
+            events.teleport = Some(TeleportEvent {
+                index,
+                source: [0.0, 0.0],
+                destination: [1.0, 1.0],
+                angle_radians: 0.0,
+            });
+            assert_eq!(gameplay_sound_ids(&events, 0), vec![17 + (index % 3) as u8]);
         }
     }
 }

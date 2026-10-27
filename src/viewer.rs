@@ -177,6 +177,19 @@ fn advance_reflection_indicator(ticks: u8, reflection_count: usize) -> u8 {
     }
 }
 
+fn teleport_failure_message(failure: openchasm::teleport::TeleportFailure) -> String {
+    use openchasm::teleport::TeleportFailure;
+    match failure {
+        TeleportFailure::UnsupportedExtra { index, value } => {
+            format!("TELEPORT {} UNSUPPORTED FLAG {}", index + 1, value)
+        }
+        TeleportFailure::DestinationBlocked { index } => {
+            format!("TELEPORT {} DESTINATION BLOCKED", index + 1)
+        }
+        TeleportFailure::InvalidDefinition { index } => format!("TELEPORT {} INVALID", index + 1),
+    }
+}
+
 struct FrameClock {
     last: Instant,
 }
@@ -411,6 +424,8 @@ struct QuickSave {
     weapon_clock: WeaponAnimationClock,
     damage_feedback: DamageFeedback,
     reflection_ticks: u8,
+    teleport_notice: Option<(String, f32)>,
+    last_teleport_failure: Option<openchasm::teleport::TeleportFailure>,
     current_message: Option<(Vec<String>, f32)>,
     completed: bool,
     shot_feedback: Option<(&'static str, f32)>,
@@ -469,6 +484,7 @@ pub struct ClientFeedback {
     pub projectile_renderer: ProjectileRenderer,
     pub explosion_renderer: Option<crate::explosion_render::ExplosionRenderer>,
     pub difficulty: openchasm::pickups::Difficulty,
+    pub teleport_load_error: Option<String>,
 }
 
 pub fn run(
@@ -485,6 +501,7 @@ pub fn run(
         projectile_renderer,
         mut explosion_renderer,
         difficulty,
+        teleport_load_error,
     } = feedback;
     let difficulty_mask = crate::difficulty_mask(difficulty);
     let initial_session = session.clone();
@@ -543,6 +560,9 @@ pub fn run(
     let mut weapon_clock = WeaponAnimationClock::default();
     let mut damage_feedback = DamageFeedback::default();
     let mut reflection_ticks = 0_u8;
+    let startup_teleport_error = teleport_load_error;
+    let mut teleport_notice = startup_teleport_error.clone().map(|message| (message, 5.0));
+    let mut last_teleport_failure = None;
     let mut current_message: Option<(Vec<String>, f32)> = None;
     let mut shot_feedback: Option<(&'static str, f32)> = None;
     let mut quicksave: Option<QuickSave> = None;
@@ -691,6 +711,8 @@ pub fn run(
             weapon_clock = WeaponAnimationClock::default();
             damage_feedback = DamageFeedback::default();
             reflection_ticks = 0;
+            teleport_notice = startup_teleport_error.clone().map(|message| (message, 5.0));
+            last_teleport_failure = None;
             animation_tick = 0;
             current_message = None;
             shot_feedback = None;
@@ -707,6 +729,8 @@ pub fn run(
                         weapon_clock,
                         damage_feedback,
                         reflection_ticks,
+                        teleport_notice: teleport_notice.clone(),
+                        last_teleport_failure,
                         current_message: current_message.clone(),
                         completed,
                         shot_feedback,
@@ -722,6 +746,8 @@ pub fn run(
                             weapon_clock = saved.weapon_clock;
                             damage_feedback = saved.damage_feedback;
                             reflection_ticks = saved.reflection_ticks;
+                            teleport_notice = saved.teleport_notice.clone();
+                            last_teleport_failure = saved.last_teleport_failure;
                             current_message = saved.current_message.clone();
                             completed = saved.completed;
                             shot_feedback = saved.shot_feedback;
@@ -787,6 +813,25 @@ pub fn run(
                 fired,
                 weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Shoot),
             );
+            if let Some((_, remaining)) = &mut teleport_notice {
+                *remaining -= STEP;
+            }
+            if teleport_notice
+                .as_ref()
+                .is_some_and(|(_, remaining)| *remaining <= 0.0)
+            {
+                teleport_notice = None;
+            }
+            if let Some(failure) = events.teleport_failure {
+                if Some(failure) != last_teleport_failure {
+                    let message = teleport_failure_message(failure);
+                    eprintln!("{message}");
+                    teleport_notice = Some((message, 3.0));
+                }
+                last_teleport_failure = Some(failure);
+            } else {
+                last_teleport_failure = None;
+            }
             if let Some((_, remaining)) = &mut checkpoint_notice {
                 *remaining -= STEP;
             }
@@ -1015,6 +1060,9 @@ pub fn run(
             for (row, line) in lines.iter().enumerate().take(6) {
                 text(&mut frame, 8, 52 + row * 10, line);
             }
+        }
+        if let Some((message, _)) = &teleport_notice {
+            text(&mut frame, 8, HEIGHT - 78, message);
         }
         if let Some((message, _)) = checkpoint_notice {
             text(&mut frame, 8, HEIGHT - 54, message);
@@ -1392,5 +1440,21 @@ mod tests {
         assert_eq!(advance_reflection_indicator(active, 0), 29);
         assert_eq!(advance_reflection_indicator(1, 2), 30);
         assert_eq!(advance_reflection_indicator(0, 0), 0);
+    }
+    #[test]
+    fn teleport_errors_are_actionable() {
+        use openchasm::teleport::TeleportFailure;
+        assert_eq!(
+            teleport_failure_message(TeleportFailure::UnsupportedExtra { index: 0, value: 2 }),
+            "TELEPORT 1 UNSUPPORTED FLAG 2"
+        );
+        assert_eq!(
+            teleport_failure_message(TeleportFailure::DestinationBlocked { index: 4 }),
+            "TELEPORT 5 DESTINATION BLOCKED"
+        );
+        assert_eq!(
+            teleport_failure_message(TeleportFailure::InvalidDefinition { index: 1 }),
+            "TELEPORT 2 INVALID"
+        );
     }
 }

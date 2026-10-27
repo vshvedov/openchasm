@@ -45,3 +45,5 @@ Source floor triggers are not fired on a successful teleport. Destination
 floor entry is reset even when source and destination share a cell. AI and
 other entities do not teleport yet; wind currently applies before teleport,
 unlike the reference's provisional order.
+
+The preview parses teleports from each level's `map/process.xx` and enables player teleportation when the section is valid. It uses the provisional `AfterLeavingSources` rearm policy to avoid immediate loops. A committed teleport plays one of sound IDs 17–19, chosen deterministically by authored row index. Invalid data is reported during level loading; blocked destinations and unknown extra flags produce an on-screen diagnostic only when triggered, without logging on every tick. Teleport rearm state and the notification are included in the in-memory quicksave. Teleports for monsters and exact original rearm behavior remain unimplemented.

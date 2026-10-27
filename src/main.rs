@@ -420,6 +420,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
                 let script_data = resources.read(&format!("map/process.{id}"))?;
                 let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
+                // Teleport sections live in the level process resource.
+                let (teleports, teleport_load_error) = match std::str::from_utf8(&script_data) {
+                    Ok(text) => match openchasm::teleport::parse(text) {
+                        Ok(rows) => (Some(rows), None),
+                        Err(error) => (None, Some(format!("TELEPORT DATA INVALID: {error}"))),
+                    },
+                    Err(_) => (None, Some("TELEPORT DATA IS NOT UTF-8".to_owned())),
+                };
+                if let Some(error) = &teleport_load_error {
+                    eprintln!("{error}");
+                }
                 let cells = raw_cells(&map);
                 let definitions =
                     objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
@@ -565,6 +576,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 session.set_explosions_enabled(true);
                 session.set_mines_enabled(mine_available);
                 session.set_protective_powerups_enabled(true);
+                if let Some(teleports) = teleports {
+                    session.set_teleports(
+                        teleports,
+                        openchasm::teleport::RearmPolicy::AfterLeavingSources,
+                    );
+                }
                 session.set_objects(openchasm::object_combat::ObjectCombat::new(
                     &instances,
                     &definitions,
@@ -589,6 +606,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         projectile_renderer,
                         explosion_renderer,
                         difficulty,
+                        teleport_load_error,
                     },
                     &format!("{id}: {name} ({difficulty:?})"),
                 )?;

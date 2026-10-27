@@ -1,4 +1,5 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
+use crate::audio::Audio;
 use crate::object_render::ObjectScene;
 use crate::planes::PlaneRenderer;
 use crate::process_runtime::ProcessRuntime;
@@ -134,15 +135,21 @@ fn render(
     text(frame, 8, 32, "GEOMETRY PREVIEW - GAMEPLAY NOT IMPLEMENTED");
 }
 
+pub struct ClientFeedback {
+    pub game: GameInventory,
+    pub audio: Audio,
+}
+
 pub fn run(
     mut world: World,
     textures: Vec<Option<CelImage>>,
     planes: PlaneRenderer,
     mut processes: ProcessRuntime,
     mut objects: ObjectScene,
-    mut game: GameInventory,
+    feedback: ClientFeedback,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
+    let ClientFeedback { mut game, audio } = feedback;
     for cell in game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
@@ -184,6 +191,13 @@ pub fn run(
             world.step(input, STEP);
             for event in game.collect_near(world.player.position) {
                 objects.set_visible(event.cell, false);
+                let sound = match event.pickup {
+                    openchasm::inventory::Pickup::Weapon(index) => 51 + index as u8,
+                    openchasm::inventory::Pickup::Health => 62,
+                    openchasm::inventory::Pickup::Key(_) => 63,
+                    _ => 60,
+                };
+                audio.play(sound);
             }
             processes.set_keys(game.inventory.keys);
             processes.tick(&mut world, STEP, pending_interact);

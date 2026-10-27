@@ -1,4 +1,5 @@
 mod archive;
+mod audio;
 mod content;
 mod object_render;
 mod planes;
@@ -274,8 +275,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             let actor_state =
                 actors::ActorState::from_placements(&map.monsters, &actor_definitions);
             object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
-            let weapons =
-                openchasm::inventory::WeaponDefinitions::parse(&resources.read("chasm.inf")?)?;
+            let info = resources.read("chasm.inf")?;
+            let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
+            let audio = audio::Audio::new(&mut resources, &info);
             let game = openchasm::game::GameInventory::new(
                 weapons,
                 &objects::instances(&map),
@@ -288,7 +290,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 planes,
                 processes,
                 object_scene,
-                game,
+                viewer::ClientFeedback { game, audio },
                 &format!("{id}: {name}"),
             )?;
         }

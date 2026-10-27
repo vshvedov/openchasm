@@ -1,6 +1,6 @@
 # OpenChasm
 
-An experimental Rust reimplementation of **Chasm: The Rift**, with Linux, Windows and macOS as target platforms. The current build is a **geometry preview**, not a playable game. It loads the original map wall segments, CEL textures, floor and ceiling textures, static 3O objects, and static monster models, starts at the player spawn, and allows basic movement. Movement and collision are provisional. A limited subset of map processes can move walls, and supported items can be collected; enemy behavior, weapons, audio and multiplayer have not been implemented.
+An experimental Rust reimplementation of **Chasm: The Rift**, with Linux, Windows and macOS as target platforms. The current build is a **geometry preview**, not a playable game. It loads the original map wall segments, CEL textures, floor and ceiling textures, static 3O objects, and static monster models, starts at the player spawn, and allows basic movement. Movement and collision are provisional. A limited subset of map processes can move walls, and supported items can be collected; enemy behavior, weapons, most audio and multiplayer have not been implemented.
 
 The name OpenChasm is already used by another independent project; this repository is a separate Rust implementation. See [research notes](docs/research.md) and [map format notes](docs/map-format.md) for references.
 

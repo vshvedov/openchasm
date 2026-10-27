@@ -47,6 +47,16 @@ impl RelativeLook {
             self.release();
         }
     }
+    /// Attempt capture only for a focused gameplay window. Drop stale deltas
+    /// when switching modes so cursor repositioning does not turn the player.
+    fn capture_with(&mut self, enable: impl FnOnce() -> bool) -> bool {
+        if !self.focused {
+            return false;
+        }
+        self.pending_dx = 0;
+        self.captured = enable();
+        self.captured
+    }
     fn release(&mut self) {
         self.captured = false;
         self.pending_dx = 0;
@@ -60,6 +70,13 @@ impl RelativeLook {
         let dx = std::mem::take(&mut self.pending_dx).clamp(-100_000, 100_000);
         dx as f32 * MOUSE_SENSITIVITY
     }
+}
+
+fn capture_mouse(look: &mut RelativeLook, mouse: &sdl2::mouse::MouseUtil) -> bool {
+    look.capture_with(|| {
+        mouse.set_relative_mouse_mode(true);
+        mouse.relative_mouse_mode()
+    })
 }
 
 /// Return the next owned weapon with ammunition; simulation still validates
@@ -765,6 +782,9 @@ pub fn run(
         focused: canvas.window().has_input_focus(),
         ..RelativeLook::default()
     };
+    if look.focused && !capture_mouse(&mut look, &sdl.mouse()) {
+        eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
+    }
     let mut held = HashSet::new();
     let mut mouse_fire = false;
     let mut frame = vec![0; WIDTH * HEIGHT];
@@ -857,6 +877,9 @@ pub fn run(
                 }
             ) {
                 look.set_focus(true);
+                if !pause.open && !capture_mouse(&mut look, &sdl.mouse()) {
+                    eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
+                }
                 continue;
             }
             if pause.open {
@@ -876,6 +899,9 @@ pub fn run(
                             pending_interact = false;
                             pending_jump = false;
                             pending_weapon = None;
+                            if !capture_mouse(&mut look, &sdl.mouse()) {
+                                eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
+                            }
                             frame_clock.rebase(Instant::now());
                             suppress_gameplay = true;
                         }
@@ -953,9 +979,7 @@ pub fn run(
                         mouse_fire = true;
                     } else {
                         // The click that captures the cursor must not also shoot.
-                        sdl.mouse().set_relative_mouse_mode(true);
-                        look.captured = sdl.mouse().relative_mouse_mode();
-                        if !look.captured {
+                        if !capture_mouse(&mut look, &sdl.mouse()) {
                             eprintln!("relative mouse capture unavailable; use arrow keys to turn");
                             mouse_fire = true;
                         }
@@ -1545,6 +1569,29 @@ mod tests {
         );
     }
     use crate::world::{Player, Wall};
+
+    #[test]
+    fn mouse_capture_follows_focus_resume_and_resets_old_motion() {
+        let mut look = RelativeLook::default();
+        assert!(!look.capture_with(|| panic!("unfocused capture must not run")));
+        look.set_focus(true);
+        assert!(look.capture_with(|| true));
+        look.motion(20);
+        assert!((look.take_yaw() - 0.04).abs() < 1e-6);
+        look.motion(80);
+        look.set_focus(false);
+        assert_eq!(look.take_yaw(), 0.0);
+        look.set_focus(true);
+        assert!(!look.capture_with(|| false));
+        look.motion(10);
+        assert_eq!(look.take_yaw(), 0.0);
+        assert!(look.capture_with(|| true));
+        look.motion(-10);
+        assert!((look.take_yaw() + 0.02).abs() < 1e-6);
+        look.motion(100);
+        assert!(look.capture_with(|| true));
+        assert_eq!(look.take_yaw(), 0.0);
+    }
 
     #[test]
     fn relative_motion_is_consumed_once_and_cleared_on_focus_loss() {

@@ -276,7 +276,9 @@ impl Console {
         }
         let overlay = height / 2;
         for pixel in frame.iter_mut().take(width * overlay) {
-            *pixel = ((*pixel & 0xfefefe) >> 1) & 0x7f7f7f;
+            // Keep the scene faintly visible without letting HUD text compete
+            // with the console's output at the same pixel positions.
+            *pixel = ((*pixel >> 4) & 0x0f0f0f) + 0x0c1014;
         }
         let prompt_y = overlay.saturating_sub(10);
         let rows = prompt_y.saturating_sub(2) / 9;

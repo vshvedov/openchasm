@@ -1041,7 +1041,14 @@ pub fn run(
                                 p.angle,
                                 session.pitch()
                             ));
-                            console.push(&format!("{:.1} fps / {:.2} ms; sim {:.2} render {:.2} present {:.2}; max {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms));
+                            console.push(&format!(
+                                "{:.1} fps / {:.2} ms per frame; max {:.2} ms",
+                                metrics.fps, metrics.frame_ms, metrics.max_frame_ms
+                            ));
+                            console.push(&format!(
+                                "sim {:.2} ms; render {:.2} ms; present {:.2} ms",
+                                metrics.simulation_ms, metrics.render_ms, metrics.present_ms
+                            ));
                         }
                         Command::Restart => {
                             restart_requested = true;

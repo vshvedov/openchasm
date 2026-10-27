@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 const WIDTH: usize = 640;
 const HEIGHT: usize = 400;
 const STEP: f32 = 1.0 / 60.0;
-const MOUSE_SENSITIVITY: f32 = 0.002;
+const MOUSE_SENSITIVITY: f32 = crate::graphics_settings::DEFAULT_MOUSE_SENSITIVITY;
 fn fps_limit(value: u32) -> Option<Duration> {
     (value != 0).then(|| Duration::from_secs_f64(1.0 / f64::from(value)))
 }
@@ -2652,7 +2652,7 @@ mod tests {
         look.set_focus(true);
         assert!(look.capture_with(|| true));
         look.motion(20);
-        assert!((look.take_yaw() + 0.04).abs() < 1e-6);
+        assert!((look.take_yaw() + 20.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         look.motion(80);
         look.set_focus(false);
         assert_eq!(look.take_yaw(), 0.0);
@@ -2662,7 +2662,7 @@ mod tests {
         assert_eq!(look.take_yaw(), 0.0);
         assert!(look.capture_with(|| true));
         look.motion(-10);
-        assert!((look.take_yaw() - 0.02).abs() < 1e-6);
+        assert!((look.take_yaw() - 10.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         look.motion(100);
         assert!(look.capture_with(|| true));
         assert_eq!(look.take_yaw(), 0.0);
@@ -2677,7 +2677,7 @@ mod tests {
         look.captured = true;
         look.motion(10);
         look.motion(-4);
-        assert!((look.take_yaw() + 0.012).abs() < 1e-6);
+        assert!((look.take_yaw() + 6.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         assert_eq!(look.take_yaw(), 0.0);
         look.motion(30);
         look.set_focus(false);
@@ -2694,7 +2694,7 @@ mod tests {
         look.captured = true;
         look.motion_y(-12);
         look.motion_y(2);
-        assert!((look.take_pitch() - 0.02).abs() < 1e-6);
+        assert!((look.take_pitch() - 10.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         assert_eq!(look.take_pitch(), 0.0);
         look.motion_y(-30);
         look.set_focus(false);

@@ -12,6 +12,9 @@ use std::{
 };
 
 const MAX_BYTES: u64 = 16 * 1024;
+const SETTINGS_VERSION: u32 = 2;
+/// Verified original mouse scale at sensitivity 1, in radians per relative count.
+pub const DEFAULT_MOUSE_SENSITIVITY: f32 = std::f32::consts::PI / 1024.0;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +66,7 @@ pub struct GraphicsSettings {
 impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: SETTINGS_VERSION,
             preset: VisualPreset::Remaster,
             tone_mapping: true,
             gamma: 1.0,
@@ -73,13 +76,13 @@ impl Default for GraphicsSettings {
             show_fps: true,
             show_help: false,
             max_fps: 60,
-            sensitivity: 0.002,
+            sensitivity: DEFAULT_MOUSE_SENSITIVITY,
         }
     }
 }
 impl GraphicsSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version != 1 {
+        if self.version != SETTINGS_VERSION {
             return Err("unsupported settings version");
         }
         self.color_settings().validate()?;
@@ -155,8 +158,16 @@ impl SettingsStore {
                 "settings exceeds 16 KiB",
             ));
         }
-        let settings: GraphicsSettings = serde_json::from_slice(&bytes)
+        let mut settings: GraphicsSettings = serde_json::from_slice(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if settings.version == 1 {
+            // Old previews saved the slow factory value whenever any graphics
+            // option changed. Upgrade that default while preserving custom values.
+            if settings.sensitivity == 0.002 {
+                settings.sensitivity = DEFAULT_MOUSE_SENSITIVITY;
+            }
+            settings.version = SETTINGS_VERSION;
+        }
         settings
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -421,6 +432,38 @@ mod tests {
         assert!(settings.validate().is_err());
     }
     #[test]
+    fn original_mouse_scale_migrates_only_the_old_factory_value() {
+        assert_eq!(DEFAULT_MOUSE_SENSITIVITY.to_bits(), 0x3b490fdb);
+        let dir = directory();
+        fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::new(dir.clone());
+        for sensitivity in [0.002, 0.004] {
+            let old = GraphicsSettings {
+                version: 1,
+                sensitivity,
+                ..GraphicsSettings::default()
+            };
+            let bytes = serde_json::to_vec(&old).unwrap();
+            fs::write(dir.join("graphics.json"), &bytes).unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(loaded.version, SETTINGS_VERSION);
+            assert_eq!(
+                loaded.sensitivity,
+                if sensitivity == 0.002 {
+                    DEFAULT_MOUSE_SENSITIVITY
+                } else {
+                    sensitivity
+                }
+            );
+            assert_eq!(
+                fs::read(dir.join("graphics.json")).unwrap(),
+                bytes,
+                "loading must not silently rewrite preferences"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn pre_hud_preferences_keep_their_saved_values() {
         let settings = GraphicsSettings {
             max_fps: 144,
@@ -464,7 +507,7 @@ mod tests {
         .unwrap();
         assert!(store.load().is_err());
         let mut unsupported = next.clone();
-        unsupported.version = 2;
+        unsupported.version = SETTINGS_VERSION + 1;
         fs::write(
             dir.join("graphics.json"),
             serde_json::to_vec(&unsupported).unwrap(),

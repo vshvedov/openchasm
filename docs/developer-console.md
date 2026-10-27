@@ -52,3 +52,9 @@ Missing HUD assets fall back to the text status display.
 to SDL when unavailable. Backend switches retain the session. This selection
 is session-local; `OPENCHASM_RENDERER=auto|gpu|software` selects startup behavior.
 Build with `--features gpu` to include GPU post-processing.
+
+Default mouse sensitivity now matches the original coefficient `pi/1024` radians
+per relative count at original sensitivity 1. Version-one preferences using the
+old factory `0.002` value upgrade in memory; other custom values are preserved.
+Loading preferences does not rewrite their file. The `sensitivity` command
+continues to use radians per count.

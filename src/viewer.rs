@@ -253,6 +253,7 @@ pub struct ClientFeedback {
     pub audio: Audio,
     pub weapon_overlay: WeaponRenderer,
     pub projectile_renderer: ProjectileRenderer,
+    pub explosion_renderer: Option<crate::explosion_render::ExplosionRenderer>,
 }
 
 pub fn run(
@@ -267,6 +268,7 @@ pub fn run(
         audio,
         weapon_overlay,
         projectile_renderer,
+        mut explosion_renderer,
     } = feedback;
     let initial_session = session.clone();
     if let Some(targets) = &session.objects {
@@ -438,6 +440,9 @@ pub fn run(
         };
         if restart_requested {
             session = initial_session.clone();
+            if let Some(renderer) = &mut explosion_renderer {
+                renderer.clear();
+            }
             objects.reset_level_objects();
             objects.reset_object_animations();
             for pose in session.processes.objects() {
@@ -486,6 +491,12 @@ pub fn run(
             pending_interact = false;
             pending_jump = false;
             pending_weapon = None;
+            if let Some(renderer) = &mut explosion_renderer {
+                renderer.tick();
+                if let Err(error) = renderer.consume(&events) {
+                    eprintln!("explosion visuals skipped: {error}");
+                }
+            }
             let rocket_type = session.game.weapons.0[session.selected_weapon].rocket_type;
             for id in crate::audio::gameplay_sound_ids(&events, rocket_type) {
                 audio.play(id);
@@ -650,6 +661,9 @@ pub fn run(
             camera,
             &projectile_visuals,
         );
+        if let Some(renderer) = &explosion_renderer {
+            renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
+        }
         let pose = if shoot_ticks > 0 {
             WeaponPose::Shoot
         } else {

@@ -1,6 +1,7 @@
 mod archive;
 mod audio;
 mod content;
+mod explosion_render;
 mod gltf_model;
 mod object_render;
 mod planes;
@@ -418,6 +419,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
                 let projectile_renderer =
                     projectile_render::ProjectileRenderer::load(&mut resources, &rockets, &palette);
+                let explosion_renderer = match explosion_render::ExplosionRenderer::load(
+                    &mut resources,
+                    &palette,
+                    &rockets,
+                ) {
+                    Ok(renderer) => Some(renderer),
+                    Err(error) => {
+                        eprintln!("explosion visuals unavailable: {error}");
+                        None
+                    }
+                };
                 let shot_blocking =
                     std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
                 let mut session =
@@ -455,6 +467,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         audio,
                         weapon_overlay,
                         projectile_renderer,
+                        explosion_renderer,
                     },
                     &format!("{id}: {name}"),
                 )?;

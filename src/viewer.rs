@@ -135,7 +135,6 @@ fn render(
     textures: &[Option<ViewerTexture>],
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
-    label: &str,
 ) {
     let world = scene.world;
     let mut camera_player = world.player;
@@ -203,6 +202,9 @@ fn render(
             objects.render_with_mines(frame, depth, WIDTH, HEIGHT, camera, scene.mines);
         }
     }
+}
+
+fn draw_header(frame: &mut [u32], label: &str) {
     text(frame, 8, 8, label);
     text(
         frame,
@@ -640,7 +642,6 @@ pub fn run(
             &textures,
             Some(&planes),
             Some(&objects),
-            label,
         );
         let projectile_visuals: Vec<_> = session
             .projectiles
@@ -686,6 +687,7 @@ pub fn run(
             pose,
             frame_index,
         );
+        draw_header(&mut frame, label);
         let cx = WIDTH / 2;
         let cy = HEIGHT / 2;
         for offset in -3isize..=3 {
@@ -818,7 +820,6 @@ mod tests {
             &textures,
             None,
             None,
-            "",
         );
         let visible_behind = frame[(HEIGHT / 2 - 10) * WIDTH + WIDTH / 2];
         let visible_in_front = frame[(HEIGHT / 2 + 10) * WIDTH + WIDTH / 2];
@@ -861,7 +862,6 @@ mod tests {
             &[],
             None,
             None,
-            "",
         );
         let lower_camera_top = top(&depth);
         render(
@@ -877,7 +877,6 @@ mod tests {
             &[],
             None,
             None,
-            "",
         );
         assert!(top(&depth) > lower_camera_top + 10);
     }
@@ -917,7 +916,6 @@ mod tests {
             &textures,
             None,
             None,
-            "",
         );
         assert_eq!(frame[(HEIGHT / 2) * WIDTH + WIDTH / 2], 0x38312b);
     }
@@ -959,7 +957,6 @@ mod tests {
             &textures,
             None,
             None,
-            "",
         );
         let center = frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
         assert!(center & 0xff0000 > 0);

@@ -22,6 +22,18 @@ const CAMERA_PLANE: f32 = 0.66;
 const NEAR: f32 = 0.05;
 const TICKS_PER_FRAME: u32 = 4; // 15 FPS at 60 simulation ticks/s.
 
+// Only sample pixels whose centers lie inside the projected image. A direct
+// float-to-usize cast saturates negative coordinates to zero and paints a
+// one-pixel fringe when the billboard starts within a pixel.
+fn texel_coordinate(pixel: usize, start: f32, scale: f32, limit: usize) -> Option<usize> {
+    let coordinate = (pixel as f32 + 0.5 - start) / scale;
+    if coordinate >= 0.0 && coordinate < limit as f32 {
+        Some(coordinate as usize)
+    } else {
+        None
+    }
+}
+
 struct Frame {
     width: usize,
     height: usize,
@@ -223,15 +235,13 @@ impl ExplosionRenderer {
             let y0 = top.floor().max(0.0).min(height as f32) as usize;
             let y1 = bottom.ceil().max(0.0).min(height as f32) as usize;
             for y in y0..y1 {
-                let ty = ((y as f32 + 0.5 - top) / scale_y) as usize;
-                if ty >= image.height {
+                let Some(ty) = texel_coordinate(y, top, scale_y, image.height) else {
                     continue;
-                }
+                };
                 for x in x0..x1 {
-                    let tx = ((x as f32 + 0.5 - left) / scale_x) as usize;
-                    if tx >= image.width {
+                    let Some(tx) = texel_coordinate(x, left, scale_x, image.width) else {
                         continue;
-                    }
+                    };
                     let offset = y * width + x;
                     // Small contact tolerance allows impacts on a wall to be visible.
                     if distance > depth[offset] + 1.0 / 32.0 {
@@ -366,5 +376,12 @@ mod tests {
         events.explosion_origins.pop();
         assert!(renderer.consume(&events).is_err());
         assert_eq!(renderer.effects.len(), 2);
+    }
+    #[test]
+    fn projected_texel_lookup_excludes_outside_pixel_centers() {
+        assert_eq!(texel_coordinate(2, 2.6, 1.0, 2), None);
+        assert_eq!(texel_coordinate(3, 2.6, 1.0, 2), Some(0));
+        assert_eq!(texel_coordinate(4, 2.6, 1.0, 2), Some(1));
+        assert_eq!(texel_coordinate(5, 2.6, 1.0, 2), None);
     }
 }

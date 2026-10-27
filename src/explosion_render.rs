@@ -267,6 +267,7 @@ impl ExplosionRenderer {
     }
 
     /// Render authored fullbright sprites into an encoded or linear scene.
+    #[cfg(test)]
     pub fn render_to<C: crate::color_pipeline::RenderPixel>(
         &self,
         frame: &mut [C],
@@ -274,6 +275,21 @@ impl ExplosionRenderer {
         width: usize,
         height: usize,
         camera: CameraView,
+    ) {
+        let mut transparency = crate::object_render::Translucency::new(frame.len());
+        self.render_deferred(frame, depth, width, height, camera, &mut transparency);
+        transparency.composite(frame, depth);
+    }
+
+    /// Queue masked sprite pixels for the shared back-to-front world pass.
+    pub fn render_deferred<C: crate::color_pipeline::RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &[f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        transparency: &mut crate::object_render::Translucency<C>,
     ) {
         if width == 0
             || height == 0
@@ -331,7 +347,13 @@ impl ExplosionRenderer {
                     }
                     let index = image.pixels[ty * image.width + tx];
                     if index != 255 {
-                        frame[offset] = C::from_srgb8(self.palette[index as usize]);
+                        transparency.push_with_bias(
+                            offset,
+                            distance,
+                            C::from_srgb8(self.palette[index as usize]),
+                            255,
+                            1.0 / 32.0,
+                        );
                     }
                 }
             }
@@ -368,6 +390,105 @@ mod tests {
         assert!(Sprite::parse(&[0, 0]).is_err());
         assert!(Sprite::parse(&[1, 0, 1, 0, 1, 0, 2, 0, 1]).is_err());
     }
+    #[test]
+    fn shared_pass_orders_model_transparency_sprites_and_late_opaque_depth() {
+        use crate::color_pipeline::LinearRgb;
+        use crate::object_render::{tests::gltf_scene, Translucency};
+        let scene = gltf_scene(128);
+        let mut sprite = renderer();
+        sprite.sprite.frames[0] = Frame {
+            width: 64,
+            height: 64,
+            center: 32,
+            pixels: vec![2; 64 * 64],
+        };
+        sprite.sprite.height = 64;
+        sprite.palette[2] = 0x00ff00;
+        assert!(sprite.spawn([3.0, 0.0, 1.0]));
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut frame = vec![LinearRgb::default(); 64 * 64];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        let mut queue = Translucency::new(frame.len());
+        scene.render_deferred(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            None,
+            &mut queue,
+        );
+        sprite.render_deferred(&mut frame, &depth, 64, 64, camera, &mut queue);
+        queue.composite(&mut frame, &depth);
+        let center = 32 * 64 + 32;
+        assert!(
+            frame[center].0[0] > 0.0 && frame[center].0[1] > 0.0,
+            "front translucent model must blend over sprite"
+        );
+        queue.clear();
+        frame.fill(LinearRgb::default());
+        depth.fill(f32::INFINITY);
+        sprite.effects[0].position[0] = 1.0;
+        scene.render_deferred(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            None,
+            &mut queue,
+        );
+        sprite.render_deferred(&mut frame, &depth, 64, 64, camera, &mut queue);
+        queue.composite(&mut frame, &depth);
+        assert_eq!(
+            frame[center],
+            LinearRgb([0.0, 1.0, 0.0]),
+            "front opaque sprite hides model behind"
+        );
+        queue.clear();
+        frame.fill(LinearRgb([0.0, 0.0, 1.0]));
+        depth.fill(f32::INFINITY);
+        scene.render_deferred(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[],
+            None,
+            None,
+            &mut queue,
+        );
+        // Render an opaque projectile after transparent object fragments were queued.
+        let projectile = crate::projectile_render::tests::renderer();
+        let shot = crate::projectile_render::ProjectileVisual {
+            rocket_type: 0,
+            position: [1.0, 0.0, 1.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        projectile.render_to(&mut frame, &mut depth, 64, 64, camera, &[shot], None);
+        assert!(depth[center] < 2.0);
+        let projectile_pixel = frame[center];
+        queue.composite(&mut frame, &depth);
+        assert_eq!(
+            frame[center], projectile_pixel,
+            "front projectile must occlude queued model"
+        );
+    }
+
     #[test]
     fn linear_effect_keeps_fullbright_color_and_respects_opaque_depth() {
         use crate::color_pipeline::LinearRgb;

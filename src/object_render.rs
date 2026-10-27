@@ -341,28 +341,45 @@ struct Fragment<C: RenderPixel> {
     depth: f32,
     rgb: C,
     alpha: u8,
+    depth_bias: f32,
 }
-struct Translucency<C: RenderPixel> {
+pub struct Translucency<C: RenderPixel> {
     heads: Vec<u32>,
     counts: Vec<u8>,
     fragments: Vec<Fragment<C>>,
 }
 impl<C: RenderPixel> Translucency<C> {
-    fn new(pixels: usize) -> Self {
+    pub fn new(pixels: usize) -> Self {
         Self {
             heads: vec![NO_FRAGMENT; pixels],
             counts: vec![0; pixels],
             fragments: Vec::new(),
         }
     }
-    fn push(&mut self, pixel: usize, depth: f32, rgb: C, alpha: u8) {
+    pub fn clear(&mut self) {
+        self.heads.fill(NO_FRAGMENT);
+        self.counts.fill(0);
+        self.fragments.clear();
+    }
+    pub fn push(&mut self, pixel: usize, depth: f32, rgb: C, alpha: u8) {
+        self.push_with_bias(pixel, depth, rgb, alpha, 0.0);
+    }
+    pub fn push_with_bias(&mut self, pixel: usize, depth: f32, rgb: C, alpha: u8, depth_bias: f32) {
+        if pixel >= self.heads.len() || !depth.is_finite() || !depth_bias.is_finite() || alpha == 0
+        {
+            return;
+        }
         let mut current = self.heads[pixel];
         let mut farthest = NO_FRAGMENT;
         while current != NO_FRAGMENT {
             let f = self.fragments[current as usize];
             // Adjacent triangles can cover the same edge sample. Avoid double
             // blending identical samples on a shared edge.
-            if (f.depth - depth).abs() < 0.00001 && f.rgb == rgb && f.alpha == alpha {
+            if (f.depth - depth).abs() < 0.00001
+                && f.rgb == rgb
+                && f.alpha == alpha
+                && f.depth_bias == depth_bias
+            {
                 return;
             }
             if farthest == NO_FRAGMENT || f.depth > self.fragments[farthest as usize].depth {
@@ -378,6 +395,7 @@ impl<C: RenderPixel> Translucency<C> {
                     depth,
                     rgb,
                     alpha,
+                    depth_bias,
                 };
             }
         } else if let Ok(index) = u32::try_from(self.fragments.len()) {
@@ -390,12 +408,16 @@ impl<C: RenderPixel> Translucency<C> {
                 depth,
                 rgb,
                 alpha,
+                depth_bias,
             });
             self.heads[pixel] = index;
             self.counts[pixel] += 1;
         }
     }
-    fn composite(&self, frame: &mut [C], depth: &[f32]) {
+    pub fn composite(&self, frame: &mut [C], depth: &[f32]) {
+        if frame.len() != self.heads.len() || depth.len() != frame.len() {
+            return;
+        }
         for (pixel, &head) in self.heads.iter().enumerate() {
             if head == NO_FRAGMENT {
                 continue;
@@ -405,12 +427,13 @@ impl<C: RenderPixel> Translucency<C> {
                 depth: 0.0,
                 rgb: C::default(),
                 alpha: 0,
+                depth_bias: 0.0,
             }; MAX_TRANSLUCENT_LAYERS as usize];
             let mut count = 0;
             let mut current = head;
             while current != NO_FRAGMENT {
                 let f = self.fragments[current as usize];
-                if f.depth < depth[pixel] {
+                if f.depth < depth[pixel] + f.depth_bias {
                     sorted[count] = f;
                     count += 1;
                 }
@@ -445,6 +468,7 @@ impl<C: RenderPixel> Raster<'_, C> {
                 .push(pixel, distance, rgb, alpha);
         }
     }
+    #[cfg(test)]
     fn finish(&mut self) {
         if let Some(translucent) = &self.translucent {
             translucent.composite(self.frame, self.depth);
@@ -1470,12 +1494,42 @@ impl ObjectScene {
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
         static_light: Option<&crate::map::StaticLightMap>,
     ) {
+        let mut transparency = Translucency::new(frame.len());
+        self.render_deferred(
+            frame,
+            depth,
+            width,
+            height,
+            camera,
+            mines,
+            lights,
+            static_light,
+            &mut transparency,
+        );
+        transparency.composite(frame, depth);
+    }
+
+    /// Draw opaque geometry now and defer transparent fragments until all world passes finish.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_deferred<C: RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        mines: &[openchasm::explosives::Mine],
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+        static_light: Option<&crate::map::StaticLightMap>,
+        transparency: &mut Translucency<C>,
+    ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
             || !player.angle.is_finite()
             || width.checked_mul(height) != Some(frame.len())
             || frame.len() != depth.len()
+            || transparency.heads.len() != frame.len()
         {
             return;
         }
@@ -1487,7 +1541,7 @@ impl ObjectScene {
             width,
             height,
             palette: &self.palette,
-            translucent: None,
+            translucent: Some(std::mem::replace(transparency, Translucency::new(0))),
             instance_light: 0.0,
             instance_static_light: None,
         };
@@ -1595,7 +1649,7 @@ impl ObjectScene {
                 }
             }
         }
-        raster.finish();
+        *transparency = raster.translucent.take().expect("queue initialized");
     }
 }
 

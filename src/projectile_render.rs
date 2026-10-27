@@ -190,7 +190,9 @@ impl ProjectileRenderer {
     }
 
     /// Render directly to an encoded or linear-HDR scene buffer.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn render_to<C: crate::color_pipeline::RenderPixel>(
         &self,
         frame: &mut [C],
@@ -200,6 +202,33 @@ impl ProjectileRenderer {
         camera: CameraView,
         projectiles: &[ProjectileVisual],
         static_light: Option<&crate::map::StaticLightMap>,
+    ) {
+        let mut transparency = crate::object_render::Translucency::new(frame.len());
+        self.render_deferred(
+            frame,
+            depth,
+            width,
+            height,
+            camera,
+            projectiles,
+            static_light,
+            &mut transparency,
+        );
+        transparency.composite(frame, depth);
+    }
+
+    /// Render opaque polygons and queue translucent polygons for the shared world pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_deferred<C: crate::color_pipeline::RenderPixel>(
+        &self,
+        frame: &mut [C],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        projectiles: &[ProjectileVisual],
+        static_light: Option<&crate::map::StaticLightMap>,
+        transparency: &mut crate::object_render::Translucency<C>,
     ) {
         let player = camera.player;
         if !camera.eye_height.is_finite()
@@ -221,6 +250,7 @@ impl ProjectileRenderer {
             height,
             palette: &self.palette,
             static_light: None,
+            transparency,
         };
         for projectile in projectiles {
             if !projectile.position.iter().all(|v| v.is_finite())
@@ -357,6 +387,7 @@ struct Raster<'a, C: crate::color_pipeline::RenderPixel> {
     height: usize,
     palette: &'a [u32; 256],
     static_light: Option<f32>,
+    transparency: &'a mut crate::object_render::Translucency<C>,
 }
 impl<C: crate::color_pipeline::RenderPixel> Raster<'_, C> {
     fn triangle(&mut self, triangle: [Projected; 3], model: &Model, flags: u8, fullbright: bool) {
@@ -402,15 +433,20 @@ impl<C: crate::color_pipeline::RenderPixel> Raster<'_, C> {
                     self.static_light
                         .unwrap_or_else(|| (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0))
                 };
-                self.frame[pixel] = C::shade_srgb8(rgb, attenuation);
-                self.depth[pixel] = distance;
+                let color = C::shade_srgb8(rgb, attenuation);
+                if flags & 0x0c != 0 {
+                    self.transparency.push(pixel, distance, color, 128);
+                } else {
+                    self.frame[pixel] = color;
+                    self.depth[pixel] = distance;
+                }
             }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn pitched_projectile_uses_shared_world_horizon() {
@@ -540,7 +576,7 @@ mod tests {
         assert_ne!(mesh.vertices(0.0), mesh.vertices(1.0 / 18.0));
     }
 
-    fn renderer() -> ProjectileRenderer {
+    pub(crate) fn renderer() -> ProjectileRenderer {
         let vertex = |y, z| ModelVertex {
             position: [0, y, z],
         };
@@ -721,6 +757,61 @@ mod tests {
             Some(map.static_light()),
         );
         assert!((frame[index].0[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn translucent_projectile_queues_without_writing_opaque_depth() {
+        let mut renderer = renderer();
+        renderer.models[0].model.polygons[0].flags = 4;
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [1.0, 0.0, 1.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        let mut frame = vec![0x0000ff; 64 * 64];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        let mut queue = crate::object_render::Translucency::new(frame.len());
+        renderer.render_deferred(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            None,
+            &mut queue,
+        );
+        assert!(frame.iter().all(|&color| color == 0x0000ff));
+        assert!(depth.iter().all(|z| z.is_infinite()));
+        queue.composite(&mut frame, &depth);
+        assert!(frame
+            .iter()
+            .any(|&color| color & 0xff0000 != 0 && color & 0xff != 0));
+        queue.clear();
+        frame.fill(0x0000ff);
+        depth.fill(0.5);
+        renderer.render_deferred(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            camera,
+            &[shot],
+            None,
+            &mut queue,
+        );
+        queue.composite(&mut frame, &depth);
+        assert!(frame.iter().all(|&color| color == 0x0000ff));
     }
 
     #[test]

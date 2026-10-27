@@ -9,7 +9,9 @@ mod minimap;
 use crate::audio::{Audio, PlayerSound};
 use crate::color_pipeline::{ColorPipeline, LinearRgb, RenderPixel};
 use crate::graphics_settings::{GraphicsMenu, GraphicsSettings, MenuAction, SettingsStore};
-use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot};
+use crate::object_render::{
+    ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot, Translucency,
+};
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
 use crate::texture::CelImage;
@@ -552,18 +554,41 @@ fn render(
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
 ) {
-    let _ = render_profiled::<true, u32>(frame, depth, scene, textures, planes, objects, false);
+    let mut transparency = Translucency::new(frame.len());
+    let _ = render_profiled::<true, u32>(
+        SceneTarget {
+            frame,
+            depth,
+            transparency: &mut transparency,
+        },
+        scene,
+        textures,
+        planes,
+        objects,
+        false,
+    );
+    transparency.composite(frame, depth);
+}
+
+struct SceneTarget<'a, C: RenderPixel> {
+    frame: &'a mut [C],
+    depth: &'a mut [f32],
+    transparency: &'a mut Translucency<C>,
 }
 
 fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
-    frame: &mut [C],
-    depth: &mut [f32],
+    target: SceneTarget<'_, C>,
     scene: RenderWorld<'_>,
     textures: &[Option<ViewerTexture>],
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
     profile: bool,
 ) -> RenderTimings {
+    let SceneTarget {
+        frame,
+        depth,
+        transparency,
+    } = target;
     let mut timings = RenderTimings::default();
     let started = profile_start(profile);
     let world = scene.world;
@@ -670,7 +695,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
     timings.wall = profile_elapsed(started);
     let started = profile_start(profile);
     if let Some(objects) = objects {
-        objects.render_to(
+        objects.render_deferred(
             frame,
             depth,
             WIDTH,
@@ -679,6 +704,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
             scene.mines,
             scene.lights,
             planes.map(PlaneRenderer::static_light),
+            transparency,
         );
     }
     timings.model = profile_elapsed(started);
@@ -706,11 +732,16 @@ impl FrameScene<'_> {
         &self,
         frame: &mut [C],
         depth: &mut [f32],
+        transparency: &mut Translucency<C>,
         profile: bool,
     ) -> RenderTimings {
+        transparency.clear();
         let mut timings = render_profiled::<true, C>(
-            frame,
-            depth,
+            SceneTarget {
+                frame,
+                depth,
+                transparency,
+            },
             self.world,
             self.textures,
             Some(self.planes),
@@ -718,7 +749,7 @@ impl FrameScene<'_> {
             profile,
         );
         let started = profile_start(profile);
-        self.projectiles.render_to(
+        self.projectiles.render_deferred(
             frame,
             depth,
             WIDTH,
@@ -726,16 +757,18 @@ impl FrameScene<'_> {
             self.camera,
             self.projectile_visuals,
             Some(self.planes.static_light()),
+            transparency,
         );
         if let Some(renderer) = self.explosions {
-            renderer.render_to(frame, depth, WIDTH, HEIGHT, self.camera);
+            renderer.render_deferred(frame, depth, WIDTH, HEIGHT, self.camera, transparency);
         }
         if let Some(renderer) = self.impacts {
-            renderer.render_to(frame, depth, WIDTH, HEIGHT, self.camera);
+            renderer.render_deferred(frame, depth, WIDTH, HEIGHT, self.camera, transparency);
         }
         if let Some(renderer) = self.trails {
-            renderer.render_to(frame, depth, WIDTH, HEIGHT, self.camera);
+            renderer.render_deferred(frame, depth, WIDTH, HEIGHT, self.camera, transparency);
         }
+        transparency.composite(frame, depth);
         timings.effects = profile_elapsed(started);
         let started = profile_start(profile);
         self.weapon.render_to(
@@ -979,6 +1012,8 @@ pub fn run(
     let mut mouse_fire = false;
     let mut frame = vec![0; WIDTH * HEIGHT];
     let mut hdr_frame = vec![LinearRgb::default(); WIDTH * HEIGHT];
+    let mut rgb_transparency = Translucency::new(WIDTH * HEIGHT);
+    let mut hdr_transparency = Translucency::new(WIDTH * HEIGHT);
     let mut bloom = crate::bloom::Bloom::new(WIDTH, HEIGHT)?;
     let settings_store = match SettingsStore::for_sdl() {
         Ok(store) => Some(store),
@@ -1915,9 +1950,9 @@ pub fn run(
             weapon_frame: frame_index,
         };
         let mut stage_timings = if graphics.uses_hdr() {
-            scene.draw(&mut hdr_frame, &mut depth, profile)
+            scene.draw(&mut hdr_frame, &mut depth, &mut hdr_transparency, profile)
         } else {
-            scene.draw(&mut frame, &mut depth, profile)
+            scene.draw(&mut frame, &mut depth, &mut rgb_transparency, profile)
         };
         if graphics.uses_hdr() {
             let started = profile_start(profile);
@@ -2330,8 +2365,11 @@ mod tests {
             let mut new_frame = old_frame.clone();
             let mut new_depth = old_depth.clone();
             render_profiled::<false, u32>(
-                &mut old_frame,
-                &mut old_depth,
+                SceneTarget {
+                    frame: &mut old_frame,
+                    depth: &mut old_depth,
+                    transparency: &mut Translucency::new(WIDTH * HEIGHT),
+                },
                 scene(),
                 &textures,
                 Some(&planes),
@@ -2339,8 +2377,11 @@ mod tests {
                 false,
             );
             render_profiled::<true, u32>(
-                &mut new_frame,
-                &mut new_depth,
+                SceneTarget {
+                    frame: &mut new_frame,
+                    depth: &mut new_depth,
+                    transparency: &mut Translucency::new(WIDTH * HEIGHT),
+                },
                 scene(),
                 &textures,
                 Some(&planes),

@@ -4,6 +4,8 @@
 //! simulation and scene instance/animation state; transient explosion sprites
 //! and one-shot sounds are cleared on load; music continues. No data is
 //! written to disk; the checkpoint is lost on leaving the viewer/level.
+#[path = "minimap.rs"]
+mod minimap;
 use crate::audio::{Audio, PlayerSound};
 use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot};
 use crate::planes::PlaneRenderer;
@@ -559,7 +561,7 @@ fn draw_header(frame: &mut [u32], label: &str) {
         frame,
         8,
         32,
-        "PREVIEW: F5 QUICKSAVE  F9 QUICKLOAD  R RESTART  ESC PAUSE",
+        "TAB MAP  F5 QUICKSAVE  F9 QUICKLOAD  R RESTART  ESC PAUSE",
     );
 }
 
@@ -608,6 +610,7 @@ fn restore_level_visibility(objects: &mut ObjectScene, session: &Session, diffic
 struct QuickSave {
     session: Session,
     scene: ObjectSceneSnapshot,
+    minimap: minimap::Minimap,
     animation_tick: u64,
     weapon_clock: WeaponAnimationClock,
     damage_feedback: DamageFeedback,
@@ -757,6 +760,7 @@ pub fn run(
     let mut checkpoint_notice: Option<(&'static str, f32)> = None;
     let mut completed = false;
     let mut pause = PauseMenu::default();
+    let mut minimap = minimap::Minimap::new(&session.world);
     let number_keys = [
         Scancode::Num1,
         Scancode::Num2,
@@ -896,6 +900,8 @@ pub fn run(
                             checkpoint_command = Some(CheckpointCommand::Save);
                         } else if code == Scancode::F9 {
                             checkpoint_command = Some(CheckpointCommand::Load);
+                        } else if code == Scancode::Tab {
+                            minimap.open = !minimap.open;
                         } else if code == Scancode::E {
                             pending_interact = true;
                         } else if code == Scancode::Space {
@@ -968,6 +974,7 @@ pub fn run(
             audio.stop_one_shots();
             audio.reset_ambient();
             session = initial_session.clone();
+            minimap = minimap::Minimap::new(&session.world);
             if let Some(renderer) = &mut explosion_renderer {
                 renderer.clear();
             }
@@ -996,6 +1003,7 @@ pub fn run(
                     quicksave = Some(QuickSave {
                         session: session.clone(),
                         scene: objects.snapshot(),
+                        minimap: minimap.clone(),
                         animation_tick,
                         weapon_clock,
                         damage_feedback,
@@ -1015,6 +1023,7 @@ pub fn run(
                             audio.stop_one_shots();
                             audio.reset_ambient();
                             session = saved.session.clone();
+                            minimap = saved.minimap.clone();
                             animation_tick = saved.animation_tick;
                             weapon_clock = saved.weapon_clock;
                             damage_feedback = saved.damage_feedback;
@@ -1071,6 +1080,7 @@ pub fn run(
                 fire: firing,
                 select_weapon: pending_weapon,
             });
+            minimap.observe(&session.world);
             audio.update_ambient(session.ambient_grid(), session.world.player.position, STEP);
             pending_interact = false;
             pending_jump = false;
@@ -1301,6 +1311,7 @@ pub fn run(
             frame_index,
         );
         apply_damage_tint(&mut frame, damage_feedback.flash);
+        minimap.draw(&mut frame, WIDTH, HEIGHT, &session.world);
         draw_header(&mut frame, label);
         let cx = WIDTH / 2;
         let cy = HEIGHT / 2;

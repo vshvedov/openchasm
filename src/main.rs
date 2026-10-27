@@ -421,7 +421,7 @@ fn play(
             initial_cell_types: None,
         };
         let processes = if scripted.is_some() {
-            process_runtime::ProcessRuntime::with_staged_actions(
+            process_runtime::ProcessRuntime::with_source_lights(
                 &script,
                 &world,
                 capabilities,

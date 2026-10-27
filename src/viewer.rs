@@ -1250,6 +1250,9 @@ pub fn run(
             quake_power,
             animation_tick,
         );
+        let dynamic_lights = session.light_sources.as_ref().map(|sources| {
+            openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&sources.snapshot())
+        });
         render(
             &mut frame,
             &mut depth,
@@ -1259,7 +1262,7 @@ pub fn run(
                 eye_height: camera.eye_height,
                 yaw_offset,
                 mines: session.mines(),
-                lights: None,
+                lights: dynamic_lights.as_ref(),
             },
             &textures,
             Some(&planes),

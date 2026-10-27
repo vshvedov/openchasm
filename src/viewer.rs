@@ -376,6 +376,14 @@ pub fn run(
         if restart_requested {
             session = initial_session.clone();
             objects.reset_object_animations();
+            for pose in session.processes.objects() {
+                objects.set_pose(
+                    [usize::from(pose.cell[0]), usize::from(pose.cell[1])],
+                    pose.position,
+                    pose.angle_radians,
+                    pose.elevation_raw,
+                );
+            }
             if let Some(targets) = &session.objects {
                 for (cell, visible) in targets.visibility() {
                     objects.set_visible(cell, visible);
@@ -441,10 +449,24 @@ pub fn run(
                 }
             }
             for effect in events.process_effects {
-                if let openchasm::process_runtime::ProcessEffect::PlayAnimation { object_id } =
-                    effect
-                {
-                    objects.play_object_animation(object_id);
+                match effect {
+                    openchasm::process_runtime::ProcessEffect::PlayAnimation { object_id } => {
+                        objects.play_object_animation(object_id);
+                    }
+                    openchasm::process_runtime::ProcessEffect::ObjectPose {
+                        cell,
+                        position,
+                        angle_radians,
+                        elevation_raw,
+                    } => {
+                        objects.set_pose(
+                            [usize::from(cell[0]), usize::from(cell[1])],
+                            position,
+                            angle_radians,
+                            elevation_raw,
+                        );
+                    }
+                    _ => {}
                 }
             }
             objects.tick_object_animations(STEP);

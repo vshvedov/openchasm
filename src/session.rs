@@ -177,6 +177,13 @@ impl Session {
         let effects = self.processes.take_effects();
         for effect in &effects {
             self.hazards.apply_effect(effect);
+            if let ProcessEffect::ObjectPose { cell, position, .. } = *effect {
+                let cell = [usize::from(cell[0]), usize::from(cell[1])];
+                self.game.pickups.set_position(cell, position);
+                if let Some(objects) = &mut self.objects {
+                    objects.set_position(cell, position);
+                }
+            }
             if let ProcessEffect::WallElevation {
                 wall_index,
                 offset_raw,
@@ -192,6 +199,11 @@ impl Session {
         }
         self.sync_wall_blocking();
         effects
+    }
+    fn invalidate_process_object(&mut self, cell: [usize; 2]) {
+        if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
+            self.processes.remove_object([x, y]);
+        }
     }
     fn apply_player_damage(&mut self, amount: u16) -> u16 {
         // Provisional armor: absorbs at most half of each incoming hit.
@@ -237,7 +249,7 @@ impl Session {
             .unwrap_or_default();
         self.sync_wall_blocking();
         // Actors currently use a provisional full-room vertical extent.
-        let circles: Vec<_> = self
+        let mut circles: Vec<_> = self
             .actors
             .actors
             .iter()
@@ -252,16 +264,38 @@ impl Session {
                 })
             })
             .collect();
+        // Only opt-in, live, represented objects have a process-owned pose.
+        // Their authored 2D radii are provisional circular approximations;
+        // object height is not yet known, so do not allow jumping over them.
+        circles.extend(
+            self.processes
+                .objects()
+                .filter(|object| {
+                    object.blocking_radius > 0.0
+                        && object.elevation_raw / 64.0 < self.vertical.head()
+                })
+                .map(|object| crate::world::CollisionCircle {
+                    center: object.position,
+                    radius: object.blocking_radius,
+                }),
+        );
         self.world.step_with_circles(input.movement, DT, &circles);
         events.pickups = self.game.collect_near(self.world.player.position);
         self.processes.set_keys(self.game.inventory.keys);
         let mut attempts = Vec::new();
         for pickup in &events.pickups {
+            self.invalidate_process_object(pickup.cell);
+            if let Some(objects) = &mut self.objects {
+                objects.set_enabled(pickup.cell, false);
+            }
             if let (Ok(x), Ok(y)) = (u8::try_from(pickup.cell[0]), u8::try_from(pickup.cell[1])) {
                 attempts.extend(self.processes.activate_links_at([x, y]));
             }
         }
         attempts.extend(self.processes.tick(&mut self.world, DT, input.interact));
+        // Process-owned object positions must be applied before this tick's
+        // hitscan or projectile queries and before enemy simulation.
+        events.process_effects.extend(self.apply_process_effects());
         self.combat.tick(DT);
         if input.fire {
             let mut shot = self.combat.fire(
@@ -288,6 +322,9 @@ impl Session {
                 FireResult::Fired(ShotImpact::Object {
                     cell, destroyed, ..
                 }) => {
+                    if destroyed {
+                        self.invalidate_process_object(cell);
+                    }
                     if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
                         attempts.extend(self.processes.activate_at("shoot", [x, y]));
                         if destroyed {
@@ -384,6 +421,9 @@ impl Session {
                         .and_then(|objects| objects.apply_hit(cell, impact.damage))
                     {
                         events.object_hits.push((cell, hit.destroyed));
+                        if hit.destroyed {
+                            self.invalidate_process_object(cell);
+                        }
                         if impact.owner == Owner::Player {
                             if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
                                 attempts.extend(self.processes.activate_at("shoot", [x, y]));
@@ -691,6 +731,22 @@ mod tests {
             &Script::parse(text),
             Difficulty::Normal,
         ));
+        let mut raw = [0u8; 4096];
+        raw[64] = 163;
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &Script::parse(text),
+            &session.world,
+            crate::process_runtime::ProcessCapabilities::default(),
+            &raw,
+            &[crate::process_runtime::ProcessObject {
+                cell: [1, 0],
+                position: [1.5, 0.5],
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 0.125,
+            }],
+        )
+        .unwrap();
         let mut projectile_session = session.clone();
         projectile_session.game.inventory.weapons[3] = true;
         projectile_session.game.inventory.ammo[3] = 1;
@@ -717,11 +773,13 @@ mod tests {
             projectile_completed |= event.mission.contains(&MissionEvent::LevelComplete);
         }
         assert!(projectile_destroyed && projectile_completed);
+        assert!(projectile_session.processes.object_pose([1, 0]).is_none());
         let events = session.step(SessionInput {
             fire: true,
             ..SessionInput::default()
         });
         assert_eq!(events.object_hits, vec![([1, 0], true)]);
+        assert!(session.processes.object_pose([1, 0]).is_none());
         assert!(matches!(
             events.shot,
             Some(FireResult::Fired(ShotImpact::Object {
@@ -737,6 +795,235 @@ mod tests {
                 .contains(&MissionEvent::LevelComplete);
         }
         assert!(completed);
+    }
+    #[test]
+    fn process_object_updates_shootable_and_pickup_positions_then_invalidates_on_collection() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text =
+            "#proc1\n#action\nmove 2 0 256 0\n#end\n#links\nfloor 0 0 1\nshoot 2 0 1\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        let mut raw = [0u8; 4096];
+        raw[128] = 163;
+        let pose = ProcessObject {
+            cell: [2, 0],
+            position: [2.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.0,
+        };
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &raw,
+            &[pose],
+        )
+        .unwrap();
+        let definition = ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: -1,
+            bmp_z: 0,
+            action_code: 141,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "key.3o".into(),
+            animation_name: None,
+        };
+        let instance = ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index: 0,
+            grid_cell: [2, 0],
+            position: [2.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let definitions = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition],
+        };
+        session.game = GameInventory::new(
+            session.game.weapons.clone(),
+            std::slice::from_ref(&instance),
+            &definitions,
+            Difficulty::Normal,
+        );
+        session.set_objects(ObjectCombat::new(
+            &[instance],
+            &definitions,
+            &script,
+            Difficulty::Normal,
+        ));
+        let mut saw_effect = false;
+        for _ in 0..80 {
+            saw_effect |= session
+                .step(SessionInput::default())
+                .process_effects
+                .iter()
+                .any(|event| matches!(event, ProcessEffect::ObjectPose { cell: [2, 0], .. }));
+        }
+        assert!(saw_effect);
+        assert!((session.processes.object_pose([2, 0]).unwrap().position[0] - 3.5).abs() < 0.001);
+        assert!(session
+            .objects
+            .as_ref()
+            .unwrap()
+            .raycast([3.0, 0.5], [1.0, 0.0], 1.0, 0.0)
+            .is_some());
+        session.world.player.position = [3.5, 0.5];
+        let event = session.step(SessionInput::default());
+        assert_eq!(event.pickups.len(), 1);
+        assert!(session.game.inventory.keys[0]);
+        assert!(session.processes.object_pose([2, 0]).is_none());
+        assert_eq!(
+            session.objects.as_ref().unwrap().is_active([2, 0]),
+            Some(false)
+        );
+    }
+    #[test]
+    fn process_object_radius_blocks_player_until_removed() {
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let mut session = mission_session("");
+        let mut raw = [0u8; 4096];
+        raw[64] = 163;
+        let pose = ProcessObject {
+            cell: [1, 0],
+            position: [1.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.3,
+        };
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &Script::default(),
+            &session.world,
+            ProcessCapabilities::default(),
+            &raw,
+            &[pose],
+        )
+        .unwrap();
+        for _ in 0..120 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert!((session.world.player.position[0] - (1.5 - 0.3 - 0.18)).abs() < 0.002);
+        assert!(session.processes.remove_object([1, 0]));
+        for _ in 0..40 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert!(session.world.player.position[0] > 1.5);
+    }
+    #[test]
+    fn raised_objects_allow_clearance_but_low_objects_block() {
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let mut session = mission_session("");
+        let mut raw = [0u8; 4096];
+        raw[64] = 163;
+        let mut pose = ProcessObject {
+            cell: [1, 0],
+            position: [1.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 96.0,
+            blocking_radius: 0.3,
+        };
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &Script::default(),
+            &session.world,
+            ProcessCapabilities::default(),
+            &raw,
+            &[pose],
+        )
+        .unwrap();
+        for _ in 0..60 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert!(session.world.player.position[0] > 1.5);
+        session.world.player.position = [0.5, 0.5];
+        pose.elevation_raw = 32.0;
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &Script::default(),
+            &session.world,
+            ProcessCapabilities::default(),
+            &raw,
+            &[pose],
+        )
+        .unwrap();
+        for _ in 0..60 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert!((session.world.player.position[0] - 1.02).abs() < 0.002);
+    }
+    #[test]
+    fn player_can_escape_initial_wall_and_object_overlap() {
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.player.position = [0.9, 0.5];
+        session.world.walls.push(Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([1, 0]),
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        let mut raw = [0u8; 4096];
+        raw[128] = 163;
+        let pose = ProcessObject {
+            cell: [2, 0],
+            position: [0.9, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.3,
+        };
+        session.processes = ProcessRuntime::with_objects_and_hazards(
+            &Script::default(),
+            &session.world,
+            ProcessCapabilities::default(),
+            &raw,
+            &[pose],
+        )
+        .unwrap();
+        for _ in 0..20 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: -1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert!(session.world.player.position[0] < 0.3);
     }
     #[test]
     fn session_jump_and_restart_clone_preserve_vertical_state() {

@@ -121,6 +121,19 @@ fn load_wall_textures(
         })
         .collect()
 }
+/// Provisional circle for represented level objects. Collectibles remain
+/// nonblocking so their existing pickup overlap rules can collect them.
+fn process_blocking_radius(kind: objects::ObjectKind, action_code: i32, radius: i32) -> f32 {
+    // Pickups::new recognizes keys as collectible level objects; ordinary
+    // pickups use the separate Item kind.
+    let collectible = (141..=143).contains(&action_code);
+    if kind == objects::ObjectKind::LevelObject && !collectible {
+        (radius.max(0) as f32 / 256.0).min(2.0)
+    } else {
+        0.0
+    }
+}
+
 fn raw_cells(map: &Map) -> [u8; 4096] {
     std::array::from_fn(|index| {
         map.wall(index / MAP_SIDE, index % MAP_SIDE)
@@ -297,15 +310,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let script_data = resources.read(&format!("map/process.{id}"))?;
                 let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
                 let cells = raw_cells(&map);
-                let processes = process_runtime::ProcessRuntime::with_hazards(
-                    &script,
-                    &world,
-                    process_runtime::ProcessCapabilities {
-                        wall_elevation: true,
-                        initial_cell_types: None,
-                    },
-                    &cells,
-                );
                 let definitions =
                     objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
                 let mut object_scene =
@@ -315,6 +319,46 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let actor_state =
                     actors::ActorState::from_placements(&map.monsters, &actor_definitions);
                 object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
+                let instances = objects::instances(&map);
+                // Only opt in for visible, difficulty-enabled object placements
+                // with a representable render instance; other targets stay closed.
+                let process_objects: Vec<_> = instances
+                    .iter()
+                    .filter_map(|instance| {
+                        if instance.difficulty_flags & 2 == 0
+                            || !object_scene.has_cell(instance.grid_cell)
+                        {
+                            return None;
+                        }
+                        let definition = definitions.definition(instance)?;
+                        let x = u8::try_from(instance.grid_cell[0]).ok()?;
+                        let y = u8::try_from(instance.grid_cell[1]).ok()?;
+                        // GoRad shapes are provisionally approximated as circles;
+                        // pickups must remain nonblocking so they can be collected.
+                        let blocking_radius = process_blocking_radius(
+                            instance.kind,
+                            definition.action_code,
+                            definition.collision_radius,
+                        );
+                        Some(process_runtime::ProcessObject {
+                            cell: [x, y],
+                            position: instance.position,
+                            angle_radians: instance.angle_radians,
+                            elevation_raw: 0.0,
+                            blocking_radius,
+                        })
+                    })
+                    .collect();
+                let processes = process_runtime::ProcessRuntime::with_objects_and_hazards(
+                    &script,
+                    &world,
+                    process_runtime::ProcessCapabilities {
+                        wall_elevation: true,
+                        initial_cell_types: None,
+                    },
+                    &cells,
+                    &process_objects,
+                )?;
                 let info = resources.read("chasm.inf")?;
                 let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
                 let mut audio = audio::Audio::new(&mut resources, &info);
@@ -323,7 +367,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     weapon_render::WeaponRenderer::load(&mut resources, &info, &palette)?;
                 let mut game = openchasm::game::GameInventory::new(
                     weapons,
-                    &objects::instances(&map),
+                    &instances,
                     &definitions,
                     openchasm::pickups::Difficulty::Normal,
                 );
@@ -348,7 +392,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         difficulty: openchasm::pickups::Difficulty::Normal,
                     });
                 session.set_objects(openchasm::object_combat::ObjectCombat::new(
-                    &objects::instances(&map),
+                    &instances,
                     &definitions,
                     &script,
                     openchasm::pickups::Difficulty::Normal,
@@ -466,6 +510,27 @@ fn main() {
 #[cfg(test)]
 mod wall_graphics_tests {
     use super::*;
+    #[test]
+    fn process_object_collision_excludes_pickups_and_preserves_authored_radius() {
+        use objects::ObjectKind::{Item, LevelObject};
+        for code in [141, 142, 143] {
+            assert_eq!(
+                process_blocking_radius(LevelObject, code, 64),
+                0.0,
+                "{code}"
+            );
+        }
+        for code in [1, 10, 102, 120, 124, 128] {
+            assert_eq!(
+                process_blocking_radius(LevelObject, code, 64),
+                0.25,
+                "{code}"
+            );
+        }
+        assert_eq!(process_blocking_radius(Item, 0, 64), 0.0);
+        assert_eq!(process_blocking_radius(LevelObject, 0, 64), 0.25);
+        assert_eq!(process_blocking_radius(LevelObject, 0, -1), 0.0);
+    }
     #[test]
     fn campaign_sequence_stops_after_last_map() {
         assert_eq!(next_campaign_level("01").as_deref(), Some("02"));

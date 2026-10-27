@@ -128,6 +128,15 @@ pub enum ProcessObjectError {
     Invalid,
     DuplicateCell,
 }
+impl std::fmt::Display for ProcessObjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid => f.write_str("invalid scripted object pose or cell"),
+            Self::DuplicateCell => f.write_str("duplicate scripted object cell"),
+        }
+    }
+}
+impl std::error::Error for ProcessObjectError {}
 #[derive(Debug, Clone)]
 struct ObjectMotion {
     cell: [u8; 2],
@@ -993,6 +1002,11 @@ impl ProcessRuntime {
     /// processes fail closed and any active movement stops emitting effects.
     pub fn remove_object(&mut self, cell: [u8; 2]) -> bool {
         self.objects.remove(&cell).is_some()
+    }
+
+    /// Iterate currently available source-object poses in stable cell order.
+    pub fn objects(&self) -> impl Iterator<Item = &ProcessObject> {
+        self.objects.values()
     }
 
     /// Retrieve current process-owned pose by original stable cell.

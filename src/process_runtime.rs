@@ -1,6 +1,6 @@
 //! Experimental subset of level process behavior, independent of rendering.
 //!
-//! Supported: floor and nearby use links, `move`, `StartDelay`, `BackWait`,
+//! Supported: floor and nearby use links, wall `move` / `rotate`, `StartDelay`, `BackWait`,
 //! `Speed`, `waitout`, and initially locked/key-gated processes. Processes with other
 //! state-changing actions are disabled in full. Movement timing, use range, and
 //! behavior in the presence of blockers are placeholders, not verified
@@ -15,7 +15,93 @@ const MAP_UNITS_PER_TILE: f32 = 256.0;
 #[derive(Clone, Debug)]
 struct Motion {
     wall: usize,
-    displacement: [f32; 2],
+    kind: MotionKind,
+}
+#[derive(Clone, Debug)]
+enum MotionKind {
+    Translate([f32; 2]),
+    Rotate { pivot: [f32; 2], radians: f32 },
+}
+impl Motion {
+    fn transform(&self, point: [f32; 2], progress_delta: f32) -> [f32; 2] {
+        match self.kind {
+            MotionKind::Translate(displacement) => [
+                point[0] + displacement[0] * progress_delta,
+                point[1] + displacement[1] * progress_delta,
+            ],
+            MotionKind::Rotate { pivot, radians } => {
+                let (sin, cos) = (radians * progress_delta).sin_cos();
+                let x = point[0] - pivot[0];
+                let y = point[1] - pivot[1];
+                [pivot[0] + x * cos - y * sin, pivot[1] + x * sin + y * cos]
+            }
+        }
+    }
+    /// Upper bound on endpoint travel for the whole motion, used for timing
+    /// and sampling during obstruction checks.
+    fn travel_bound(&self, wall: &crate::world::Wall) -> f32 {
+        match self.kind {
+            MotionKind::Translate(d) => d[0].hypot(d[1]),
+            MotionKind::Rotate { pivot, radians } => {
+                let radius = [wall.a, wall.b]
+                    .iter()
+                    .map(|p| (p[0] - pivot[0]).hypot(p[1] - pivot[1]))
+                    .fold(0.0f32, f32::max);
+                radius * radians.abs()
+            }
+        }
+    }
+}
+
+fn distance_to_segment(point: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let length_sq = dx * dx + dy * dy;
+    let along = if length_sq < 1e-12 {
+        0.0
+    } else {
+        (((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / length_sq).clamp(0.0, 1.0)
+    };
+    (point[0] - (a[0] + along * dx)).hypot(point[1] - (a[1] + along * dy))
+}
+
+/// Check the swept wall against the player's preview collision circle. A short
+/// travel sampling interval bounds tunnelling; excessive deltas fail closed.
+fn obstructed(motions: &[Motion], world: &World, change: f32) -> bool {
+    const PLAYER_RADIUS: f32 = 0.18;
+    const SAMPLE_STEP: f32 = 0.04;
+    const MAX_SAMPLES: usize = 128;
+    if !world.player.position.iter().all(|value| value.is_finite()) {
+        return true;
+    }
+    for motion in motions {
+        let Some(wall) = world.walls.get(motion.wall) else {
+            return true;
+        };
+        if !wall.blocks_movement {
+            continue;
+        }
+        let travel = motion.travel_bound(wall) * change.abs();
+        if !travel.is_finite() || travel > SAMPLE_STEP * MAX_SAMPLES as f32 {
+            return true;
+        }
+        let count = ((travel / SAMPLE_STEP).ceil() as usize).max(1);
+        let mut previous = distance_to_segment(world.player.position, wall.a, wall.b);
+        for sample in 1..=count {
+            let fraction = change * sample as f32 / count as f32;
+            let distance = distance_to_segment(
+                world.player.position,
+                motion.transform(wall.a, fraction),
+                motion.transform(wall.b, fraction),
+            );
+            // Permit a wall already overlapping the player to move away.
+            if distance < PLAYER_RADIUS && distance < previous - 1e-5 {
+                return true;
+            }
+            previous = distance;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,7 +180,15 @@ impl RuntimeProcess {
                 }
                 continue;
             }
-            if action.name != "move" || action.arguments.len() != 4 {
+            let expected_arguments = match action.name.as_str() {
+                "move" => 4,
+                "rotate" => 5,
+                _ => {
+                    supported = false;
+                    break;
+                }
+            };
+            if action.arguments.len() != expected_arguments {
                 supported = false;
                 break;
             }
@@ -119,6 +213,25 @@ impl RuntimeProcess {
                 supported = false;
                 break;
             };
+            let kind = if action.name == "rotate" {
+                let Some(angle) = action.arguments.get(4).and_then(|s| s.parse::<i32>().ok())
+                else {
+                    supported = false;
+                    break;
+                };
+                MotionKind::Rotate {
+                    pivot: [
+                        dx as f32 / MAP_UNITS_PER_TILE,
+                        dy as f32 / MAP_UNITS_PER_TILE,
+                    ],
+                    radians: (angle as f32).to_radians(),
+                }
+            } else {
+                MotionKind::Translate([
+                    dx as f32 / MAP_UNITS_PER_TILE,
+                    dy as f32 / MAP_UNITS_PER_TILE,
+                ])
+            };
             let before = motions.len();
             for (index, _) in world
                 .walls
@@ -126,13 +239,19 @@ impl RuntimeProcess {
                 .enumerate()
                 .filter(|(_, wall)| wall.cell == Some([cell.0, cell.1]))
             {
+                // Two transformations targeting the same wall would require
+                // ordering semantics that have not been established.
+                if motions.iter().any(|motion: &Motion| motion.wall == index) {
+                    supported = false;
+                    break;
+                }
                 motions.push(Motion {
                     wall: index,
-                    displacement: [
-                        dx as f32 / MAP_UNITS_PER_TILE,
-                        dy as f32 / MAP_UNITS_PER_TILE,
-                    ],
+                    kind: kind.clone(),
                 });
+            }
+            if !supported {
+                break;
             }
             // Missing walls could be models or malformed references. Never
             // perform only the subset of a process that happened to resolve.
@@ -150,7 +269,7 @@ impl RuntimeProcess {
         let speed = property_float(process, "speed", 8.0).max(0.01) / 8.0;
         let max_distance = motions
             .iter()
-            .map(|m| m.displacement[0].hypot(m.displacement[1]))
+            .map(|m| m.travel_bound(&world.walls[m.wall]))
             .fold(0.0f32, f32::max);
         let locked = process.properties.iter().any(|cmd| cmd.name == "lock");
         let required_keys = ["redkey", "greenkey", "bluekey"]
@@ -240,16 +359,19 @@ impl RuntimeProcess {
         }
         let change = self.progress - previous;
         if change != 0.0 {
+            if obstructed(&self.motions, world, change) {
+                self.progress = previous;
+                self.phase = if change > 0.0 {
+                    Phase::Opening
+                } else {
+                    Phase::Closing
+                };
+                return;
+            }
             for motion in &self.motions {
                 if let Some(wall) = world.walls.get_mut(motion.wall) {
-                    let shift = [
-                        motion.displacement[0] * change,
-                        motion.displacement[1] * change,
-                    ];
-                    wall.a[0] += shift[0];
-                    wall.a[1] += shift[1];
-                    wall.b[0] += shift[0];
-                    wall.b[1] += shift[1];
+                    wall.a = motion.transform(wall.a, change);
+                    wall.b = motion.transform(wall.b, change);
                 }
             }
         }
@@ -429,13 +551,15 @@ mod tests {
         world.player.position = [1.2, 0.5];
         let mut runtime = ProcessRuntime::new(&script, &world);
         runtime.tick(&mut world, 1.0 / 60.0, true);
+        // Step away so the wall can move after the chosen link is activated.
+        world.player.position = [0.0, 2.0];
         tick_for(&mut runtime, &mut world, 2.1);
         assert!((world.walls[0].a[0] - 2.0).abs() < 0.001);
     }
     #[test]
     fn unsupported_or_missing_targets_disable_the_entire_process() {
         for action in [
-            "rotate 1 0 1 1",
+            "rotate 1 0 1 1", // missing angle
             "move 2 0 256 0",
             "move 1 0 128 0 s:2",
             "unknown 1 0",
@@ -448,6 +572,80 @@ mod tests {
             tick_for(&mut runtime, &mut world, 2.0);
             assert_eq!(world.walls[0].a[0], 1.0, "{action}");
         }
+    }
+    #[test]
+    fn rotates_wall_around_pivot_and_returns_to_initial_geometry() {
+        let script = Script::parse("#proc1\nSpeed 8\nBackWait 0.1\n#action\nrotate 1 0 256 0 90\n#end\n#links\nfloor 0 0 1\n#end\n");
+        let mut world = world();
+        world.player.position = [0.0, 0.9];
+        let original = world.walls[0];
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        tick_for(&mut runtime, &mut world, 1.6);
+        assert!((world.walls[0].a[0] - 1.0).abs() < 0.001);
+        assert!(
+            (world.walls[0].b[0] - 0.0).abs() < 0.02,
+            "{:?}",
+            world.walls[0]
+        );
+        assert!(world.walls[0].b[1].abs() < 0.02);
+        tick_for(&mut runtime, &mut world, 2.0);
+        assert!((world.walls[0].a[0] - original.a[0]).abs() < 0.001);
+        assert!((world.walls[0].b[0] - original.b[0]).abs() < 0.001);
+        assert!((world.walls[0].b[1] - original.b[1]).abs() < 0.001);
+    }
+    #[test]
+    fn a_rotating_wall_stops_before_overlapping_player() {
+        let script = Script::parse(
+            "#proc1\nSpeed 8\n#action\nrotate 1 0 256 0 90\n#end\n#links\nlink 1 0 1\n#end\n",
+        );
+        let mut world = world();
+        world.player.position = [0.5, 0.5];
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        runtime.tick(&mut world, 1.0 / 60.0, true);
+        tick_for(&mut runtime, &mut world, 3.0);
+        let wall = world.walls[0];
+        assert!(distance_to_segment(world.player.position, wall.a, wall.b) >= 0.18 - 0.001);
+        assert!(
+            wall.b[0] > 0.4,
+            "blocked before complete rotation: {wall:?}"
+        );
+        world.player.position = [0.0, 1.5];
+        tick_for(&mut runtime, &mut world, 2.0);
+        assert!(world.walls[0].b[0].abs() < 0.02);
+    }
+    #[test]
+    fn negative_rotation_turns_opposite_direction() {
+        let script = Script::parse(
+            "#proc1\n#action\nrotate 1 0 256 0 -90\n#end\n#links\nfloor 0 0 1\n#end\n",
+        );
+        let mut world = world();
+        world.player.position = [0.0, 0.9];
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        tick_for(&mut runtime, &mut world, 2.0);
+        assert!((world.walls[0].b[0] - 2.0).abs() < 0.02);
+        assert!(world.walls[0].b[1].abs() < 0.02);
+    }
+    #[test]
+    fn translating_door_stops_before_player() {
+        let script =
+            Script::parse("#proc1\n#action\nmove 1 0 -256 0\n#end\n#links\nfloor 0 0 1\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        tick_for(&mut runtime, &mut world, 2.0);
+        assert!(world.walls[0].a[0] >= world.player.position[0] + 0.18 - 0.001);
+        assert!(world.walls[0].a[0] < 0.7);
+        world.player.position = [2.0, 2.0];
+        tick_for(&mut runtime, &mut world, 2.0);
+        assert!(world.walls[0].a[0].abs() < 0.02);
+    }
+    #[test]
+    fn duplicate_target_actions_disable_process() {
+        let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\nrotate 1 0 256 0 90\n#end\n#links\nfloor 0 0 1\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        tick_for(&mut runtime, &mut world, 2.0);
+        assert_eq!(world.walls[0].a, [1.0, 0.0]);
+        assert_eq!(world.walls[0].b, [1.0, 1.0]);
     }
     #[test]
     fn required_key_allows_a_door_to_open() {

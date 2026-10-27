@@ -88,13 +88,16 @@ fn line_of_sight(from: [f32; 2], to: [f32; 2], walls: &[Wall]) -> bool {
     })
 }
 
-/// Conservative projectile obstruction until material-specific shooting flags
-/// are part of World: treat any ordinary, transparent, or invisible wall as an
-/// obstacle. Sight remains independent and can pass through transparent walls.
-fn shot_clear(from: [f32; 2], to: [f32; 2], walls: &[Wall]) -> bool {
+/// Sight remains independent of the material-specific projectile predicate.
+fn shot_clear(
+    from: [f32; 2],
+    to: [f32; 2],
+    walls: &[Wall],
+    blocks_shots: &dyn Fn(&Wall) -> bool,
+) -> bool {
     let ray = sub(to, from);
     !walls.iter().any(|wall| {
-        if !(1..=120).contains(&wall.texture) {
+        if !blocks_shots(wall) {
             return false;
         }
         let edge = sub(wall.b, wall.a);
@@ -224,7 +227,9 @@ impl EnemyAi {
         definitions: &ActorDefinitions,
         world: &World,
     ) -> Vec<EnemyAttack> {
-        self.tick_inner(actors, definitions, None, world)
+        self.tick_inner(actors, definitions, None, world, &|wall| {
+            (1..=120).contains(&wall.texture)
+        })
     }
 
     /// As `tick`, also emitting projectile launch events from each actor's
@@ -236,7 +241,20 @@ impl EnemyAi {
         rockets: &RocketDefinitions,
         world: &World,
     ) -> Vec<EnemyAttack> {
-        self.tick_inner(actors, definitions, Some(rockets), world)
+        self.tick_inner(actors, definitions, Some(rockets), world, &|wall| {
+            (1..=120).contains(&wall.texture)
+        })
+    }
+    /// Launch attacks using the level's material-specific shot collision rules.
+    pub fn tick_with_collision(
+        &mut self,
+        actors: &mut ActorState,
+        definitions: &ActorDefinitions,
+        rockets: &RocketDefinitions,
+        world: &World,
+        blocks_shots: &dyn Fn(&Wall) -> bool,
+    ) -> Vec<EnemyAttack> {
+        self.tick_inner(actors, definitions, Some(rockets), world, blocks_shots)
     }
 
     fn tick_inner(
@@ -245,6 +263,7 @@ impl EnemyAi {
         definitions: &ActorDefinitions,
         rockets: Option<&RocketDefinitions>,
         world: &World,
+        blocks_shots: &dyn Fn(&Wall) -> bool,
     ) -> Vec<EnemyAttack> {
         let mut attacks = Vec::new();
         let target = world.player.position;
@@ -306,7 +325,7 @@ impl EnemyAi {
                 }
                 continue;
             }
-            if sees_player && shot_clear(actor.position, target, &world.walls) {
+            if sees_player && shot_clear(actor.position, target, &world.walls, blocks_shots) {
                 let rocket = rockets.and_then(|table| {
                     usize::try_from(def.rocket)
                         .ok()
@@ -515,6 +534,20 @@ mod tests {
         let events = ai.tick_with_rockets(&mut state, &defs, &rockets(), &near);
         assert!(matches!(events[0].kind, EnemyAttackKind::Melee));
         assert_eq!(events[0].damage, 20);
+    }
+    #[test]
+    fn ranged_fire_respects_shot_passthrough_material() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].rocket = 1;
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let blocked = world([3.0, 0.0], vec![wall(87, true)]);
+        let events = ai.tick_with_collision(&mut state, &defs, &rockets(), &blocked, &|wall| {
+            wall.texture != 87
+        });
+        assert!(matches!(
+            events.first().map(|event| event.kind),
+            Some(EnemyAttackKind::Ranged { .. })
+        ));
     }
     #[test]
     fn difficulty_and_invalid_positions_do_not_activate_actors() {

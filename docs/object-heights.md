@@ -24,3 +24,13 @@ flat floor height, so a horizontal-radius-only check incorrectly rejects the
 first teleport landing. The client loads a catalog for every level-object definition and supplies it to the session. An installed-content regression exercises this teleport with the roof retained: the conservative path blocks the landing, while the loaded base bounds permit it. Unknown or invalid assets remain conservatively blocking.
 
 The client loader caches bounds by model path, follows the renderer's explicit 3O versus glTF-only selection, and rejects empty or invalid geometry. It derives bounds from the base pose, including each glTF node transform; replacement definitions are loaded as well so later type changes use their own bounds. If the session rejects the catalog's cell mapping, the preview retains conservative collision and reports the failure.
+
+When the catalog is enabled, shot queries filter each shootable object by its
+absolute model interval before selecting the nearest target. Player instant
+shots use eye height, enemy instant shots use the existing provisional 1-tile
+height, and physical shots use their stored height plus projectile radius.
+Live process elevation and replacement type are applied. Unknown model or pose
+metadata remains a blocking shot candidate. Blast targets use the same model
+interval; unknown heights conservatively span the supported vertical range.
+Without a catalog the legacy [0, 1] blast interval remains unchanged. Actor
+and player shot collision and physical-shot wall height are still provisional.

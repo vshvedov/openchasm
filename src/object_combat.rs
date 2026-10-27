@@ -196,6 +196,19 @@ impl ObjectCombat {
         max_distance: f32,
         radius: f32,
     ) -> Option<ObjectRayHit> {
+        self.raycast_filtered(origin, direction, max_distance, radius, |_, _| true)
+    }
+
+    /// Filter each candidate before selecting the nearest. The predicate sees
+    /// the object's cell and current raw type, including script replacements.
+    pub fn raycast_filtered(
+        &self,
+        origin: [f32; 2],
+        direction: [f32; 2],
+        max_distance: f32,
+        radius: f32,
+        accepts: impl Fn([usize; 2], u8) -> bool,
+    ) -> Option<ObjectRayHit> {
         if !origin.iter().chain(direction.iter()).all(|x| x.is_finite())
             || !max_distance.is_finite()
             || max_distance < 0.0
@@ -215,6 +228,7 @@ impl ObjectCombat {
                 || !target.difficulty_enabled
                 || !target.enabled
                 || target.destroyed
+                || !accepts(target.cell, target.raw_type)
                 || !target.position.iter().all(|v| v.is_finite())
             {
                 continue;
@@ -282,6 +296,14 @@ impl ObjectCombat {
 
     /// Active destructible blast targets; height is supplied by the host.
     pub fn explosion_targets(&self) -> impl Iterator<Item = ([usize; 2], [f32; 2], f32)> + '_ {
+        self.explosion_targets_with_types()
+            .map(|(cell, position, radius, _)| (cell, position, radius))
+    }
+
+    /// Active blast targets including their live replacement raw type.
+    pub fn explosion_targets_with_types(
+        &self,
+    ) -> impl Iterator<Item = ([usize; 2], [f32; 2], f32, u8)> + '_ {
         self.targets
             .iter()
             .filter(|target| {
@@ -291,7 +313,7 @@ impl ObjectCombat {
                     && target.enabled
                     && !target.destroyed
             })
-            .map(|target| (target.cell, target.position, target.radius))
+            .map(|target| (target.cell, target.position, target.radius, target.raw_type))
     }
 
     /// Return whether a tracked object can currently be hit. Untracked cells

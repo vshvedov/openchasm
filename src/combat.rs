@@ -135,6 +135,21 @@ pub fn enemy_hitscan<F>(
 where
     F: Fn(&Wall) -> bool,
 {
+    enemy_hitscan_filtered(origin, aim, shooter, context, blocks_shots, |_, _| true)
+}
+
+/// Variant that filters each object candidate before nearest-hit selection.
+pub fn enemy_hitscan_filtered<F>(
+    origin: [f32; 2],
+    aim: [f32; 2],
+    shooter: usize,
+    context: EnemyShotContext<'_>,
+    blocks_shots: F,
+    accepts_object: impl Fn([usize; 2], u8) -> bool,
+) -> Option<EnemyShotHit>
+where
+    F: Fn(&Wall) -> bool,
+{
     if !origin.iter().chain(aim.iter()).all(|v| v.is_finite()) {
         return None;
     }
@@ -170,10 +185,9 @@ where
             selected = Some(EnemyShotTarget::Wall { wall_index: index });
         }
     }
-    if let Some(hit) = context
-        .objects
-        .and_then(|objects| objects.raycast(origin, direction, nearest, 0.0))
-    {
+    if let Some(hit) = context.objects.and_then(|objects| {
+        objects.raycast_filtered(origin, direction, nearest, 0.0, accepts_object)
+    }) {
         if hit.distance < nearest {
             nearest = hit.distance;
             selected = Some(EnemyShotTarget::Object { cell: hit.cell });
@@ -349,6 +363,21 @@ impl Combat {
     where
         F: Fn(&Wall) -> bool,
     {
+        self.fire_with_explosions_filtered(weapon, context, blocks_shots, explosions, |_, _| true)
+    }
+
+    /// Variant filtering object candidates before nearest-hit selection.
+    pub fn fire_with_explosions_filtered<F>(
+        &mut self,
+        weapon: usize,
+        context: ShotContext<'_>,
+        blocks_shots: F,
+        explosions: bool,
+        accepts_object: impl Fn([usize; 2], u8) -> bool,
+    ) -> FireResult
+    where
+        F: Fn(&Wall) -> bool,
+    {
         let ShotContext {
             inventory,
             weapons,
@@ -409,9 +438,9 @@ impl Combat {
             .min_by(|a, b| a.0.total_cmp(&b.0));
         let mut nearest = wall_hit.map_or(MAX_RANGE, |(distance, _)| distance.min(MAX_RANGE));
         let mut selected = None;
-        let mut object_hit = objects
-            .as_deref()
-            .and_then(|objects| objects.raycast(player.position, direction, nearest, 0.0));
+        let mut object_hit = objects.as_deref().and_then(|objects| {
+            objects.raycast_filtered(player.position, direction, nearest, 0.0, accepts_object)
+        });
         if let Some(hit) = object_hit {
             nearest = hit.distance;
         }

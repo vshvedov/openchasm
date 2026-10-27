@@ -183,6 +183,48 @@ struct SessionObjectHeights {
     initial_raw_cells: Box<[u8; 4096]>,
 }
 
+/// Absolute model bounds for a combat target; missing/invalid pose or metadata
+/// is unknown and must not be treated as empty space.
+fn object_combat_bounds(
+    heights: Option<&SessionObjectHeights>,
+    processes: &ProcessRuntime,
+    cell: [usize; 2],
+    combat_raw: u8,
+) -> Option<(f32, f32)> {
+    let heights = heights?;
+    let cell = [u8::try_from(cell[0]).ok()?, u8::try_from(cell[1]).ok()?];
+    if cell[0] >= 64 || cell[1] >= 64 {
+        return None;
+    }
+    let object = processes.object_pose(cell)?;
+    let raw = processes.cell_type(cell).unwrap_or(combat_raw);
+    let bounds = heights.catalog.get(raw)?;
+    let elevation = object.elevation_raw / 64.0;
+    let bottom = bounds.bottom + elevation;
+    let top = bounds.top + elevation;
+    (bottom.is_finite()
+        && top.is_finite()
+        && bottom <= top
+        && bottom.abs() <= 4096.0
+        && top.abs() <= 4096.0)
+        .then_some((bottom, top))
+}
+
+fn object_combat_overlaps(
+    heights: Option<&SessionObjectHeights>,
+    processes: &ProcessRuntime,
+    cell: [usize; 2],
+    raw: u8,
+    bottom: f32,
+    top: f32,
+) -> bool {
+    if !bottom.is_finite() || !top.is_finite() || bottom > top {
+        return true;
+    }
+    object_combat_bounds(heights, processes, cell, raw)
+        .is_none_or(|(object_bottom, object_top)| top >= object_bottom && bottom <= object_top)
+}
+
 fn object_blocks_height(
     heights: Option<&SessionObjectHeights>,
     processes: &ProcessRuntime,
@@ -552,7 +594,7 @@ impl Session {
         events: &mut SessionEvents,
         attempts: &mut Vec<ProcessEvent>,
     ) {
-        let hit = combat::enemy_hitscan(
+        let hit = combat::enemy_hitscan_filtered(
             origin,
             target,
             attack.source_index,
@@ -563,6 +605,16 @@ impl Session {
                 objects: self.objects.as_ref(),
             },
             |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
+            |cell, raw| {
+                object_combat_overlaps(
+                    self.object_heights.as_ref(),
+                    &self.processes,
+                    cell,
+                    raw,
+                    1.0,
+                    1.0,
+                )
+            },
         );
         let before = hit.and_then(|hit| {
             matches!(
@@ -693,17 +745,30 @@ impl Session {
             })
         }));
         if let Some(objects) = &self.objects {
-            targets.extend(objects.explosion_targets().map(|(cell, center, radius)| {
-                ExplosionTarget {
-                    id: TargetId::Object { cell },
-                    cylinder: Cylinder {
-                        center,
-                        radius,
-                        bottom: 0.0,
-                        top: 1.0,
-                    },
-                }
-            }));
+            targets.extend(objects.explosion_targets_with_types().map(
+                |(cell, center, radius, raw)| {
+                    let (bottom, top) = object_combat_bounds(
+                        self.object_heights.as_ref(),
+                        &self.processes,
+                        cell,
+                        raw,
+                    )
+                    .unwrap_or(if self.object_heights.is_some() {
+                        (-4096.0, 4096.0)
+                    } else {
+                        (0.0, 1.0)
+                    });
+                    ExplosionTarget {
+                        id: TargetId::Object { cell },
+                        cylinder: Cylinder {
+                            center,
+                            radius,
+                            bottom,
+                            top,
+                        },
+                    }
+                },
+            ));
         }
         let Ok(damage) = explosives::resolve_explosion(explosion, &targets) else {
             return false;
@@ -1349,7 +1414,7 @@ impl Session {
                     self.world.player.position,
                 )
             } else {
-                self.combat.fire_with_explosions(
+                self.combat.fire_with_explosions_filtered(
                     self.selected_weapon,
                     ShotContext {
                         inventory: &mut self.game.inventory,
@@ -1369,6 +1434,16 @@ impl Session {
                         )
                     },
                     self.explosions_enabled,
+                    |cell, raw| {
+                        object_combat_overlaps(
+                            self.object_heights.as_ref(),
+                            &self.processes,
+                            cell,
+                            raw,
+                            self.vertical.eye(),
+                            self.vertical.eye(),
+                        )
+                    },
                 )
             };
             if matches!(shot, FireResult::Fired(ShotImpact::MinePlaced)) {
@@ -1565,7 +1640,7 @@ impl Session {
         let mut elapsed = 0.0_f32;
         loop {
             let remaining = (DT - elapsed).max(0.0);
-            let candidate = self.projectiles.trace_next(
+            let candidate = self.projectiles.trace_next_filtered(
                 remaining,
                 crate::projectiles::TraceContext {
                     world: &self.world,
@@ -1575,6 +1650,21 @@ impl Session {
                 },
                 |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
                 &frozen,
+                |projectile, cell, raw| {
+                    let height = self
+                        .projectile_heights
+                        .get(&projectile.id)
+                        .copied()
+                        .unwrap_or(0.75);
+                    object_combat_overlaps(
+                        self.object_heights.as_ref(),
+                        &self.processes,
+                        cell,
+                        raw,
+                        height - projectile.radius,
+                        height + projectile.radius,
+                    )
+                },
             );
             let Some(mut impact) = candidate else {
                 self.projectiles.advance_traced(remaining, &frozen);
@@ -1880,6 +1970,256 @@ mod tests {
         session
     }
 
+    fn height_combat_fixture() -> Session {
+        use crate::object_heights::{HeightBounds, ObjectHeightCatalog};
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let mut session = mission_session("");
+        let def = |name: &str| ObjectDefinition {
+            collision_radius: 40,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 1,
+            break_limit: 100,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![def("roof.3o"), def("floor.3o")],
+        };
+        let instance = |x, index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index: index,
+            grid_cell: [x, 0],
+            position: [x as f32 + 0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 7,
+            extra: 0,
+            size: 0,
+        };
+        let instances = [instance(2, 0), instance(3, 1)];
+        let mut cells = [0; 4096];
+        cells[2 * 64] = 163;
+        cells[3 * 64] = 164;
+        let poses = instances.clone().map(|i| ProcessObject {
+            cell: [i.grid_cell[0] as u8, 0],
+            position: i.position,
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.0,
+        });
+        let script = Script::default();
+        session.processes = ProcessRuntime::with_wind(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        let mut catalog = ObjectHeightCatalog::new();
+        assert!(catalog.set(163, HeightBounds::new(2.0, 3.0).unwrap()));
+        assert!(catalog.set(164, HeightBounds::new(0.0, 1.0).unwrap()));
+        assert!(session.set_object_heights(catalog, cells));
+        session.rockets = RocketDefinitions(vec![
+            RocketDefinition {
+                model_name: "".into(),
+                power: 10,
+                raw_fields: vec![0, 0, 0, 0, 10],
+            },
+            RocketDefinition {
+                model_name: "rocket.3o".into(),
+                power: 10,
+                raw_fields: vec![0, 0, 0, 1, 10],
+            },
+        ]);
+        session.game.inventory.weapons[0] = true;
+        session.game.inventory.ammo[0] = 5;
+        session
+    }
+
+    #[test]
+    fn shot_and_projectile_skip_overhead_object_before_nearest_selection() {
+        let mut instant = height_combat_fixture();
+        let shot = instant.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            shot.shot,
+            Some(FireResult::Fired(ShotImpact::Object { cell: [3, 0], .. }))
+        ));
+        let mut physical = height_combat_fixture();
+        let id = physical
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Player,
+                    rocket_id: 1,
+                    origin: [0.5, 0.5],
+                    direction: [1.0, 0.0],
+                },
+                &physical.rockets,
+            )
+            .unwrap();
+        physical.projectile_heights.insert(id, 0.75);
+        let mut hit = None;
+        for _ in 0..30 {
+            let events = physical.step(SessionInput::default());
+            if let Some(impact) = events.projectile_impacts.first() {
+                hit = Some(impact.target);
+                break;
+            }
+        }
+        assert_eq!(hit, Some(ImpactTarget::Object { cell: [3, 0] }));
+        let mut high = height_combat_fixture();
+        let id = high
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Player,
+                    rocket_id: 1,
+                    origin: [0.5, 0.5],
+                    direction: [1.0, 0.0],
+                },
+                &high.rockets,
+            )
+            .unwrap();
+        high.projectile_heights.insert(id, 2.5);
+        let mut hit = None;
+        for _ in 0..30 {
+            let events = high.step(SessionInput::default());
+            if let Some(impact) = events.projectile_impacts.first() {
+                hit = Some(impact.target);
+                break;
+            }
+        }
+        assert_eq!(hit, Some(ImpactTarget::Object { cell: [2, 0] }));
+        let mut unknown = height_combat_fixture();
+        unknown.object_heights.as_mut().unwrap().catalog =
+            crate::object_heights::ObjectHeightCatalog::new();
+        let shot = unknown.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            shot.shot,
+            Some(FireResult::Fired(ShotImpact::Object { cell: [2, 0], .. }))
+        ));
+    }
+
+    #[test]
+    fn object_blast_uses_model_bounds_and_unknown_is_conservative() {
+        let mut session = height_combat_fixture();
+        let explosion = Explosion {
+            owner: Owner::Player,
+            center: [2.5, 0.5, 0.75],
+            radius: 0.5,
+            damage: 100,
+        };
+        let mut events = SessionEvents::default();
+        assert!(session.apply_explosion(
+            explosion,
+            ExplosionOrigin::Projectile {
+                projectile_id: 1,
+                rocket_id: 1
+            },
+            None,
+            &mut events,
+            &mut Vec::new()
+        ));
+        assert!(!events
+            .explosion_damage
+            .iter()
+            .any(|item| item.target == TargetId::Object { cell: [2, 0] }));
+        let mut high = height_combat_fixture();
+        let mut high_events = SessionEvents::default();
+        let high_blast = Explosion {
+            center: [2.5, 0.5, 2.5],
+            ..explosion
+        };
+        assert!(high.apply_explosion(
+            high_blast,
+            ExplosionOrigin::Projectile {
+                projectile_id: 2,
+                rocket_id: 1
+            },
+            None,
+            &mut high_events,
+            &mut Vec::new()
+        ));
+        assert!(high_events
+            .explosion_damage
+            .iter()
+            .any(|item| item.target == TargetId::Object { cell: [2, 0] }));
+        let mut unknown = height_combat_fixture();
+        unknown.object_heights.as_mut().unwrap().catalog =
+            crate::object_heights::ObjectHeightCatalog::new();
+        let mut events = SessionEvents::default();
+        assert!(unknown.apply_explosion(
+            explosion,
+            ExplosionOrigin::Projectile {
+                projectile_id: 1,
+                rocket_id: 1
+            },
+            None,
+            &mut events,
+            &mut Vec::new()
+        ));
+        assert!(events
+            .explosion_damage
+            .iter()
+            .any(|item| item.target == TargetId::Object { cell: [2, 0] }));
+    }
+
+    #[test]
+    fn enemy_hitscan_skips_overhead_objects() {
+        use crate::object_heights::HeightBounds;
+        let mut session = height_combat_fixture();
+        session
+            .object_heights
+            .as_mut()
+            .unwrap()
+            .catalog
+            .set(164, HeightBounds::new(2.0, 3.0).unwrap());
+        let attack = EnemyAttack {
+            source_index: 42,
+            damage: 20,
+            kind: EnemyAttackKind::Ranged {
+                rocket_id: 0,
+                instant: true,
+                origin: [4.5, 0.5],
+                target: [0.5, 0.5],
+            },
+        };
+        let mut events = SessionEvents::default();
+        session.resolve_enemy_instant(
+            attack,
+            0,
+            [4.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            events.enemy_hits[0].hit.unwrap().target,
+            EnemyShotTarget::Player
+        );
+        assert!(session.game.inventory.health < 100);
+    }
+
     fn addon_boss_fixture(script: &str, raw_id: u16, rocket: usize, reflected: bool) -> Session {
         let mut session = mission_session(script);
         session.actor_definitions.entries.push(ActorDefinition {
@@ -2073,8 +2413,24 @@ mod tests {
             0.9,
             0.9
         ));
+        assert_eq!(
+            object_combat_bounds(Some(&heights), &runtime, [2, 0], 165),
+            Some((2.0, 4.0))
+        );
         let mut moved = roof;
         moved.elevation_raw = -128.0;
+        let moved_runtime = ProcessRuntime::with_wind(
+            &Script::parse(text),
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[moved],
+        )
+        .unwrap();
+        assert_eq!(
+            object_combat_bounds(Some(&heights), &moved_runtime, [2, 0], 165),
+            Some((0.0, 2.0))
+        );
         assert!(object_blocks_height(
             Some(&heights),
             &runtime,
@@ -2090,6 +2446,10 @@ mod tests {
         let mut world = world;
         runtime.tick(&mut world, 1.0 / 60.0, false);
         assert_eq!(runtime.cell_type([2, 0]), Some(166));
+        assert_eq!(
+            object_combat_bounds(Some(&heights), &runtime, [2, 0], 165),
+            Some((0.0, 1.0))
+        );
         assert!(object_blocks_height(
             Some(&heights),
             &runtime,

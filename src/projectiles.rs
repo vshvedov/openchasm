@@ -205,6 +205,21 @@ impl ProjectileSystem {
     where
         F: Fn(&Wall) -> bool,
     {
+        self.trace_next_filtered(horizon, context, blocks_shots, frozen, |_, _, _| true)
+    }
+
+    /// Height-aware hosts filter each object candidate per projectile.
+    pub fn trace_next_filtered<F>(
+        &self,
+        horizon: f32,
+        context: TraceContext<'_>,
+        blocks_shots: F,
+        frozen: &BTreeSet<u64>,
+        accepts_object: impl Fn(&Projectile, [usize; 2], u8) -> bool,
+    ) -> Option<Impact>
+    where
+        F: Fn(&Wall) -> bool,
+    {
         if !horizon.is_finite() || horizon < 0.0 {
             return None;
         }
@@ -220,14 +235,7 @@ impl ProjectileSystem {
             horizon
         };
         probe
-            .tick_with_objects(
-                probe_horizon,
-                context.world,
-                context.actors,
-                context.definitions,
-                context.objects,
-                blocks_shots,
-            )
+            .tick_with_objects_filtered(probe_horizon, context, blocks_shots, accepts_object)
             .into_iter()
             .find(|impact| horizon > 0.0 || impact.time == 0.0)
     }
@@ -425,6 +433,35 @@ impl ProjectileSystem {
     where
         F: Fn(&Wall) -> bool,
     {
+        self.tick_with_objects_filtered(
+            dt,
+            TraceContext {
+                world,
+                actors,
+                definitions,
+                objects,
+            },
+            blocks_shots,
+            |_, _, _| true,
+        )
+    }
+
+    fn tick_with_objects_filtered<F>(
+        &mut self,
+        dt: f32,
+        context: TraceContext<'_>,
+        blocks_shots: F,
+        accepts_object: impl Fn(&Projectile, [usize; 2], u8) -> bool,
+    ) -> Vec<Impact>
+    where
+        F: Fn(&Wall) -> bool,
+    {
+        let TraceContext {
+            world,
+            actors,
+            definitions,
+            objects,
+        } = context;
         if !dt.is_finite() || dt <= 0.0 {
             return Vec::new();
         }
@@ -441,7 +478,7 @@ impl ProjectileSystem {
                 }
             }
             let length = delta[0].hypot(delta[1]);
-            if let Some(hit) = objects.and_then(|objects| objects.raycast(origin, projectile.velocity, length, projectile.radius)) {
+            if let Some(hit) = objects.and_then(|objects| objects.raycast_filtered(origin, projectile.velocity, length, projectile.radius, |cell, raw| accepts_object(projectile, cell, raw))) {
                 let t = if length > 1e-8 { hit.distance / length } else { 0.0 };
                 if nearest.is_none_or(|(best, _)| t < best) { nearest = Some((t, ImpactTarget::Object { cell: hit.cell })); }
             }

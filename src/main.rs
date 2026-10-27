@@ -440,6 +440,7 @@ fn play(
         let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
         let mut audio = audio::Audio::new(resources, &info);
         audio.play_level_music(resources, &resource);
+        audio.load_ambient(resources, &resource);
         let weapon_overlay = weapon_render::WeaponRenderer::load(resources, &info, &palette)?;
         let mut game =
             openchasm::game::GameInventory::new(weapons, &instances, &definitions, difficulty);

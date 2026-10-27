@@ -8,6 +8,9 @@
 //! provisional distance-based volume; other sounds are non-spatial. Authored
 //! volume metadata and original spatialization are not yet implemented.
 //! Player damage uses the first monster definition's documented pain/death WAVs.
+//! Ambient cell ID zero is provisionally silent, as in PanzerChasm; the
+//! remaster's behavior is unverified. Loops crossfade over 0.5 simulation
+//! seconds at authored volume / 128. Random `b:` cues are not implemented.
 use crate::content::ResourceSet;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::collections::BTreeMap;
@@ -215,6 +218,83 @@ pub struct Audio {
     player_sounds: [Option<Arc<[u8]>>; 3],
     music: Option<Player>,
     one_shots: Vec<Player>,
+    ambient_samples: [Option<AmbientSample>; 32],
+    ambient: AmbientPlayback,
+}
+
+struct AmbientSample {
+    bytes: Arc<[u8]>,
+    volume: f32,
+}
+
+struct AmbientVoice {
+    player: Player,
+    gain: f32,
+    volume: f32,
+}
+
+#[derive(Default)]
+struct AmbientPlayback {
+    selected: Option<u8>,
+    current: Option<AmbientVoice>,
+    outgoing: Option<AmbientVoice>,
+}
+
+impl AmbientPlayback {
+    fn update(
+        &mut self,
+        selected: Option<u8>,
+        dt: f32,
+        create: impl FnOnce(u8) -> Option<AmbientVoice>,
+    ) {
+        if selected != self.selected {
+            // Bound the number of voices even when crossing many cells quickly.
+            if let Some(outgoing) = self.outgoing.take() {
+                outgoing.player.stop();
+            }
+            self.outgoing = self.current.take();
+            self.current = selected.and_then(create);
+            self.selected = selected;
+        }
+        let increment = if dt.is_finite() {
+            dt.clamp(0.0, 0.5) * 2.0
+        } else {
+            0.0
+        };
+        if let Some(voice) = &mut self.current {
+            voice.gain = (voice.gain + increment).min(1.0);
+            voice.player.set_volume(voice.gain * voice.volume);
+        }
+        if let Some(voice) = &mut self.outgoing {
+            voice.gain = (voice.gain - increment).max(0.0);
+            voice.player.set_volume(voice.gain * voice.volume);
+            if voice.gain == 0.0 {
+                voice.player.stop();
+                self.outgoing = None;
+            }
+        }
+    }
+    fn clear(&mut self) {
+        if let Some(voice) = self.current.take() {
+            voice.player.stop();
+        }
+        if let Some(voice) = self.outgoing.take() {
+            voice.player.stop();
+        }
+        self.selected = None;
+    }
+}
+
+fn ambient_id(grid: Option<&openchasm::ambient::AmbientGrid>, position: [f32; 2]) -> Option<u8> {
+    if !position
+        .iter()
+        .all(|v| v.is_finite() && *v >= 0.0 && *v < 64.0)
+    {
+        return None;
+    }
+    grid?
+        .cell(position.map(|v| v as u8))
+        .filter(|id| *id != 0 && *id < 32)
 }
 const MAX_ONE_SHOTS: usize = 64;
 
@@ -295,6 +375,8 @@ impl Audio {
             player_sounds,
             music: None,
             one_shots: Vec::new(),
+            ambient_samples: std::array::from_fn(|_| None),
+            ambient: AmbientPlayback::default(),
         }
     }
     /// Play one committed player pain/death cue. A missing pain variant falls
@@ -378,11 +460,149 @@ impl Audio {
             player.stop();
         }
     }
+
+    /// Preload valid level loops; unavailable or malformed assets remain silent.
+    pub fn load_ambient(&mut self, resources: &mut ResourceSet, level_resource: &[u8]) {
+        self.ambient.clear();
+        self.ambient_samples = std::array::from_fn(|_| None);
+        let definitions =
+            match openchasm::ambient_definitions::AmbientDefinitions::parse(level_resource) {
+                Ok(definitions) => definitions,
+                Err(error) => {
+                    eprintln!("ambient audio unavailable: {error}");
+                    return;
+                }
+            };
+        let paths: BTreeMap<String, String> = resources
+            .names()
+            .filter(|name| name.starts_with("sound/"))
+            .map(|name| (name.to_ascii_lowercase(), name.to_owned()))
+            .collect();
+        let mut total = 0usize;
+        for (id, definition) in definitions.entries.iter().enumerate().skip(1) {
+            let Some(definition) = definition else {
+                continue;
+            };
+            let Some(path) = definition
+                .resource_path()
+                .and_then(|path| paths.get(&path.to_ascii_lowercase()))
+            else {
+                continue;
+            };
+            let Ok(bytes) = resources.read(path) else {
+                continue;
+            };
+            if bytes.len() > 2 * 1024 * 1024 || total + bytes.len() > 32 * 1024 * 1024 {
+                continue;
+            }
+            let bytes: Arc<[u8]> = Arc::from(bytes);
+            if rodio::Decoder::try_from(Cursor::new(Arc::clone(&bytes))).is_err() {
+                continue;
+            }
+            total += bytes.len();
+            self.ambient_samples[id] = Some(AmbientSample {
+                bytes,
+                volume: f32::from(definition.volume) / 128.0,
+            });
+        }
+    }
+
+    /// Synchronize to the authoritative listener cell and advance the fade.
+    pub fn update_ambient(
+        &mut self,
+        grid: Option<&openchasm::ambient::AmbientGrid>,
+        position: [f32; 2],
+        dt: f32,
+    ) {
+        let selected =
+            ambient_id(grid, position).filter(|id| self.ambient_samples[*id as usize].is_some());
+        let sink = &self.sink;
+        let samples = &self.ambient_samples;
+        self.ambient.update(selected, dt, |id| {
+            let sink = sink.as_ref()?;
+            let sample = samples[id as usize].as_ref()?;
+            let source = rodio::Decoder::try_from(Cursor::new(Arc::clone(&sample.bytes))).ok()?;
+            let player = Player::connect_new(sink.mixer());
+            player.set_volume(0.0);
+            player.append(source.repeat_infinite());
+            Some(AmbientVoice {
+                player,
+                gain: 0.0,
+                volume: sample.volume,
+            })
+        });
+    }
+
+    /// Discard loops from a replaced timeline; music is independent.
+    pub fn reset_ambient(&mut self) {
+        self.ambient.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ambient_grid_selection_and_bounded_crossfade() {
+        let mut bytes = vec![0; 0x27005];
+        bytes[0x26001 + 2 * 64 + 3] = 7;
+        let map = openchasm::map::Map::parse(&bytes).unwrap();
+        let grid = openchasm::ambient::AmbientGrid::from_map(&map);
+        assert_eq!(ambient_id(Some(&grid), [2.9, 3.1]), Some(7));
+        assert_eq!(ambient_id(Some(&grid), [3.0, 2.0]), None);
+        assert_eq!(ambient_id(Some(&grid), [f32::NAN, 0.0]), None);
+        assert_eq!(ambient_id(Some(&grid), [64.0, 0.0]), None);
+        let make_voice = |_| {
+            let (player, _output) = Player::new();
+            Some(AmbientVoice {
+                player,
+                gain: 0.0,
+                volume: 0.5,
+            })
+        };
+        let mut playback = AmbientPlayback::default();
+        playback.update(Some(7), 0.25, make_voice);
+        assert_eq!(playback.current.as_ref().unwrap().gain, 0.5);
+        playback.update(Some(7), 0.25, |_| panic!("same ID must not restart"));
+        assert_eq!(playback.current.as_ref().unwrap().gain, 1.0);
+        playback.update(Some(8), 0.25, make_voice);
+        assert_eq!(playback.current.as_ref().unwrap().gain, 0.5);
+        assert_eq!(playback.outgoing.as_ref().unwrap().gain, 0.5);
+        playback.update(None, 0.5, make_voice);
+        assert!(playback.current.is_none() && playback.outgoing.is_none());
+        playback.update(Some(7), 0.25, make_voice);
+        playback.clear();
+        assert!(playback.current.is_none() && playback.outgoing.is_none());
+        assert_eq!(playback.selected, None);
+    }
+    #[test]
+    fn installed_ambient_loops_load_when_content_is_available() {
+        let path = std::path::Path::new("assets/csm.bin");
+        if !path.exists() {
+            return;
+        }
+        let mut resources = ResourceSet::open(path).unwrap();
+        let mut audio = Audio {
+            sink: None,
+            sounds: BTreeMap::new(),
+            enemy_sounds: Vec::new(),
+            player_sounds: [None, None, None],
+            music: None,
+            one_shots: Vec::new(),
+            ambient_samples: std::array::from_fn(|_| None),
+            ambient: AmbientPlayback::default(),
+        };
+        let mut loaded = 0;
+        for level in 1..=19 {
+            let resource = resources.read(&format!("map/resource.{level:02}")).unwrap();
+            audio.load_ambient(&mut resources, &resource);
+            loaded += audio.ambient_samples.iter().flatten().count();
+        }
+        assert!(
+            loaded > 0,
+            "installed levels should have playable ambient samples"
+        );
+    }
     #[test]
     fn one_shots_are_bounded_and_reset_does_not_stop_music() {
         use rodio::buffer::SamplesBuffer;
@@ -405,6 +625,8 @@ mod tests {
             player_sounds: [None, None, None],
             music: Some(music),
             one_shots: Vec::new(),
+            ambient_samples: std::array::from_fn(|_| None),
+            ambient: AmbientPlayback::default(),
         };
         let mut outputs = Vec::new();
         for _ in 0..=MAX_ONE_SHOTS {

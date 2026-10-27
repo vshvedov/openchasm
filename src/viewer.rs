@@ -753,6 +753,7 @@ pub fn run(
         }
         if restart_requested {
             audio.stop_one_shots();
+            audio.reset_ambient();
             session = initial_session.clone();
             if let Some(renderer) = &mut explosion_renderer {
                 renderer.clear();
@@ -799,6 +800,7 @@ pub fn run(
                     if let Some(saved) = &quicksave {
                         if objects.restore(&saved.scene) {
                             audio.stop_one_shots();
+                            audio.reset_ambient();
                             session = saved.session.clone();
                             animation_tick = saved.animation_tick;
                             weapon_clock = saved.weapon_clock;
@@ -855,6 +857,7 @@ pub fn run(
                 fire: firing,
                 select_weapon: pending_weapon,
             });
+            audio.update_ambient(session.ambient_grid(), session.world.player.position, STEP);
             pending_interact = false;
             pending_jump = false;
             pending_weapon = None;
@@ -1014,6 +1017,8 @@ pub fn run(
             sync_actor_scene(&mut objects, &session, STEP, &mut warned_actor_clips);
             accumulator -= STEP;
         }
+        // Initialize or resynchronize even when no simulation tick ran.
+        audio.update_ambient(session.ambient_grid(), session.world.player.position, 0.0);
         let quake_power = session
             .scripted_objects
             .as_ref()

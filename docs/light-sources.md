@@ -1,0 +1,9 @@
+# Process light sources
+
+`SourceLight::parse` reads five `source` arguments. The remaster's activation code converts an X or Y value below 64 to the center of that map cell (`value * 256 + 128` raw units); values at least 64 are already 8.8 map units. Radius is converted to 8.8 units as `radius * 64`, or one quarter tile per authored unit. Brightness and the startup delay remain raw values. The parser conservatively accepts in-map coordinates, nonnegative signed-16-bit delay, brightness 0–255, and a radius that fits the remaster's signed 16-bit raw field.
+
+`LightSources` tracks ordered sources per process and elapsed 60 Hz ticks. The host activates or deactivates sources according to the process lifecycle; it must stage the full process transaction before activation, and synchronize any presentation and networking. Snapshot/restore validates each complete set before mutation. The module does not generate lightmaps or apply rendering, collision, or AI effects.
+
+The remaster's opcode-16 initialization at `0x14014b5be` and subsequent update at `0x14014c32d` provide the coordinate and radius conversion and show an initial blinking delay before the final brightness. This module preserves elapsed ticks and the authored delay but does not reproduce the blinking pattern. PanzerChasm removes sources at procedure deactivation; the host lifecycle remains provisional pending further remaster verification. These commands are not `light` commands: the separate object-attached rotating light has different parameters and can rotate the object itself.
+
+Installed examples include level 14 `source 29 29 5 28 160` and level 12 `source 10240 8192 9 32 10`. Level 12 process 32 also changes an object and starts a death zone, so treating `source` as an ignored no-op would discard visible authored behavior while enabling unrelated gameplay effects.

@@ -86,6 +86,37 @@ fn nearest_on_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
         .clamp(0.0, 1.0);
     [a[0] + d[0] * t, a[1] + d[1] * t]
 }
+fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let nearest = if a == b {
+        a
+    } else {
+        nearest_on_segment(p, a, b)
+    };
+    (p[0] - nearest[0]).hypot(p[1] - nearest[1])
+}
+
+// Distance to the parallelogram swept by a translated segment. Degenerate
+// parallel translations are covered by its boundary segments.
+fn swept_wall_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2], d: [f32; 2]) -> f32 {
+    let points = [a, b, [b[0] + d[0], b[1] + d[1]], [a[0] + d[0], a[1] + d[1]]];
+    let area = (b[0] - a[0]) * d[1] - (b[1] - a[1]) * d[0];
+    let mut positive = false;
+    let mut negative = false;
+    let mut distance = f32::INFINITY;
+    for i in 0..4 {
+        let x = points[i];
+        let y = points[(i + 1) % 4];
+        let cross = (y[0] - x[0]) * (p[1] - x[1]) - (y[1] - x[1]) * (p[0] - x[0]);
+        positive |= cross > 0.0;
+        negative |= cross < 0.0;
+        distance = distance.min(segment_distance(p, x, y));
+    }
+    if area != 0.0 && !(positive && negative) {
+        0.0
+    } else {
+        distance
+    }
+}
 
 /// Resolve simultaneous translations in stable mover/entity order. All movers
 /// advance together in increments at most 1/64 tile. Circle obstacles describe
@@ -221,6 +252,39 @@ pub fn propose(
                 ];
                 let distance = diff[0].hypot(diff[1]);
                 if distance >= combined_radius {
+                    // A grazing contact can begin and end between samples.
+                    // Refuse that motion instead of silently tunnelling; its
+                    // exact push response requires a continuous-time solver.
+                    let d = [mover.delta[0] / steps as f32, mover.delta[1] / steps as f32];
+                    let (start_distance, swept_distance) = match mover.mover {
+                        MoverId::Wall(i) => {
+                            let wall = staged_world.walls[i];
+                            let a = [wall.a[0] - d[0], wall.a[1] - d[1]];
+                            let b = [wall.b[0] - d[0], wall.b[1] - d[1]];
+                            (
+                                segment_distance(entity.position, a, b),
+                                swept_wall_distance(entity.position, a, b, d),
+                            )
+                        }
+                        MoverId::Circle(i) => {
+                            let end = staged_circles[i].center;
+                            let start = [end[0] - d[0], end[1] - d[1]];
+                            (
+                                (entity.position[0] - start[0])
+                                    .hypot(entity.position[1] - start[1]),
+                                segment_distance(entity.position, start, end),
+                            )
+                        }
+                    };
+                    if start_distance >= combined_radius && swept_distance < combined_radius {
+                        return Ok(MotionProposal::Blocked {
+                            mover: mover.mover,
+                            entity: entity.id,
+                        });
+                    }
+                    continue;
+                }
+                if mover.delta == [0.0, 0.0] {
                     continue;
                 }
                 let direction = if distance > 1e-7 {
@@ -235,6 +299,11 @@ pub fn propose(
                     }
                     [mover.delta[0] / length, mover.delta[1] / length]
                 };
+                // Initial overlap can be a legitimate transient. A stationary
+                // or receding mover must not eject the entity or report a pin.
+                if mover.delta[0] * direction[0] + mover.delta[1] * direction[1] <= 0.0 {
+                    continue;
+                }
                 let push = combined_radius - distance + EPSILON;
                 let wanted = [direction[0] * push, direction[1] * push];
                 let mut collision_world = staged_world.clone();
@@ -341,6 +410,69 @@ mod tests {
         assert_eq!(world.player.position, [1.3, 1.0]);
         assert_eq!(result.world.player.position, result.entities[0].position);
     }
+    #[test]
+    fn stationary_and_receding_movers_do_not_push_existing_overlap() {
+        let mut world = world();
+        world.player.position = [1.1, 1.0];
+        let player = entity(EntityId::Player, 1.1, 1.0);
+        for delta in [0.0, -0.1] {
+            let MotionProposal::Committed(result) =
+                propose(&world, &[], &[player], &[movement(MoverId::Wall(0), delta)]).unwrap()
+            else {
+                panic!("receding motion cannot pin")
+            };
+            assert_eq!(result.entities[0], player);
+        }
+        let circle = CollisionCircle {
+            center: [2.0, 1.0],
+            radius: 0.3,
+        };
+        let actor = entity(EntityId::Actor(1), 2.3, 1.0);
+        let MotionProposal::Committed(result) = propose(
+            &world,
+            &[circle],
+            &[actor],
+            &[movement(MoverId::Circle(0), -0.1)],
+        )
+        .unwrap() else {
+            panic!("receding circle cannot pin")
+        };
+        assert_eq!(result.entities[0], actor);
+    }
+
+    #[test]
+    fn grazing_swept_endpoints_and_circles_fail_closed() {
+        let mut world = world();
+        world.walls[0].a = [1.0, 1.0];
+        world.walls[0].b = [1.0, 2.0];
+        let actor = entity(EntityId::Actor(1), 1.0078125, 0.80001);
+        assert!(matches!(
+            propose(
+                &world,
+                &[],
+                &[actor],
+                &[movement(MoverId::Wall(0), 1.0 / 64.0)]
+            )
+            .unwrap(),
+            MotionProposal::Blocked { .. }
+        ));
+        let circle = CollisionCircle {
+            center: [1.0, 1.0],
+            radius: 0.1,
+        };
+        let actor = entity(EntityId::Actor(1), 1.0078125, 0.70001);
+        assert!(matches!(
+            propose(
+                &world,
+                &[circle],
+                &[actor],
+                &[movement(MoverId::Circle(0), 1.0 / 64.0)]
+            )
+            .unwrap(),
+            MotionProposal::Blocked { .. }
+        ));
+    }
+
     #[test]
     fn blocked_push_returns_only_pin_and_never_publishes_prefix() {
         let mut world = world();

@@ -25,7 +25,7 @@ use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
 use crate::quake::{QuakeField, QuakeZone};
 use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
 use crate::wind::{WindError, WindField};
-use crate::world::{CollisionCircle, Input, World};
+use crate::world::{CollisionCircle, Input, WallCollisionMode, World};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct LevelSetup {
@@ -164,6 +164,7 @@ impl ScriptedObjects {
 #[derive(Clone)]
 pub struct Session {
     pub world: World,
+    wall_collision_mode: WallCollisionMode,
     pub vertical: VerticalState,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
@@ -211,6 +212,7 @@ impl Session {
             base_wall_blocking,
             elevation_by_cell: vec![0.0; 64 * 64],
             world: setup.world,
+            wall_collision_mode: WallCollisionMode::TwoSided,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
             processes: setup.processes,
             actors: setup.actors,
@@ -234,6 +236,18 @@ impl Session {
             shot_blocking: setup.shot_blocking,
         }
     }
+    /// Choose the wall policy for player and wind-driven movement. Defaults to
+    /// two-sided; regular enemy AI and moving-wall obstruction remain separate
+    /// until their owners explicitly support the same policy. Snapshot clones
+    /// retain the selected policy.
+    pub fn set_wall_collision_mode(&mut self, mode: WallCollisionMode) {
+        self.wall_collision_mode = mode;
+    }
+
+    pub fn wall_collision_mode(&self) -> WallCollisionMode {
+        self.wall_collision_mode
+    }
+
     /// Opt into provisional straight 2D grenades and impact splash. The host
     /// must consume explosion events and synchronize resulting object changes.
     pub fn set_explosions_enabled(&mut self, enabled: bool) {
@@ -939,8 +953,13 @@ impl Session {
             .wind
             .displacement(self.world.player.position, DT)
             .unwrap_or([0.0, 0.0]);
-        self.world
-            .step_with_external(input.movement, DT, &circles, displacement);
+        self.world.step_with_external_mode(
+            input.movement,
+            DT,
+            &circles,
+            displacement,
+            self.wall_collision_mode,
+        );
         // Move live actors in stable order using the same tick-start field.
         // Rebuild obstacles after each move, so subsequent actors see new positions.
         for index in 0..self.actors.actors.len() {
@@ -989,9 +1008,13 @@ impl Session {
                         radius: object.blocking_radius,
                     }),
             );
-            self.actors.actors[index].position =
-                self.world
-                    .move_circle(position, displacement, radius, &obstacles);
+            self.actors.actors[index].position = self.world.move_circle_with_mode(
+                position,
+                displacement,
+                radius,
+                &obstacles,
+                self.wall_collision_mode,
+            );
         }
         // First stage only inventory/pickup data. The larger simulation snapshot
         // is needed only on ticks where a collection actually occurs.
@@ -1534,6 +1557,74 @@ mod tests {
         session
     }
     #[test]
+    fn authored_wall_mode_is_opt_in_and_restart_snapshot_retains_it() {
+        use crate::wind::WindZone;
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.player.position = [2.0, 0.5];
+        session.world.walls.push(Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        session
+            .wind
+            .activate(
+                1,
+                &[WindZone {
+                    min_cell: [0, 0],
+                    max_cell: [5, 5],
+                    direction: [-64, 0],
+                }],
+            )
+            .unwrap();
+        let mut default_session = session.clone();
+        for _ in 0..3 {
+            default_session.step(SessionInput::default());
+        }
+        assert!(default_session.world.player.position[0] > 1.179);
+        session.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        let restart = session.clone();
+        for _ in 0..3 {
+            session.step(SessionInput::default());
+        }
+        assert!(session.world.player.position[0] < 1.0);
+        let mut restarted = restart;
+        assert_eq!(
+            restarted.wall_collision_mode(),
+            WallCollisionMode::AuthoredSides
+        );
+        for _ in 0..3 {
+            restarted.step(SessionInput::default());
+        }
+        assert_eq!(
+            restarted.world.player.position,
+            session.world.player.position
+        );
+        restarted.world.player.position = [0.5, 0.5];
+        restarted.wind.deactivate(1);
+        restarted
+            .wind
+            .activate(
+                2,
+                &[WindZone {
+                    min_cell: [0, 0],
+                    max_cell: [5, 5],
+                    direction: [64, 0],
+                }],
+            )
+            .unwrap();
+        for _ in 0..3 {
+            restarted.step(SessionInput::default());
+        }
+        assert!(restarted.world.player.position[0] < 0.821);
+    }
+
+    #[test]
     fn scripted_wind_starts_next_tick_and_cannot_push_player_through_wall() {
         use crate::process_runtime::ProcessCapabilities;
         use crate::world::Wall;
@@ -1628,6 +1719,71 @@ mod tests {
         session.actors.actors[0].health = 0;
         session.step(SessionInput::default());
         assert_eq!(session.actors.actors[0].position[0], x);
+    }
+
+    #[test]
+    fn wind_actor_obeys_opt_in_opaque_sides() {
+        use crate::wind::WindZone;
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.player.position = [5.5, 5.5];
+        session.world.walls.push(Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 2.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "test.car".into(),
+            wall_radius: 64,
+            actor_radius: 64,
+            speed: 0,
+            rotation_speed: 0,
+            health: 30,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: "".into(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 0,
+            definition_index: 0,
+            placement: Monster {
+                position: [256, 128],
+                id: 100,
+                angle: 0,
+                flags: 2,
+            },
+            position: [2.0, 0.5],
+            angle_radians: 0.0,
+            health: 30,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session
+            .wind
+            .activate(
+                1,
+                &[WindZone {
+                    min_cell: [0, 0],
+                    max_cell: [5, 5],
+                    direction: [-64, 0],
+                }],
+            )
+            .unwrap();
+        let mut baseline = session.clone();
+        for _ in 0..3 {
+            baseline.step(SessionInput::default());
+        }
+        assert!(baseline.actors.actors[0].position[0] > 1.249);
+        session.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        for _ in 0..3 {
+            session.step(SessionInput::default());
+        }
+        assert!(session.actors.actors[0].position[0] < 1.0);
     }
 
     #[test]

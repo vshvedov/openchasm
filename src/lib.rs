@@ -21,3 +21,4 @@ pub mod pickups;
 pub mod projectiles;
 pub mod session;
 pub mod vertical;
+pub mod wind;

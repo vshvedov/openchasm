@@ -104,6 +104,127 @@ impl RocketDefinitions {
     }
 }
 
+/// Nearest physical target on an enemy instant shot's horizontal ray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnemyShotTarget {
+    Player,
+    Actor { source_index: usize },
+    Object { cell: [usize; 2] },
+    Wall { wall_index: usize },
+}
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnemyShotHit {
+    pub target: EnemyShotTarget,
+    pub distance: f32,
+}
+pub struct EnemyShotContext<'a> {
+    pub world: &'a World,
+    pub actors: &'a ActorState,
+    pub definitions: &'a ActorDefinitions,
+    pub objects: Option<&'a ObjectCombat>,
+}
+/// Trace up to 64 tiles in the direction of the supplied aim point, ignoring
+/// the shooter. Stable ties prefer walls, then objects, then actors, then player.
+pub fn enemy_hitscan<F>(
+    origin: [f32; 2],
+    aim: [f32; 2],
+    shooter: usize,
+    context: EnemyShotContext<'_>,
+    blocks_shots: F,
+) -> Option<EnemyShotHit>
+where
+    F: Fn(&Wall) -> bool,
+{
+    if !origin.iter().chain(aim.iter()).all(|v| v.is_finite()) {
+        return None;
+    }
+    let delta = [aim[0] - origin[0], aim[1] - origin[1]];
+    let length = delta[0].hypot(delta[1]);
+    if length < 1e-6 || !length.is_finite() {
+        return None;
+    }
+    let direction = [delta[0] / length, delta[1] / length];
+    let mut nearest = MAX_RANGE;
+    let mut selected = None;
+    let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+    for (index, wall) in context
+        .world
+        .walls
+        .iter()
+        .enumerate()
+        .filter(|(_, wall)| blocks_shots(wall))
+    {
+        if !wall.a.iter().chain(wall.b.iter()).all(|v| v.is_finite()) {
+            continue;
+        }
+        let edge = [wall.b[0] - wall.a[0], wall.b[1] - wall.a[1]];
+        let denominator = cross(direction, edge);
+        if denominator.abs() < 1e-5 {
+            continue;
+        }
+        let offset = [wall.a[0] - origin[0], wall.a[1] - origin[1]];
+        let distance = cross(offset, edge) / denominator;
+        let along = cross(offset, direction) / denominator;
+        if distance > 0.001 && distance < nearest && (0.0..=1.0).contains(&along) {
+            nearest = distance;
+            selected = Some(EnemyShotTarget::Wall { wall_index: index });
+        }
+    }
+    if let Some(hit) = context
+        .objects
+        .and_then(|objects| objects.raycast(origin, direction, nearest, 0.0))
+    {
+        if hit.distance < nearest {
+            nearest = hit.distance;
+            selected = Some(EnemyShotTarget::Object { cell: hit.cell });
+        }
+    }
+    let circle_distance = |center: [f32; 2], radius: f32| {
+        if !center.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let offset = [center[0] - origin[0], center[1] - origin[1]];
+        let projection = offset[0] * direction[0] + offset[1] * direction[1];
+        let perpendicular =
+            (offset[0] * offset[0] + offset[1] * offset[1] - projection * projection).max(0.0);
+        if perpendicular > radius * radius {
+            return None;
+        }
+        let half = (radius * radius - perpendicular).sqrt();
+        if projection + half < 0.0 {
+            return None;
+        }
+        Some((projection - half).max(0.0))
+    };
+    for actor in &context.actors.actors {
+        if actor.source_index == shooter || actor.health <= 0 {
+            continue;
+        }
+        let Some(definition) = context.definitions.entries.get(actor.definition_index) else {
+            continue;
+        };
+        let radius = (definition.wall_radius as f32 / UNITS_PER_TILE).clamp(0.05, 2.0);
+        if let Some(distance) = circle_distance(actor.position, radius) {
+            if distance < nearest {
+                nearest = distance;
+                selected = Some(EnemyShotTarget::Actor {
+                    source_index: actor.source_index,
+                });
+            }
+        }
+    }
+    if let Some(distance) = circle_distance(context.world.player.position, 0.18) {
+        if distance < nearest {
+            nearest = distance;
+            selected = Some(EnemyShotTarget::Player);
+        }
+    }
+    selected.map(|target| EnemyShotHit {
+        target,
+        distance: nearest,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShotImpact {
     Actor {

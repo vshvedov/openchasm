@@ -1,7 +1,10 @@
 //! Fixed-tick game session: simulation state independent of presentation and transport.
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
-use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpact};
+use crate::combat::{
+    self, Combat, EnemyShotContext, EnemyShotHit, EnemyShotTarget, FireResult, RocketDefinitions,
+    ShotContext, ShotImpact,
+};
 use crate::explosives::{
     self, Cylinder, DamageEvent, Explosion, ExplosionTarget, Mine, MineEvent, MineSystem,
     MineTrigger, TargetId,
@@ -48,6 +51,14 @@ pub struct SessionInput {
     pub fire: bool,
     pub select_weapon: Option<usize>,
 }
+/// Result of one authoritative enemy instant-shot trace.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnemyHitscanEvent {
+    pub source_index: usize,
+    pub rocket_id: usize,
+    pub hit: Option<EnemyShotHit>,
+}
+
 /// The source of a committed explosion, aligned with `SessionEvents::explosions`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplosionOrigin {
@@ -66,6 +77,7 @@ pub struct SessionEvents {
     pub shot: Option<FireResult>,
     pub damage: u16,
     pub enemy_attacks: Vec<EnemyAttack>,
+    pub enemy_hits: Vec<EnemyHitscanEvent>,
     pub projectile_impacts: Vec<Impact>,
     /// Impact explosions and raw pre-armor damage, in deterministic order.
     pub explosions: Vec<Explosion>,
@@ -377,9 +389,9 @@ impl Session {
         (attempts, true)
     }
 
-    /// Dispatch contact links in authored order without publishing a partial
-    /// staged action. The caller owns rollback of the surrounding hit.
-    fn activate_explosion_contact(
+    /// Dispatch shot-contact links in authored order without publishing a
+    /// partial staged action. Caller owns rollback of the surrounding hit.
+    fn activate_shot_contact(
         &mut self,
         cell: [u8; 2],
         events: &mut SessionEvents,
@@ -407,6 +419,119 @@ impl Session {
             }
         }
         true
+    }
+
+    fn resolve_enemy_instant(
+        &mut self,
+        attack: EnemyAttack,
+        rocket_id: usize,
+        origin: [f32; 2],
+        target: [f32; 2],
+        events: &mut SessionEvents,
+        attempts: &mut Vec<ProcessEvent>,
+    ) {
+        let hit = combat::enemy_hitscan(
+            origin,
+            target,
+            attack.source_index,
+            EnemyShotContext {
+                world: &self.world,
+                actors: &self.actors,
+                definitions: &self.actor_definitions,
+                objects: self.objects.as_ref(),
+            },
+            |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
+        );
+        let before = hit.and_then(|hit| {
+            matches!(
+                hit.target,
+                EnemyShotTarget::Object { .. } | EnemyShotTarget::Wall { .. }
+            )
+            .then(|| self.clone())
+        });
+        let attempt_count = attempts.len();
+        let hit_count = events.object_hits.len();
+        let transition_count = events.object_transitions.len();
+        let quake_count = events.quake_changes.len();
+        let mut accepted = true;
+        if let Some(hit) = hit {
+            let cell = match hit.target {
+                EnemyShotTarget::Object { cell } => Some([cell[0] as u8, cell[1] as u8]),
+                EnemyShotTarget::Wall { wall_index } => {
+                    self.world.walls.get(wall_index).and_then(|wall| wall.cell)
+                }
+                _ => None,
+            };
+            if let Some(cell) = cell {
+                accepted = self.activate_shot_contact(cell, events, attempts);
+            }
+            if accepted {
+                match hit.target {
+                    EnemyShotTarget::Player => {
+                        events.damage = events
+                            .damage
+                            .saturating_add(self.apply_player_damage(attack.damage));
+                    }
+                    EnemyShotTarget::Actor { source_index } => {
+                        if let Some(actor) = self
+                            .actors
+                            .actors
+                            .iter_mut()
+                            .find(|actor| actor.source_index == source_index)
+                        {
+                            actor.health =
+                                actor.health.saturating_sub(i32::from(attack.damage)).max(0);
+                            if actor.health > 0 {
+                                self.ai.alert(source_index, origin);
+                            }
+                        }
+                    }
+                    EnemyShotTarget::Object { cell } => {
+                        if let Some(object_hit) = self
+                            .objects
+                            .as_mut()
+                            .and_then(|objects| objects.apply_hit(cell, i32::from(attack.damage)))
+                        {
+                            self.sync_object_damage(cell, i32::from(attack.damage));
+                            if object_hit.destroyed {
+                                let (destroy_attempts, committed) =
+                                    self.activate_destroy([cell[0] as u8, cell[1] as u8], events);
+                                if committed {
+                                    attempts.extend(destroy_attempts);
+                                    if !events.object_transitions[transition_count..]
+                                        .iter()
+                                        .any(|t| t.cell == cell)
+                                    {
+                                        self.invalidate_process_object(cell);
+                                    }
+                                } else {
+                                    accepted = false;
+                                }
+                            }
+                            if accepted {
+                                events.object_hits.push((cell, object_hit.destroyed));
+                            }
+                        }
+                    }
+                    EnemyShotTarget::Wall { .. } => {}
+                }
+            }
+        }
+        if !accepted {
+            if let Some(before) = before {
+                *self = before;
+            }
+            attempts.truncate(attempt_count);
+            events.object_hits.truncate(hit_count);
+            events.object_transitions.truncate(transition_count);
+            events.quake_changes.truncate(quake_count);
+            return;
+        }
+        events.enemy_hits.push(EnemyHitscanEvent {
+            source_index: attack.source_index,
+            rocket_id,
+            hit,
+        });
     }
 
     /// Apply one impact as a transaction. Damage is only emitted after every
@@ -476,7 +601,7 @@ impl Session {
             _ => None,
         };
         if let Some(cell) = hit_cell {
-            if !self.activate_explosion_contact(cell, events, attempts) {
+            if !self.activate_shot_contact(cell, events, attempts) {
                 *self = before;
                 attempts.truncate(attempt_count);
                 events.object_hits.truncate(hit_count);
@@ -1109,7 +1234,25 @@ impl Session {
             &self.world,
             &|wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
         );
-        for attack in &events.enemy_attacks {
+        for index in 0..events.enemy_attacks.len() {
+            let attack = events.enemy_attacks[index];
+            if let EnemyAttackKind::Ranged {
+                rocket_id,
+                instant: true,
+                origin,
+                target,
+            } = attack.kind
+            {
+                self.resolve_enemy_instant(
+                    attack,
+                    rocket_id,
+                    origin,
+                    target,
+                    &mut events,
+                    &mut attempts,
+                );
+                continue;
+            }
             if let EnemyAttackKind::Ranged {
                 rocket_id,
                 instant: false,
@@ -3436,5 +3579,267 @@ mod tests {
         assert_eq!(session.projectiles.active().len(), 1);
         assert_eq!(session.projectiles.active()[0].id, 1);
         assert!((session.projectiles.active()[0].position[0] - (0.8 + 10.0 / 60.0)).abs() < 1e-5);
+    }
+    #[test]
+    fn enemy_instant_shot_selects_nearest_actor_wall_and_player() {
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        let def = ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 32,
+            actor_radius: 32,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: 0,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        };
+        session.actor_definitions.entries.push(def);
+        for (source_index, x) in [(7, 4.5), (8, 2.5)] {
+            session.actors.actors.push(Actor {
+                source_index,
+                definition_index: 0,
+                placement: Monster {
+                    position: [(x * 256.0) as u16, 128],
+                    id: 101,
+                    angle: 0,
+                    flags: 2,
+                },
+                position: [x, 0.5],
+                angle_radians: 0.0,
+                health: 100,
+            });
+        }
+        let mut passive = session.actor_definitions.entries[0].clone();
+        passive.rocket = -1;
+        session.actor_definitions.entries.push(passive);
+        session.actors.actors[1].definition_index = 1;
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: String::new(),
+            power: 20,
+            raw_fields: vec![],
+        }]);
+        let mut actual_tick = session.clone();
+        let tick = actual_tick.step(SessionInput::default());
+        assert!(tick.enemy_hits.iter().any(|event| event.source_index == 7
+            && matches!(
+                event.hit,
+                Some(EnemyShotHit {
+                    target: EnemyShotTarget::Actor { source_index: 8 },
+                    ..
+                })
+            )));
+        assert_eq!(actual_tick.actors.actors[1].health, 80);
+        assert_eq!(actual_tick.game.inventory.health, 100);
+        let attack = EnemyAttack {
+            source_index: 7,
+            damage: 20,
+            kind: EnemyAttackKind::Ranged {
+                rocket_id: 11,
+                instant: true,
+                origin: [4.5, 0.5],
+                target: [0.5, 0.5],
+            },
+        };
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        session.resolve_enemy_instant(
+            attack,
+            11,
+            [4.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(
+            events.enemy_hits[0].hit.unwrap().target,
+            EnemyShotTarget::Actor { source_index: 8 }
+        );
+        assert_eq!(session.actors.actors[0].health, 100);
+        assert_eq!(session.actors.actors[1].health, 80);
+        assert_eq!(session.game.inventory.health, 100);
+        session.actors.actors[1].health = 0;
+        session.world.walls.push(Wall {
+            a: [2.0, 0.0],
+            b: [2.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        let mut events = SessionEvents::default();
+        session.resolve_enemy_instant(
+            attack,
+            11,
+            [4.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(
+            events.enemy_hits[0].hit.unwrap().target,
+            EnemyShotTarget::Wall { wall_index: 0 }
+        );
+        assert_eq!(session.game.inventory.health, 100);
+        session.shot_blocking[1] = false;
+        let mut events = SessionEvents::default();
+        session.resolve_enemy_instant(
+            attack,
+            11,
+            [4.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(
+            events.enemy_hits[0].hit.unwrap().target,
+            EnemyShotTarget::Player
+        );
+        assert_eq!(session.game.inventory.health, 80);
+        let mut events = SessionEvents::default();
+        session.resolve_enemy_instant(
+            attack,
+            11,
+            [4.5, 0.5],
+            [4.5, 5.0],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(events.enemy_hits[0].hit, None);
+        assert_eq!(session.game.inventory.health, 80);
+    }
+    #[test]
+    fn enemy_instant_object_hit_stages_contact_and_destroy_atomically() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text = "#proc1\n#action\nchange 3 0 165\n#end\n#proc2\nEndDelay 1\n#end\n#links\nshoot 2 0 1\ndestroy 2 0 2\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        let def = |name: &str, health| ObjectDefinition {
+            collision_radius: 32,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: health,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![
+                def("barrel.3o", 10),
+                def("switch.3o", 0),
+                def("dummy.3o", 0),
+            ],
+        };
+        let object = |x: usize, definition_index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index,
+            grid_cell: [x, 0],
+            position: [x as f32 + 0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let instances = [object(2, 0), object(3, 1)];
+        let mut cells = [0; 4096];
+        cells[128] = 163;
+        cells[192] = 164;
+        let poses: Vec<_> = instances
+            .iter()
+            .map(|o| ProcessObject {
+                cell: [o.grid_cell[0] as u8, 0],
+                position: o.position,
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 0.125,
+            })
+            .collect();
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        session.set_scripted_objects(ScriptedObjects::new(
+            ObjectStates::new(&instances, &defs).unwrap(),
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        let attack = EnemyAttack {
+            source_index: 7,
+            damage: 20,
+            kind: EnemyAttackKind::Ranged {
+                rocket_id: 11,
+                instant: true,
+                origin: [4.5, 0.5],
+                target: [0.5, 0.5],
+            },
+        };
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        session.resolve_enemy_instant(
+            attack,
+            11,
+            [4.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert!(events.enemy_hits.is_empty());
+        assert!(attempts.is_empty());
+        assert_eq!(session.game.inventory.health, 100);
+        assert_eq!(
+            session.objects.as_ref().unwrap().is_active([2, 0]),
+            Some(true)
+        );
+        assert_eq!(session.processes.cell_type([3, 0]), Some(164));
+        session
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([3, 0], 165);
+        session.resolve_enemy_instant(
+            attack,
+            11,
+            [4.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(
+            events.enemy_hits[0].hit.unwrap().target,
+            EnemyShotTarget::Object { cell: [2, 0] }
+        );
+        assert_eq!(events.object_hits, vec![([2, 0], true)]);
+        assert_eq!(
+            attempts.iter().map(|a| a.process_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(attempts
+            .iter()
+            .all(|a| a.outcome == ProcessOutcome::Accepted));
+        assert_eq!(session.processes.cell_type([3, 0]), Some(165));
+        assert_eq!(session.game.inventory.health, 100);
     }
 }

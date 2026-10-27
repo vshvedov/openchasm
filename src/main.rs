@@ -2,6 +2,7 @@ mod archive;
 mod content;
 mod map;
 mod model;
+mod objects;
 mod planes;
 mod process;
 mod process_runtime;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use world::{Player, Wall, World};
 
 fn usage() {
-    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
+    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|objects [LEVEL]|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
 }
 fn resource_paths(resources: &ResourceSet) -> Vec<String> {
     resources
@@ -270,6 +271,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
             let processes = process_runtime::ProcessRuntime::new(&script, &world);
             viewer::run(world, textures, planes, processes, &format!("{id}: {name}"))?;
+        }
+        "objects" => {
+            let id = args.next().unwrap_or_else(|| "01".to_owned());
+            if args.next().is_some() || id.len() != 2 || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("objects expects a two-digit level ID".into());
+            }
+            let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
+            let inf = resources.read("chasm.inf")?;
+            let level_data = resources.read(&format!("map/resource.{id}"))?;
+            let definitions = objects::ObjectDefinitions::parse(&inf, &level_data)?;
+            let instances = objects::instances(&map);
+            for instance in &instances {
+                let def = definitions.definition(instance).ok_or_else(|| {
+                    format!("missing object definition at {:?}", instance.grid_cell)
+                })?;
+                println!("{:?} #{} cell {:?} pos {:?} angle {:.3} flags {:02x} difficulty {} extra {} size {}; model {} alternate {} animation {:?}; metadata {:?}", instance.kind, instance.definition_index, instance.grid_cell, instance.position, instance.angle_radians, instance.flags, instance.difficulty_flags, instance.extra, instance.size, def.model_3o_path().unwrap_or_else(|| "(none)".into()), def.model_gltf_path(), def.animation_path(), [def.collision_radius, def.shadow, def.bmp_object, def.bmp_z, def.action_code, def.blow_up, def.break_limit, def.ambient_sound, def.break_sound]);
+            }
+            println!("{} objects in level {id}.", instances.len());
         }
         "model-info" => {
             let name = args

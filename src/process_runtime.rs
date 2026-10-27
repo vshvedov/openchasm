@@ -1402,7 +1402,153 @@ pub enum ProcessSnapshotError {
     InvalidValue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessGeometryError {
+    Identity,
+    InvalidValue,
+    PoseMismatch,
+    AmbiguousRotation,
+}
+
 impl ProcessRuntime {
+    /// Verify restored process motion against a fresh runtime/world baseline.
+    /// Translations commute; a rotation sharing its target with any other
+    /// horizontal motion has history-dependent order and is rejected.
+    pub fn validate_snapshot_geometry(
+        &self,
+        baseline: &ProcessRuntime,
+        base_world: &World,
+        saved_world: &World,
+    ) -> Result<(), ProcessGeometryError> {
+        const EPS: f32 = 0.002;
+        let near = |a: f32, b: f32| a.is_finite() && b.is_finite() && (a - b).abs() <= EPS;
+        for process in self.processes.values() {
+            let motion_progress = process
+                .motions
+                .iter()
+                .map(|m| m.progress)
+                .chain(process.object_motions.iter().map(|m| m.progress));
+            match process.phase {
+                Phase::Closed | Phase::Delay(_)
+                    if process.progress != 0.0 || motion_progress.clone().any(|p| p != 0.0) =>
+                {
+                    return Err(ProcessGeometryError::InvalidValue)
+                }
+                Phase::Open
+                    if process.progress != 1.0 || motion_progress.clone().any(|p| p != 1.0) =>
+                {
+                    return Err(ProcessGeometryError::InvalidValue)
+                }
+                _ => {}
+            }
+        }
+        if base_world.walls.len() != saved_world.walls.len()
+            || self.elevations.len() != base_world.walls.len()
+            || baseline.elevations.len() != base_world.walls.len()
+        {
+            return Err(ProcessGeometryError::Identity);
+        }
+        for (index, (base, saved)) in base_world.walls.iter().zip(&saved_world.walls).enumerate() {
+            let motions: Vec<_> = self
+                .processes
+                .values()
+                .flat_map(|p| &p.motions)
+                .filter(|m| m.wall == index)
+                .collect();
+            let horizontal: Vec<_> = motions
+                .iter()
+                .copied()
+                .filter(|m| !matches!(m.kind, MotionKind::Vertical(_)))
+                .collect();
+            if horizontal.len() > 1
+                && horizontal
+                    .iter()
+                    .any(|m| matches!(m.kind, MotionKind::Rotate { .. }))
+                && (horizontal.iter().any(|m| m.progress != 0.0)
+                    || !near(base.a[0], saved.a[0])
+                    || !near(base.a[1], saved.a[1])
+                    || !near(base.b[0], saved.b[0])
+                    || !near(base.b[1], saved.b[1]))
+            {
+                return Err(ProcessGeometryError::AmbiguousRotation);
+            }
+            let mut a = base.a;
+            let mut b = base.b;
+            let mut elevation = baseline.elevations[index];
+            for motion in motions {
+                if !motion.progress.is_finite() || !(0.0..=1.0).contains(&motion.progress) {
+                    return Err(ProcessGeometryError::InvalidValue);
+                }
+                match motion.kind {
+                    MotionKind::Vertical(raw) => elevation += raw as f32 * motion.progress,
+                    _ => {
+                        a = motion.transform(a, 0.0, motion.progress);
+                        b = motion.transform(b, 0.0, motion.progress);
+                    }
+                }
+            }
+            if !near(a[0], saved.a[0])
+                || !near(a[1], saved.a[1])
+                || !near(b[0], saved.b[0])
+                || !near(b[1], saved.b[1])
+                || !near(elevation, self.elevations[index])
+            {
+                return Err(ProcessGeometryError::PoseMismatch);
+            }
+        }
+        for (&cell, object) in &self.objects {
+            let base = baseline
+                .objects
+                .get(&cell)
+                .ok_or(ProcessGeometryError::Identity)?;
+            let motions: Vec<_> = self
+                .processes
+                .values()
+                .flat_map(|p| &p.object_motions)
+                .filter(|m| m.cell == cell)
+                .collect();
+            let horizontal: Vec<_> = motions
+                .iter()
+                .copied()
+                .filter(|m| !matches!(m.kind, MotionKind::Vertical(_)))
+                .collect();
+            if horizontal.len() > 1
+                && horizontal
+                    .iter()
+                    .any(|m| matches!(m.kind, MotionKind::Rotate { .. }))
+                && (horizontal.iter().any(|m| m.progress != 0.0)
+                    || !near(base.position[0], object.position[0])
+                    || !near(base.position[1], object.position[1])
+                    || !near(base.angle_radians, object.angle_radians))
+            {
+                return Err(ProcessGeometryError::AmbiguousRotation);
+            }
+            let mut position = base.position;
+            let mut angle = base.angle_radians;
+            let mut elevation = base.elevation_raw;
+            for motion in motions {
+                if !motion.progress.is_finite() || !(0.0..=1.0).contains(&motion.progress) {
+                    return Err(ProcessGeometryError::InvalidValue);
+                }
+                match motion.kind {
+                    MotionKind::Vertical(raw) => elevation += raw as f32 * motion.progress,
+                    MotionKind::Rotate { radians, .. } => {
+                        position = motion.proxy().transform(position, 0.0, motion.progress);
+                        angle += radians * motion.progress;
+                    }
+                    _ => position = motion.proxy().transform(position, 0.0, motion.progress),
+                }
+            }
+            if !near(position[0], object.position[0])
+                || !near(position[1], object.position[1])
+                || !near(angle, object.angle_radians)
+                || !near(elevation, object.elevation_raw)
+            {
+                return Err(ProcessGeometryError::PoseMismatch);
+            }
+        }
+        Ok(())
+    }
     /// Validate host hazard/wind memberships and zones against compiled script
     /// state. This does not reconstruct the history-dependent wind grids.
     pub fn snapshot_effects_match(
@@ -2476,6 +2622,69 @@ impl ProcessRuntime {
 mod tests {
     use super::*;
     use crate::world::{Player, Wall};
+
+    #[test]
+    fn validates_reversed_object_motion_and_rejects_forgery() {
+        let script = Script::parse(
+            "#proc1\nBackWait 0.1\n#action\nmove 2 0 256 0\n#end\n#links\nfloor 0 0 1\n#end\n",
+        );
+        let base_world = world();
+        let mut moving_world = base_world.clone();
+        let mut cells = [0; 4096];
+        cells[128] = 163;
+        let baseline = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &base_world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[object_fixture([2, 0])],
+        )
+        .unwrap();
+        let mut source = baseline.clone();
+        for _ in 0..80 {
+            source.tick(&mut moving_world, 1.0 / 60.0, false);
+            source.take_effects();
+        }
+        let snapshot = source.snapshot(&moving_world).unwrap();
+        assert!(matches!(
+            snapshot.processes[0].phase,
+            ProcessPhaseSnapshot::Closing
+        ));
+        let mut restored = baseline.clone();
+        restored.restore(&snapshot, &moving_world).unwrap();
+        assert_eq!(
+            restored.validate_snapshot_geometry(&baseline, &base_world, &moving_world),
+            Ok(())
+        );
+        let mut forged = snapshot;
+        forged.objects[0].position[0] += 0.1;
+        restored.restore(&forged, &moving_world).unwrap();
+        assert_eq!(
+            restored.validate_snapshot_geometry(&baseline, &base_world, &moving_world),
+            Err(ProcessGeometryError::PoseMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_history_dependent_rotation_combinations() {
+        let script = Script::parse(
+            "#proc1\n#action\nrotate 1 0 256 0 90\n#end\n#proc2\n#action\nmove 1 0 256 0\n#end\n#links\nlink 0 0 2\n#end\n",
+        );
+        let world = world();
+        let baseline = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            baseline.validate_snapshot_geometry(&baseline, &world, &world),
+            Ok(())
+        );
+        let mut moved = world.clone();
+        let mut runtime = baseline.clone();
+        runtime.activate_at("link", [0, 0]);
+        runtime.tick(&mut moved, 1.0 / 60.0, false);
+        assert_eq!(
+            runtime.validate_snapshot_geometry(&baseline, &world, &moved),
+            Err(ProcessGeometryError::AmbiguousRotation)
+        );
+    }
 
     #[test]
     fn snapshot_effects_match_compiled_active_zones() {

@@ -452,7 +452,7 @@ impl Session {
     /// Build a candidate from a caller-supplied fresh same-content baseline.
     /// The caller must verify the digest from actual resolved inputs before
     /// passing it, and publish the returned Session only after presentation is
-    /// rebuilt. Moving geometry is rejected until its history can be verified.
+    /// rebuilt. Ambiguous rotation histories are rejected.
     pub fn restore_from_baseline(
         &self,
         snapshot: &SessionSnapshot,
@@ -490,45 +490,34 @@ impl Session {
         }) {
             return Err(SessionSnapshotError::Unverifiable("baseline is not fresh"));
         }
-        if snapshot.processes.processes.iter().any(|p| {
-            p.wall_progress
-                .iter()
-                .chain(&p.object_progress)
-                .any(|v| *v != 0.0)
-        }) {
-            return Err(SessionSnapshotError::Unverifiable(
-                "moving process geometry",
-            ));
-        }
-        if snapshot.world.walls.len() != self.world.walls.len()
-            || snapshot
-                .world
-                .walls
-                .iter()
-                .zip(&self.world.walls)
-                .any(|(saved, wall)| saved.a != wall.a || saved.b != wall.b)
-        {
-            return Err(SessionSnapshotError::Unverifiable("wall geometry"));
-        }
         if snapshot.wall_elevations != snapshot.processes.elevations
             || snapshot.wall_elevations.len() != self.world.walls.len()
-            || snapshot.wall_elevations.iter().any(|v| *v != 0.0)
             || snapshot.elevation_by_cell.len() != 4096
-            || snapshot.elevation_by_cell.iter().any(|v| *v != 0.0)
         {
-            return Err(SessionSnapshotError::Unverifiable("wall elevation"));
+            return Err(SessionSnapshotError::Inconsistent("wall elevation"));
         }
-        for object in &snapshot.processes.objects {
-            let original = baseline
-                .objects
-                .iter()
-                .find(|o| o.cell == object.cell)
-                .ok_or(SessionSnapshotError::Inconsistent("process object"))?;
-            if object.position != original.position
-                || object.angle_radians != original.angle_radians
-                || object.elevation_raw != original.elevation_raw
-            {
-                return Err(SessionSnapshotError::Unverifiable("object geometry"));
+        let mut cell_elevations = BTreeMap::new();
+        for (wall, &offset) in self.world.walls.iter().zip(&snapshot.wall_elevations) {
+            if let Some(cell) = wall.cell.filter(|[x, y]| *x < 64 && *y < 64) {
+                if cell_elevations
+                    .insert(cell, offset)
+                    .is_some_and(|previous| previous != offset)
+                {
+                    return Err(SessionSnapshotError::Unverifiable(
+                        "shared wall cell elevation",
+                    ));
+                }
+            }
+        }
+        for x in 0..64 {
+            for y in 0..64 {
+                let expected = cell_elevations
+                    .get(&[x as u8, y as u8])
+                    .copied()
+                    .unwrap_or(0.0);
+                if snapshot.elevation_by_cell[x * 64 + y] != expected {
+                    return Err(SessionSnapshotError::Inconsistent("cell elevation"));
+                }
             }
         }
         if snapshot.processes.keys != snapshot.inventory.keys {
@@ -576,6 +565,15 @@ impl Session {
             .processes
             .restore(&snapshot.processes, &candidate.world)
             .map_err(|_| SessionSnapshotError::Component("processes"))?;
+        candidate
+            .processes
+            .validate_snapshot_geometry(&self.processes, &self.world, &candidate.world)
+            .map_err(|error| match error {
+                crate::process_runtime::ProcessGeometryError::AmbiguousRotation => {
+                    SessionSnapshotError::Unverifiable("rotation history")
+                }
+                _ => SessionSnapshotError::Inconsistent("process geometry"),
+            })?;
         candidate
             .wall_elevations
             .clone_from(&snapshot.wall_elevations);
@@ -802,13 +800,15 @@ impl Session {
                 return Err(SessionSnapshotError::Inconsistent("removed process object"));
             }
         }
-        for (wall, original) in candidate
+        let needed = (candidate.vertical.head() * 64.0).max(80.0);
+        for ((wall, original), elevation) in candidate
             .world
             .walls
             .iter()
             .zip(&candidate.base_wall_blocking)
+            .zip(&candidate.wall_elevations)
         {
-            if wall.blocks_movement != *original {
+            if wall.blocks_movement != (*original && *elevation < needed) {
                 return Err(SessionSnapshotError::Inconsistent("wall collision"));
             }
         }
@@ -2640,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_snapshot_rejects_pending_effects_and_unverified_motion() {
+    fn aggregate_snapshot_validates_moving_wall_and_rejects_corruption() {
         let digest = crate::save_format::ContentDigest([1; 32]);
         let text = "#proc1\n#action\nplayani 1\n#end\n#links\nlink 0 0 1\n#end\n";
         let mut pending = mission_session(text);
@@ -2667,11 +2667,16 @@ mod tests {
         let mut moved = baseline.clone();
         moved.step(SessionInput::default());
         let snapshot = moved.snapshot(digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.world.snapshot(), moved.world.snapshot());
+        restored.step(SessionInput::default());
+        moved.step(SessionInput::default());
+        assert_eq!(restored.world.snapshot(), moved.world.snapshot());
+        let mut corrupted = snapshot.clone();
+        corrupted.world.walls[0].a[0] += 0.1;
         assert_eq!(
-            baseline.restore_from_baseline(&snapshot, digest).err(),
-            Some(SessionSnapshotError::Unverifiable(
-                "moving process geometry"
-            ))
+            baseline.restore_from_baseline(&corrupted, digest).err(),
+            Some(SessionSnapshotError::Inconsistent("process geometry"))
         );
     }
 
@@ -2695,6 +2700,47 @@ mod tests {
             assert_eq!(source.ambient_grid(), restored.ambient_grid());
         }
         assert_eq!(restored.ambient_grid().unwrap().cell([0, 0]), Some(5));
+    }
+
+    #[test]
+    fn aggregate_snapshot_validates_raised_wall_elevation() {
+        use crate::process_runtime::ProcessCapabilities;
+        let text = "#proc1\n#action\nup 1 0 80\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let mut baseline = mission_session(text);
+        baseline.world.walls.push(crate::world::Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([1, 0]),
+        });
+        baseline.processes = ProcessRuntime::with_capabilities(
+            &Script::parse(text),
+            &baseline.world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: None,
+            },
+        );
+        baseline.wall_elevations = vec![0.0];
+        baseline.base_wall_blocking = vec![true];
+        let mut source = baseline.clone();
+        for _ in 0..30 {
+            source.step(SessionInput::default());
+        }
+        assert!(source.wall_elevations[0] > 0.0);
+        let digest = crate::save_format::ContentDigest([7; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        let restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.wall_elevations, source.wall_elevations);
+        let mut forged = snapshot.clone();
+        forged.wall_elevations[0] += 1.0;
+        forged.processes.elevations[0] += 1.0;
+        forged.elevation_by_cell[64] += 1.0;
+        assert_eq!(
+            baseline.restore_from_baseline(&forged, digest).err(),
+            Some(SessionSnapshotError::Inconsistent("process geometry"))
+        );
     }
 
     fn ambient_session(text: &str) -> Session {

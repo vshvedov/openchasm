@@ -13,6 +13,7 @@ pub mod actors;
 pub mod ai;
 pub mod combat;
 pub mod game;
+pub mod mission;
 pub mod pickups;
 pub mod projectiles;
 pub mod session;

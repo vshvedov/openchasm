@@ -5,6 +5,7 @@ mod gltf_model;
 mod object_render;
 mod planes;
 mod projectile_render;
+mod replacement_manifest;
 mod texture;
 mod viewer;
 mod weapon_render;

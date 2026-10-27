@@ -315,6 +315,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
                 let mut object_scene =
                     object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
+                let mine_available = object_scene.preload_mine(&mut resources, &definitions);
+                if !mine_available {
+                    eprintln!("mine placement disabled: mine model unavailable");
+                }
                 let actor_definitions =
                     actors::ActorDefinitions::parse(&resources.read("chasm.inf")?)?;
                 let actor_state =
@@ -428,6 +432,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         difficulty: openchasm::pickups::Difficulty::Normal,
                     });
                 session.set_explosions_enabled(true);
+                session.set_mines_enabled(mine_available);
                 session.set_objects(openchasm::object_combat::ObjectCombat::new(
                     &instances,
                     &definitions,

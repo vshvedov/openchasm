@@ -3,6 +3,7 @@
 //! Jump uses ID 12 from `chasm.inf`. Actual rocket collisions use ID 30 plus
 //! the rocket type, following the independent PanzerChasm reconstruction.
 //! Unmapped or unavailable samples are silent, as are missing output devices.
+//! Mine arming uses ID 72 and detonation ID 40; placement has no mapped sound.
 //! This initial playback is non-spatial and ignores authored volume metadata.
 use crate::content::ResourceSet;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
@@ -98,6 +99,14 @@ pub fn gameplay_sound_ids(events: &openchasm::session::SessionEvents, rocket_typ
             }
         }
     }
+    for mine_event in &events.mine_events {
+        use openchasm::explosives::MineEvent;
+        match mine_event {
+            MineEvent::Armed { .. } => ids.push(72),
+            MineEvent::Detonated { .. } => ids.push(40),
+            MineEvent::Placed(_) | MineEvent::Expired { .. } => {}
+        }
+    }
     ids
 }
 
@@ -110,7 +119,7 @@ impl Audio {
     pub fn new(resources: &mut ResourceSet, inf: &[u8]) -> Self {
         let mut sounds = BTreeMap::new();
         for (id, path) in sound_names(inf) {
-            if matches!(id, 12 | 21..=28 | 30..=50 | 51..=58 | 60 | 61 | 62 | 63) {
+            if matches!(id, 12 | 21..=28 | 30..=50 | 51..=58 | 60 | 61 | 62 | 63 | 72) {
                 if let Ok(bytes) = resources.read(&path) {
                     sounds.insert(id, Arc::from(bytes));
                 }
@@ -247,6 +256,35 @@ mod tests {
         assert!(gameplay_sound_ids(&events, 21).is_empty());
     }
     #[test]
+    fn mine_sounds_follow_committed_lifecycle_only() {
+        use openchasm::explosives::{Explosion, Mine, MineEvent};
+        use openchasm::projectiles::Owner;
+        let mine = Mine {
+            id: 7,
+            owner: Owner::Player,
+            position: [1.0, 1.0, 0.0],
+            age_ticks: 0,
+            armed: false,
+        };
+        let explosion = Explosion {
+            owner: Owner::Player,
+            center: mine.position,
+            radius: 2.3,
+            damage: 140,
+        };
+        let mut events = openchasm::session::SessionEvents::default();
+        events.mine_events.extend([
+            MineEvent::Placed(mine),
+            MineEvent::Armed { id: 7 },
+            MineEvent::Detonated { id: 7, explosion },
+            MineEvent::Expired { id: 8 },
+        ]);
+        assert_eq!(gameplay_sound_ids(&events, 0), vec![72, 40]);
+        events.mine_events.clear();
+        assert!(gameplay_sound_ids(&events, 0).is_empty());
+    }
+
+    #[test]
     fn installed_jump_and_impact_samples_decode_when_available() {
         let path = std::env::var_os("OPENCHASM_TEST_CONTENT")
             .map(std::path::PathBuf::from)
@@ -256,7 +294,7 @@ mod tests {
         }
         let mut archive = crate::archive::Archive::open(&path).unwrap();
         let names = sound_names(&archive.read("chasm.inf").unwrap());
-        for id in [12, 30, 38] {
+        for id in [12, 30, 38, 40, 72] {
             let bytes = archive
                 .read(names.get(&id).expect("mapped sample"))
                 .unwrap();

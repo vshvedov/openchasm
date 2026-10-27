@@ -101,6 +101,7 @@ struct RenderWorld<'a> {
     elevations: &'a [f32],
     eye_height: f32,
     yaw_offset: f32,
+    mines: &'a [openchasm::explosives::Mine],
 }
 
 // Authored quake power has no documented unit. Scale linearly up to a small
@@ -196,7 +197,11 @@ fn render(
         }
     }
     if let Some(objects) = objects {
-        objects.render(frame, depth, WIDTH, HEIGHT, camera);
+        if scene.mines.is_empty() {
+            objects.render(frame, depth, WIDTH, HEIGHT, camera);
+        } else {
+            objects.render_with_mines(frame, depth, WIDTH, HEIGHT, camera, scene.mines);
+        }
     }
     text(frame, 8, 8, label);
     text(
@@ -619,6 +624,7 @@ pub fn run(
                 elevations: &session.wall_elevations,
                 eye_height: camera.eye_height,
                 yaw_offset,
+                mines: session.mines(),
             },
             &textures,
             Some(&planes),
@@ -793,6 +799,7 @@ mod tests {
                 elevations: &[],
                 eye_height: 1.0,
                 yaw_offset: 0.0,
+                mines: &[],
             },
             &textures,
             None,
@@ -835,6 +842,7 @@ mod tests {
                 elevations: &[],
                 eye_height: 0.75,
                 yaw_offset: 0.0,
+                mines: &[],
             },
             &[],
             None,
@@ -850,6 +858,7 @@ mod tests {
                 elevations: &[],
                 eye_height: 1.15,
                 yaw_offset: 0.0,
+                mines: &[],
             },
             &[],
             None,
@@ -889,6 +898,7 @@ mod tests {
                 elevations: &[80.0],
                 eye_height: 1.0,
                 yaw_offset: 0.0,
+                mines: &[],
             },
             &textures,
             None,
@@ -930,6 +940,7 @@ mod tests {
                 elevations: &[],
                 eye_height: 1.0,
                 yaw_offset: 0.0,
+                mines: &[],
             },
             &textures,
             None,

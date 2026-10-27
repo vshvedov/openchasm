@@ -204,7 +204,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("{}: {e}", source_path.display()))?;
     match command.as_str() {
         "info" if args.peek().is_none() => {
-            println!("OpenChasm: experimental geometry viewer (gameplay not implemented)");
+            println!("OpenChasm: experimental gameplay preview (campaign incomplete)");
             println!("Content: {}", source_path.display());
             println!("Resources: {}", resources.names().count());
             println!("Use 'sources', 'levels', or 'view 01'.");

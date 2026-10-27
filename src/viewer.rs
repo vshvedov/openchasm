@@ -96,15 +96,21 @@ fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
     }
 }
 
+struct RenderWorld<'a> {
+    world: &'a World,
+    elevations: &'a [f32],
+}
+
 fn render(
     frame: &mut [u32],
     depth: &mut [f32],
-    world: &World,
+    scene: RenderWorld<'_>,
     textures: &[Option<ViewerTexture>],
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
     label: &str,
 ) {
+    let world = scene.world;
     if let Some(planes) = planes {
         planes.render(
             frame,
@@ -131,9 +137,11 @@ fn render(
             if texture == 120 {
                 continue;
             }
-            let half = (HEIGHT as f32 * 0.5 / distance).min(HEIGHT as f32) as usize;
-            let top = (HEIGHT / 2).saturating_sub(half);
-            let bottom = (HEIGHT / 2 + half).min(HEIGHT);
+            let half = (HEIGHT as f32 * 0.5 / distance).min((HEIGHT * 4) as f32);
+            let offset = scene.elevations.get(index).copied().unwrap_or(0.0) / 64.0;
+            let origin = HEIGHT as f32 * 0.5 - half - offset * half;
+            let top = origin.max(0.0).min(HEIGHT as f32) as usize;
+            let bottom = (origin + half * 2.0).max(0.0).min(HEIGHT as f32) as usize;
             let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
             let channel = |base: u32| ((base as f32 * attenuation) as u32).min(255);
             let color = (channel(75 + texture * 37 % 110) << 16)
@@ -143,9 +151,8 @@ fn render(
             for y in top..bottom {
                 let pixel = if let Some(image) = image {
                     let tx = ((along * image.width as f32) as usize).min(image.width - 1);
-                    let height = (half * 2).max(1);
-                    let screen_origin = HEIGHT as isize / 2 - half as isize;
-                    let ty = (((y as isize - screen_origin) as usize * image.height) / height)
+                    let ty = (((y as f32 - origin) / (half * 2.0).max(1.0) * image.height as f32)
+                        as usize)
                         .min(image.height - 1);
                     let rgb = image.pixels[ty * image.width + tx];
                     if (87..=119).contains(&texture) && rgb >> 24 == 0 {
@@ -454,7 +461,10 @@ pub fn run(
         render(
             &mut frame,
             &mut depth,
-            &session.world,
+            RenderWorld {
+                world: &session.world,
+                elevations: &session.wall_elevations,
+            },
             &textures,
             Some(&planes),
             Some(&objects),
@@ -620,13 +630,61 @@ mod tests {
         });
         let mut frame = vec![0; WIDTH * HEIGHT];
         let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
-        render(&mut frame, &mut depth, &world, &textures, None, None, "");
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[],
+            },
+            &textures,
+            None,
+            None,
+            "",
+        );
         let visible_behind = frame[(HEIGHT / 2 - 10) * WIDTH + WIDTH / 2];
         let visible_in_front = frame[(HEIGHT / 2 + 10) * WIDTH + WIDTH / 2];
         assert!(visible_behind & 0xff0000 > 0, "{visible_behind:06x}");
         assert!(visible_in_front & 0x0000ff > 0, "{visible_in_front:06x}");
     }
 
+    #[test]
+    fn raised_wall_exposes_space_below_it() {
+        let world = World {
+            walls: vec![Wall {
+                a: [1.0, -1.0],
+                b: [1.0, 1.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: None,
+            }],
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+        };
+        let mut textures: Vec<Option<ViewerTexture>> = (0..2).map(|_| None).collect();
+        textures[1] = Some(ViewerTexture {
+            width: 1,
+            height: 1,
+            pixels: vec![0xffff0000],
+        });
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[80.0],
+            },
+            &textures,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(frame[(HEIGHT / 2) * WIDTH + WIDTH / 2], 0x38312b);
+    }
     #[test]
     fn paints_a_textured_wall_at_screen_center() {
         let world = World {
@@ -652,7 +710,18 @@ mod tests {
         ];
         let mut frame = vec![0; WIDTH * HEIGHT];
         let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
-        render(&mut frame, &mut depth, &world, &textures, None, None, "");
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[],
+            },
+            &textures,
+            None,
+            None,
+            "",
+        );
         let center = frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
         assert!(center & 0xff0000 > 0);
         assert_eq!(center & 0x00ffff, 0);

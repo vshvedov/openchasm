@@ -6,7 +6,7 @@ use crate::game::GameInventory;
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
 use crate::object_combat::ObjectCombat;
 use crate::pickups::{Difficulty, PickupEvent};
-use crate::process_runtime::{ProcessOutcome, ProcessRuntime};
+use crate::process_runtime::{ProcessEffect, ProcessOutcome, ProcessRuntime};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
 use crate::world::{Input, World};
 
@@ -42,6 +42,7 @@ pub struct SessionEvents {
     pub object_hits: Vec<([usize; 2], bool)>,
     /// Mission presentation/completion events produced during this step.
     pub mission: Vec<MissionEvent>,
+    pub process_effects: Vec<ProcessEffect>,
 }
 
 #[derive(Clone)]
@@ -56,6 +57,10 @@ pub struct Session {
     pub projectiles: ProjectileSystem,
     pub objects: Option<ObjectCombat>,
     pub mission: Option<MissionState>,
+    /// Absolute offsets in original script units, indexed by wall index.
+    pub wall_elevations: Vec<f32>,
+    base_wall_blocking: Vec<bool>,
+    elevation_by_cell: Vec<f32>,
     combat: Combat,
     rockets: RocketDefinitions,
     shot_blocking: [bool; 128],
@@ -69,7 +74,17 @@ impl Session {
                 actor.health = 0;
             }
         }
+        let wall_elevations = vec![0.0; setup.world.walls.len()];
+        let base_wall_blocking = setup
+            .world
+            .walls
+            .iter()
+            .map(|wall| wall.blocks_movement)
+            .collect();
         Self {
+            wall_elevations,
+            base_wall_blocking,
+            elevation_by_cell: vec![0.0; 64 * 64],
             world: setup.world,
             processes: setup.processes,
             actors: setup.actors,
@@ -93,6 +108,43 @@ impl Session {
     /// Attach a freshly parsed mission before taking the session's restart snapshot.
     pub fn set_mission(&mut self, plan: MissionPlan) {
         self.mission = Some(MissionState::new(plan));
+    }
+    fn blocks_shot(
+        wall: &crate::world::Wall,
+        shot_blocking: &[bool; 128],
+        elevation_by_cell: &[f32],
+    ) -> bool {
+        let elevated = wall.cell.is_some_and(|[x, y]| {
+            x < 64
+                && y < 64
+                && elevation_by_cell
+                    .get(usize::from(x) * 64 + usize::from(y))
+                    .is_some_and(|offset| *offset >= 64.0)
+        });
+        !elevated
+            && shot_blocking
+                .get(wall.texture as usize)
+                .copied()
+                .unwrap_or(true)
+    }
+    fn apply_process_effects(&mut self) -> Vec<ProcessEffect> {
+        let effects = self.processes.take_effects();
+        for effect in &effects {
+            if let ProcessEffect::WallElevation {
+                wall_index,
+                offset_raw,
+            } = *effect
+            {
+                if let Some(wall) = self.world.walls.get_mut(wall_index) {
+                    self.wall_elevations[wall_index] = offset_raw;
+                    wall.blocks_movement = self.base_wall_blocking[wall_index] && offset_raw < 80.0;
+                    if let Some([x, y]) = wall.cell.filter(|[x, y]| *x < 64 && *y < 64) {
+                        self.elevation_by_cell[usize::from(x) * 64 + usize::from(y)] = offset_raw;
+                    }
+                }
+            }
+        }
+        effects
     }
     fn apply_player_damage(&mut self, amount: u16) -> u16 {
         // Provisional armor: absorbs at most half of each incoming hit.
@@ -152,12 +204,7 @@ impl Session {
                     world: &self.world,
                     objects: self.objects.as_mut(),
                 },
-                |wall| {
-                    self.shot_blocking
-                        .get(wall.texture as usize)
-                        .copied()
-                        .unwrap_or(true)
-                },
+                |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell),
             );
             match shot {
                 FireResult::Fired(ShotImpact::Object {
@@ -204,17 +251,13 @@ impl Session {
             }
             events.shot = Some(shot);
         }
+        events.process_effects.extend(self.apply_process_effects());
         events.enemy_attacks = self.ai.tick_with_collision(
             &mut self.actors,
             &self.actor_definitions,
             &self.rockets,
             &self.world,
-            &|wall| {
-                self.shot_blocking
-                    .get(wall.texture as usize)
-                    .copied()
-                    .unwrap_or(true)
-            },
+            &|wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell),
         );
         for attack in &events.enemy_attacks {
             if let EnemyAttackKind::Ranged {
@@ -247,12 +290,7 @@ impl Session {
             &self.actors,
             &self.actor_definitions,
             self.objects.as_ref(),
-            |wall| {
-                self.shot_blocking
-                    .get(wall.texture as usize)
-                    .copied()
-                    .unwrap_or(true)
-            },
+            |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell),
         );
         for impact in &events.projectile_impacts {
             match impact.target {
@@ -315,6 +353,7 @@ impl Session {
                 }
             }
         }
+        events.process_effects.extend(self.apply_process_effects());
         events
     }
 }
@@ -592,6 +631,55 @@ mod tests {
                 .contains(&MissionEvent::LevelComplete);
         }
         assert!(completed);
+    }
+    #[test]
+    fn raised_wall_becomes_passable_and_remains_visible_as_elevated_geometry() {
+        use crate::process_runtime::ProcessCapabilities;
+        use crate::world::Wall;
+        let text = "#proc1\n#action\nup 1 0 80\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let old = mission_session(text);
+        let world = World {
+            player: Player {
+                position: [0.5, 0.5],
+                angle: 0.0,
+            },
+            walls: vec![Wall {
+                a: [1.0, 0.0],
+                b: [1.0, 1.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([1, 0]),
+            }],
+        };
+        let script = Script::parse(text);
+        let processes = ProcessRuntime::with_capabilities(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: None,
+            },
+        );
+        let mut session = Session::new(LevelSetup {
+            world,
+            processes,
+            actors: old.actors,
+            actor_definitions: old.actor_definitions,
+            game: old.game,
+            rockets: RocketDefinitions(vec![]),
+            shot_blocking: [true; 128],
+            difficulty: Difficulty::Normal,
+        });
+        for _ in 0..120 {
+            session.step(SessionInput::default());
+        }
+        assert!((session.wall_elevations[0] - 80.0).abs() < 0.001);
+        assert!(!session.world.walls[0].blocks_movement);
+        assert!(!Session::blocks_shot(
+            &session.world.walls[0],
+            &session.shot_blocking,
+            &session.elevation_by_cell
+        ));
     }
     #[test]
     fn session_fires_damages_enemies_and_consumes_ammunition() {

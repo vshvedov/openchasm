@@ -73,7 +73,7 @@ fn cross(a: [f32; 2], b: [f32; 2]) -> f32 {
 fn line_of_sight(from: [f32; 2], to: [f32; 2], walls: &[Wall]) -> bool {
     let ray = sub(to, from);
     !walls.iter().any(|wall| {
-        if !(1..=86).contains(&wall.texture) {
+        if !(1..=86).contains(&wall.texture) || !wall.blocks_movement {
             return false;
         }
         let edge = sub(wall.b, wall.a);

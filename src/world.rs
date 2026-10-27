@@ -25,6 +25,7 @@ pub struct Input {
     pub turn: f32,
 }
 
+#[derive(Clone)]
 pub struct World {
     pub walls: Vec<Wall>,
     pub player: Player,

@@ -3,6 +3,7 @@ use crate::inventory::{Inventory, WeaponDefinitions};
 use crate::objects::{ObjectDefinitions, ObjectInstance};
 use crate::pickups::{Difficulty, PickupEvent, Pickups};
 
+#[derive(Clone)]
 pub struct GameInventory {
     pub inventory: Inventory,
     pub pickups: Pickups,

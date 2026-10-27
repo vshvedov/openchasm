@@ -13,7 +13,7 @@ cargo run --release -- sources
 cargo run --release -- --source full view 01
 ```
 
-Use **WASD** to move, **left/right arrows** to turn, **E** to use nearby linked objects, **Space** or the left mouse button to fire, **1–8** to select owned weapons, and **Escape** to quit. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
+Use **WASD** to move, **left/right arrows** to turn, **E** to use nearby linked objects, **Space** or the left mouse button to fire, **1–8** to select owned weapons, and **R** to restart the level, and **Escape** to quit. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
 
 Examples:
 

@@ -53,7 +53,7 @@ struct Brain {
 }
 
 /// Per-actor AI state remains separate from map definitions and rendering.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EnemyAi {
     brains: BTreeMap<usize, Brain>,
 }

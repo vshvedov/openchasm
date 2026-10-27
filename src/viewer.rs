@@ -160,6 +160,7 @@ pub fn run(
         audio,
         weapon_overlay,
     } = feedback;
+    let initial_session = session.clone();
     for cell in session.game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
@@ -209,6 +210,15 @@ pub fn run(
             strafe: key(Key::D) - key(Key::A),
             turn: key(Key::Right) - key(Key::Left),
         };
+        if window.is_key_pressed(Key::R, KeyRepeat::No) {
+            session = initial_session.clone();
+            for (cell, visible) in session.game.pickups.visibility() {
+                objects.set_visible(cell, visible);
+            }
+            pending_interact = false;
+            pending_weapon = None;
+            shoot_ticks = 0;
+        }
         pending_interact |= window.is_key_pressed(Key::E, KeyRepeat::No);
         for (index, key) in number_keys.iter().enumerate() {
             if window.is_key_pressed(*key, KeyRepeat::No) {
@@ -318,7 +328,7 @@ pub fn run(
                 &mut frame,
                 WIDTH / 2 - 80,
                 HEIGHT / 2 + 35,
-                "YOU DIED - ESC TO EXIT",
+                "YOU DIED - R TO RESTART",
             );
         }
         window.update_with_buffer(&frame, WIDTH, HEIGHT)?;

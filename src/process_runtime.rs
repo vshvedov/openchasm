@@ -113,7 +113,7 @@ enum Phase {
     Closing,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RuntimeProcess {
     motions: Vec<Motion>,
     phase: Phase,
@@ -380,6 +380,7 @@ impl RuntimeProcess {
 
 /// Process state can be ticked by a client or a headless authoritative server.
 /// The owning world's wall vector must retain its original order and length.
+#[derive(Clone)]
 pub struct ProcessRuntime {
     processes: BTreeMap<u16, RuntimeProcess>,
     links: Vec<crate::process::Trigger>,

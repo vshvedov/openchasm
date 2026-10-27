@@ -137,6 +137,16 @@ impl Pickups {
             })
     }
 
+    /// Current visibility for every tracked pickup placement.
+    pub fn visibility(&self) -> impl Iterator<Item = ([usize; 2], bool)> + '_ {
+        self.candidates.iter().map(|candidate| {
+            (
+                candidate.cell,
+                candidate.difficulty_enabled && candidate.script_enabled && !candidate.collected,
+            )
+        })
+    }
+
     /// Iterate tracked cells that are hidden because of difficulty or state.
     /// Call at level initialization and after script enable/disable changes.
     pub fn hidden_cells(&self) -> impl Iterator<Item = [usize; 2]> + '_ {

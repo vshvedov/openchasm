@@ -34,6 +34,7 @@ pub struct SessionEvents {
     pub enemy_attacks: Vec<EnemyAttack>,
 }
 
+#[derive(Clone)]
 pub struct Session {
     pub world: World,
     pub processes: ProcessRuntime,
@@ -223,6 +224,7 @@ mod tests {
             shot_blocking: [true; 128],
             difficulty: Difficulty::Normal,
         });
+        let initial = session.clone();
         let events = session.step(SessionInput {
             fire: true,
             ..SessionInput::default()
@@ -233,6 +235,8 @@ mod tests {
         ));
         assert_eq!(session.actors.actors[0].health, 20);
         assert_eq!(session.game.inventory.ammo[0], 9);
+        assert_eq!(initial.game.inventory.ammo[0], 10);
+        assert_eq!(initial.actors.actors[0].health, 30);
         session.actor_definitions.entries[1].rocket = 0;
         let events = session.step(SessionInput::default());
         assert!(matches!(

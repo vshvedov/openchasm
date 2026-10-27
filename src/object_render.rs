@@ -360,6 +360,13 @@ fn facet_normal(vertices: &[Vertex], camera: CameraView) -> [f32; 3] {
         .unwrap_or([0.0, 0.0, 1.0])
 }
 
+/// Original 3O/CAR polygons use clockwise outward winding, opposite to glTF.
+/// For example, the installed spot1 shaft's standard cross points into the
+/// shaft on all 36 side/base faces. Reverse it for physical outward lighting.
+fn legacy_facet_normal(vertices: &[Vertex], camera: CameraView) -> [f32; 3] {
+    facet_normal(vertices, camera).map(|component| -component)
+}
+
 /// Clips a polygon to the near plane before perspective division.
 fn clip_near(input: &[Vertex]) -> Vec<Vertex> {
     if input.is_empty() {
@@ -1789,7 +1796,7 @@ impl ObjectScene {
                     });
                 }
                 if raster.remaster_light.is_some() {
-                    let facet = facet_normal(&vertices, camera);
+                    let facet = legacy_facet_normal(&vertices, camera);
                     for vertex in &mut vertices {
                         vertex.normal = facet;
                     }
@@ -1887,6 +1894,116 @@ pub(crate) mod tests {
         });
         assert!((interpolated[1] - 2.0 / 3.0).abs() < 1e-6);
         assert!((interpolated[2] - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clockwise_legacy_shaft_faces_outward_and_rejects_its_center_light() {
+        let mut data = vec![0; 0x27001 + 4];
+        data[0x25001..0x26001].fill(15);
+        let mut map = crate::map::Map::parse(&data).unwrap();
+        map.lights.push(crate::map::Light {
+            position: [512, 512],
+            power: 128,
+            inner_radius: 256,
+            outer_radius: 512,
+            brightness: 0,
+        });
+        let world = crate::world::World {
+            walls: vec![],
+            player: Player {
+                position: [0.0; 2],
+                angle: 0.0,
+            },
+        };
+        let light = crate::remaster_light::RemasterLightMap::build(&map, &world, &[], &[]).unwrap();
+        // A clockwise right-hand shaft face, with its light on the central axis.
+        let face = [
+            [2.125, 1.9, 2.0],
+            [2.125, 2.1, 2.0],
+            [2.125, 2.1, 0.0],
+            [2.125, 1.9, 0.0],
+        ];
+        for angle in [0.0, 0.7, std::f32::consts::PI] {
+            let camera = CameraView {
+                player: Player {
+                    angle,
+                    ..world.player
+                },
+                eye_height: 1.0,
+                pitch: 0.0,
+            };
+            let forward = camera.player.forward();
+            let right = camera.player.right();
+            let vertices = face.map(|p| Vertex {
+                side: p[0] * right[0] + p[1] * right[1],
+                depth: p[0] * forward[0] + p[1] * forward[1],
+                up: p[2] - camera.eye_height,
+                uv: [0.0; 2],
+                normal: [0.0; 3],
+            });
+            let outward = legacy_facet_normal(&vertices, camera);
+            let inward = facet_normal(&vertices, camera);
+            assert!(outward[0] > 0.999 && inward[0] < -0.999);
+            let corrected = light.sample([2.125, 2.0], outward);
+            let reversed = light.sample([2.125, 2.0], inward);
+            assert!(
+                (corrected - 25.0 / 255.0).abs() < 1e-5,
+                "outward shaft gets ambient only: {corrected}"
+            );
+            assert!(
+                reversed > corrected + 0.9,
+                "inward normal wrongly lights the shaft: {reversed}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_spot1_shaft_has_clockwise_outward_winding_when_available() {
+        let path = std::path::Path::new("assets/csm.bin");
+        if !path.exists() {
+            return;
+        }
+        let mut resources = ResourceSet::open(path).unwrap();
+        let model = Model::parse(&resources.read("model/spot1.3o").unwrap()).unwrap();
+        let camera = CameraView {
+            player: Player {
+                position: [0.0; 2],
+                angle: 0.0,
+            },
+            eye_height: 0.0,
+            pitch: 0.0,
+        };
+        let mut shaft_faces = 0;
+        for polygon in &model.polygons {
+            let positions: Vec<_> = polygon.vertices[..polygon.vertex_count()]
+                .iter()
+                .map(|&index| {
+                    model.vertices[index as usize]
+                        .position
+                        .map(|v| f32::from(v) * MODEL_SCALE)
+                })
+                .collect();
+            if positions.iter().any(|position| position[2] > 2.0) {
+                continue;
+            }
+            let vertices: Vec<_> = positions
+                .iter()
+                .map(|p| Vertex {
+                    side: -p[1],
+                    up: p[2],
+                    depth: p[0],
+                    uv: [0.0; 2],
+                    normal: [0.0; 3],
+                })
+                .collect();
+            let normal = legacy_facet_normal(&vertices, camera);
+            let radial: [f32; 2] = std::array::from_fn(|i| {
+                positions.iter().map(|p| p[i]).sum::<f32>() / positions.len() as f32
+            });
+            assert!(normal[0] * radial[0] + normal[1] * radial[1] > 0.03);
+            shaft_faces += 1;
+        }
+        assert_eq!(shaft_faces, 36);
     }
 
     #[test]

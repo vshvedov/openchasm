@@ -25,3 +25,7 @@ Bytes after the actor array vary by level and have not been decoded. No assumpti
 `floors.XX` holds 64 indexed textures, not level geometry: a 64-byte header followed by 64 records of 5,504 bytes. Each record begins with 4,096 palette indices for a 64×64 texture, followed by mip levels (32×32, 16×16, 8×8) and 64 bytes of unknown purpose. The first 64×64 index image is exposed by the parser; palette interpretation belongs to the image loader.
 
 The Rust reader was checked against all 20 map and floor files in the installed full-release archive; each parsed successfully, had the expected floor size, and included a spawn numbered zero. Synthetic tests check coordinate order, little-endian values, record counts, truncation, and floor-texture stride.
+
+## Plane preview observations
+
+`chasm2.pal` contains the 256 RGB triples used for `floors.XX` palette indices. Sampling the local release's map grids showed floor and ceiling IDs in `0..=63`. Across levels 01–19, ceiling ID 62 is common while floor ID 62 appears only eight times (in level 10); ID 63 dominates unused map space, and texture slot 63 is a uniform color in the inspected maps. The prototype treats ceiling 62 as sky and both planes' 63 as empty, pending verification against the original engine. Floor ID 62 remains a texture. The texture axes, exact vertical scale, brightness, light maps, animation, and sky behavior need visual comparison against the original game.

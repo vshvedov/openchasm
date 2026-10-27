@@ -1,6 +1,7 @@
 mod archive;
 mod content;
 mod map;
+mod planes;
 mod process;
 mod texture;
 mod viewer;
@@ -230,7 +231,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             let name = level_name(&resource);
             let textures = load_wall_textures(&mut resources, &resource);
             let world = make_world(&map)?;
-            viewer::run(world, textures, &format!("{id}: {name}"))?;
+            let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
+            let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
+            let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
+            viewer::run(world, textures, planes, &format!("{id}: {name}"))?;
         }
         "cat" => {
             let path = args.next().ok_or("cat requires a resource name")?;

@@ -1,4 +1,5 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
+use crate::planes::PlaneRenderer;
 use crate::texture::CelImage;
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
@@ -46,9 +47,25 @@ fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
     }
 }
 
-fn render(frame: &mut [u32], world: &World, textures: &[Option<ViewerTexture>], label: &str) {
-    for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
-        row.fill(if y < HEIGHT / 2 { 0x303847 } else { 0x38312b });
+fn render(
+    frame: &mut [u32],
+    world: &World,
+    textures: &[Option<ViewerTexture>],
+    planes: Option<&PlaneRenderer>,
+    label: &str,
+) {
+    if let Some(planes) = planes {
+        planes.render(
+            frame,
+            WIDTH,
+            HEIGHT,
+            world.player.position,
+            world.player.angle,
+        );
+    } else {
+        for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
+            row.fill(if y < HEIGHT / 2 { 0x303847 } else { 0x38312b });
+        }
     }
     let (sin, cos) = world.player.angle.sin_cos();
     for x in 0..WIDTH {
@@ -92,6 +109,7 @@ fn render(frame: &mut [u32], world: &World, textures: &[Option<ViewerTexture>], 
 pub fn run(
     mut world: World,
     textures: Vec<Option<CelImage>>,
+    planes: PlaneRenderer,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     let textures: Vec<Option<ViewerTexture>> = textures
@@ -129,7 +147,7 @@ pub fn run(
             world.step(input, STEP);
             accumulator -= STEP;
         }
-        render(&mut frame, &world, &textures, label);
+        render(&mut frame, &world, &textures, Some(&planes), label);
         window.update_with_buffer(&frame, WIDTH, HEIGHT)?;
     }
     Ok(())
@@ -163,7 +181,7 @@ mod tests {
             }),
         ];
         let mut frame = vec![0; WIDTH * HEIGHT];
-        render(&mut frame, &world, &textures, "");
+        render(&mut frame, &world, &textures, None, "");
         let center = frame[(HEIGHT / 2) * WIDTH + WIDTH / 2];
         assert!(center & 0xff0000 > 0);
         assert_eq!(center & 0x00ffff, 0);

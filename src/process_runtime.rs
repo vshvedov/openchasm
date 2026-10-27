@@ -111,6 +111,88 @@ fn obstructed(motions: &[Motion], world: &World, change: f32) -> bool {
     false
 }
 
+/// Initial authoritative pose and conservative collision radius of one source
+/// map object. Position and radius use map tiles; elevation uses raw script
+/// units and orientation uses radians. Cell is a stable map-grid identifier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessObject {
+    pub cell: [u8; 2],
+    pub position: [f32; 2],
+    pub angle_radians: f32,
+    pub elevation_raw: f32,
+    /// Zero denotes an object that does not block the player.
+    pub blocking_radius: f32,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessObjectError {
+    Invalid,
+    DuplicateCell,
+}
+#[derive(Debug, Clone)]
+struct ObjectMotion {
+    cell: [u8; 2],
+    raw_type: u8,
+    kind: MotionKind,
+}
+impl ObjectMotion {
+    fn proxy(&self) -> Motion {
+        Motion {
+            wall: 0,
+            kind: self.kind.clone(),
+        }
+    }
+    fn travel_bound(&self, pose: &ProcessObject) -> f32 {
+        match self.kind {
+            MotionKind::Translate(d) => d[0].hypot(d[1]),
+            MotionKind::Vertical(raw) => raw.unsigned_abs() as f32 / MAP_UNITS_PER_TILE,
+            MotionKind::Rotate { pivot, radians } => {
+                let orbit = (pose.position[0] - pivot[0]).hypot(pose.position[1] - pivot[1]);
+                (orbit + pose.blocking_radius.max(0.125)) * radians.abs()
+            }
+        }
+    }
+}
+
+/// Check moving object circles against the player without pushing or crushing.
+fn objects_obstructed(
+    motions: &[ObjectMotion],
+    world: &World,
+    objects: &BTreeMap<[u8; 2], ProcessObject>,
+    change: f32,
+) -> bool {
+    const PLAYER_RADIUS: f32 = 0.18;
+    const SAMPLE_STEP: f32 = 0.04;
+    const MAX_SAMPLES: usize = 128;
+    for motion in motions {
+        let Some(object) = objects.get(&motion.cell) else {
+            return true;
+        };
+        if object.blocking_radius <= 0.0 || matches!(motion.kind, MotionKind::Vertical(_)) {
+            continue;
+        }
+        let travel = motion.travel_bound(object) * change.abs();
+        if !travel.is_finite() || travel > SAMPLE_STEP * MAX_SAMPLES as f32 {
+            return true;
+        }
+        let count = ((travel / SAMPLE_STEP).ceil() as usize).max(1);
+        let radius = PLAYER_RADIUS + object.blocking_radius;
+        let mut previous = (object.position[0] - world.player.position[0])
+            .hypot(object.position[1] - world.player.position[1]);
+        for sample in 1..=count {
+            let pos = motion
+                .proxy()
+                .transform(object.position, change * sample as f32 / count as f32);
+            let distance =
+                (pos[0] - world.player.position[0]).hypot(pos[1] - world.player.position[1]);
+            if distance < radius && distance < previous - 1e-5 {
+                return true;
+            }
+            previous = distance;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
     Closed,
@@ -135,6 +217,13 @@ pub enum ProcessEffect {
     WallElevation { wall_index: usize, offset_raw: f32 },
     /// New raw type for the grid cell; includes original type on reversal.
     CellType { cell: [u8; 2], raw_type: u8 },
+    /// Absolute pose, keyed by the original stable map cell.
+    ObjectPose {
+        cell: [u8; 2],
+        position: [f32; 2],
+        angle_radians: f32,
+        elevation_raw: f32,
+    },
     /// Presentation request; no object animation is simulated by the runtime.
     PlayAnimation { object_id: u16 },
     /// The host must activate all zones under this process ID. Zones use
@@ -163,11 +252,20 @@ struct CellChange {
     previous: Option<u8>,
 }
 
+struct ProcessFrame<'a> {
+    world: &'a mut World,
+    elevations: &'a mut [f32],
+    objects: &'a mut BTreeMap<[u8; 2], ProcessObject>,
+    cell_types: &'a mut Option<Vec<u8>>,
+    effects: &'a mut Vec<ProcessEffect>,
+}
+
 type Activation = (Vec<(u16, bool)>, Vec<u16>);
 
 #[derive(Debug, Clone)]
 struct RuntimeProcess {
     motions: Vec<Motion>,
+    object_motions: Vec<ObjectMotion>,
     // Verified empty-cell commands still occupy a process movement stage.
     empty_motion_cells: Vec<[u8; 2]>,
     phase: Phase,
@@ -207,8 +305,10 @@ impl RuntimeProcess {
         capabilities: ProcessCapabilities<'_>,
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
+        objects: Option<&BTreeMap<[u8; 2], ProcessObject>>,
     ) -> Self {
         let mut motions = Vec::new();
+        let mut object_motions = Vec::new();
         let mut empty_motion_cells = Vec::new();
         let mut empty_motion_distance = 0.0_f32;
         let mut cell_changes = Vec::new();
@@ -348,7 +448,7 @@ impl RuntimeProcess {
             let expected_arguments = match action.name.as_str() {
                 "move" => 4,
                 "rotate" => 5,
-                "up" if capabilities.wall_elevation => 3,
+                "up" if capabilities.wall_elevation || objects.is_some() => 3,
                 _ => {
                     supported = false;
                     break;
@@ -427,11 +527,32 @@ impl RuntimeProcess {
             if !supported {
                 break;
             }
+            if motions.len() != before && action.name == "up" && !capabilities.wall_elevation {
+                supported = false;
+                break;
+            }
             // Missing walls could be models or malformed references. Never
             // perform only the subset of a process that happened to resolve.
             if motions.len() == before {
                 let index = usize::from(cell.0) * 64 + usize::from(cell.1);
-                if raw_cells.is_some_and(|cells| cells[index] == 0) {
+                let is_authored_object =
+                    raw_cells.is_some_and(|cells| (131..=226).contains(&cells[index]));
+                if is_authored_object
+                    && objects.is_some_and(|poses| poses.contains_key(&[cell.0, cell.1]))
+                {
+                    if object_motions
+                        .iter()
+                        .any(|m: &ObjectMotion| m.cell == [cell.0, cell.1])
+                    {
+                        supported = false;
+                        break;
+                    }
+                    object_motions.push(ObjectMotion {
+                        cell: [cell.0, cell.1],
+                        raw_type: raw_cells.expect("authored object has raw cells")[index],
+                        kind,
+                    });
+                } else if raw_cells.is_some_and(|cells| cells[index] == 0) {
                     empty_motion_cells.push([cell.0, cell.1]);
                     let distance = match kind {
                         MotionKind::Translate(d) => d[0].hypot(d[1]),
@@ -450,8 +571,18 @@ impl RuntimeProcess {
         if nonstop && death_zones.is_empty() {
             supported = false;
         }
+        if !object_motions.is_empty()
+            && process
+                .properties
+                .iter()
+                .any(|cmd| matches!(cmd.name.as_str(), "mortal" | "checkgo" | "checkback"))
+        {
+            // Object-versus-actor blocking/pushing/crushing is not implemented.
+            supported = false;
+        }
         if !supported {
             motions.clear();
+            object_motions.clear();
             empty_motion_cells.clear();
             lock_changes.clear();
             cell_changes.clear();
@@ -461,10 +592,18 @@ impl RuntimeProcess {
         // The manual labels Speed but does not specify units. At speed 8 we use
         // one tile per second; each process completes when its longest move does.
         let speed = property_float(process, "speed", 8.0).max(0.01) / 8.0;
-        let max_distance = motions
+        let wall_distance = motions
             .iter()
             .map(|m| m.travel_bound(&world.walls[m.wall]))
             .fold(empty_motion_distance, f32::max);
+        let max_distance = object_motions
+            .iter()
+            .filter_map(|motion| {
+                objects
+                    .and_then(|poses| poses.get(&motion.cell))
+                    .map(|pose| motion.travel_bound(pose))
+            })
+            .fold(wall_distance, f32::max);
         // The independent reconstruction advances procedure stages at
         // Speed/10 per second even for a hazard with no moving geometry.
         // Existing non-hazard movement timing is left unchanged.
@@ -478,6 +617,7 @@ impl RuntimeProcess {
             .map(|name| process.properties.iter().any(|cmd| cmd.name == name));
         Self {
             motions,
+            object_motions,
             empty_motion_cells,
             phase: Phase::Closed,
             progress: 0.0,
@@ -510,6 +650,7 @@ impl RuntimeProcess {
         }
         if !self.supported
             || (self.motions.is_empty()
+                && self.object_motions.is_empty()
                 && self.empty_motion_cells.is_empty()
                 && self.lock_changes.is_empty()
                 && self.cell_changes.is_empty()
@@ -522,6 +663,7 @@ impl RuntimeProcess {
         match self.phase {
             Phase::Closed => {
                 if !self.motions.is_empty()
+                    || !self.object_motions.is_empty()
                     || !self.empty_motion_cells.is_empty()
                     || !self.cell_changes.is_empty()
                     || !self.death_zones.is_empty()
@@ -536,6 +678,7 @@ impl RuntimeProcess {
             }
             Phase::Open
                 if !self.motions.is_empty()
+                    || !self.object_motions.is_empty()
                     || !self.empty_motion_cells.is_empty()
                     || !self.cell_changes.is_empty()
                     || !self.death_zones.is_empty() =>
@@ -583,15 +726,21 @@ impl RuntimeProcess {
             Phase::Closed | Phase::Closing => {}
         }
     }
-    fn tick(
-        &mut self,
-        process_id: u16,
-        world: &mut World,
-        dt: f32,
-        elevations: &mut [f32],
-        cell_types: &mut Option<Vec<u8>>,
-        effects: &mut Vec<ProcessEffect>,
-    ) {
+    fn tick(&mut self, process_id: u16, dt: f32, frame: &mut ProcessFrame<'_>) {
+        let world = &mut *frame.world;
+        let elevations = &mut *frame.elevations;
+        let objects = &mut *frame.objects;
+        let cell_types = &mut *frame.cell_types;
+        let effects = &mut *frame.effects;
+        if self.object_motions.iter().any(|motion| {
+            !objects.contains_key(&motion.cell)
+                || cell_types.as_ref().is_some_and(|types| {
+                    types[usize::from(motion.cell[0]) * 64 + usize::from(motion.cell[1])]
+                        != motion.raw_type
+                })
+        }) {
+            return;
+        }
         if self.phase == Phase::Closing
             && self.waitout.iter().any(|(center, radius)| {
                 let dx = world.player.position[0] - center[0];
@@ -632,7 +781,9 @@ impl RuntimeProcess {
         }
         let change = self.progress - previous;
         if change != 0.0 {
-            if obstructed(&self.motions, world, change) {
+            if obstructed(&self.motions, world, change)
+                || objects_obstructed(&self.object_motions, world, objects, change)
+            {
                 self.progress = previous;
                 self.phase = if change > 0.0 {
                     Phase::Opening
@@ -658,6 +809,26 @@ impl RuntimeProcess {
                             wall.b = motion.transform(wall.b, change);
                         }
                     }
+                }
+            }
+            for motion in &self.object_motions {
+                if let Some(object) = objects.get_mut(&motion.cell) {
+                    match motion.kind {
+                        MotionKind::Vertical(raw) => object.elevation_raw += raw as f32 * change,
+                        MotionKind::Translate(_) => {
+                            object.position = motion.proxy().transform(object.position, change)
+                        }
+                        MotionKind::Rotate { radians, .. } => {
+                            object.position = motion.proxy().transform(object.position, change);
+                            object.angle_radians += radians * change;
+                        }
+                    }
+                    effects.push(ProcessEffect::ObjectPose {
+                        cell: object.cell,
+                        position: object.position,
+                        angle_radians: object.angle_radians,
+                        elevation_raw: object.elevation_raw,
+                    });
                 }
             }
             // Apply type changes only after successful motion completion. A
@@ -716,6 +887,7 @@ pub struct ProcessRuntime {
     previous_floor: Option<[u8; 2]>,
     keys: [bool; 3],
     elevations: Vec<f32>,
+    objects: BTreeMap<[u8; 2], ProcessObject>,
     cell_types: Option<Vec<u8>>,
     effects: Vec<ProcessEffect>,
 }
@@ -736,6 +908,7 @@ impl ProcessRuntime {
             capabilities,
             capabilities.initial_cell_types,
             false,
+            None,
         )
     }
     /// Supply x-major map cell types for validating empty motion targets without
@@ -753,6 +926,7 @@ impl ProcessRuntime {
             capabilities,
             capabilities.initial_cell_types.or(Some(raw_cells)),
             false,
+            None,
         )
     }
     /// Enable death-zone effects only when the authoritative host consumes
@@ -769,15 +943,73 @@ impl ProcessRuntime {
             capabilities,
             capabilities.initial_cell_types.or(Some(raw_cells)),
             true,
+            None,
         )
     }
+    /// Enable object poses and hazard events only when the host can apply
+    /// every resulting pose to presentation, collision and pickup state.
+    pub fn with_objects_and_hazards(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+        object_poses: &[ProcessObject],
+    ) -> Result<Self, ProcessObjectError> {
+        let mut objects = BTreeMap::new();
+        for &object in object_poses {
+            if object.cell[0] >= 64
+                || object.cell[1] >= 64
+                || !object.position.iter().all(|v| v.is_finite())
+                || !object.angle_radians.is_finite()
+                || !object.elevation_raw.is_finite()
+                || !object.blocking_radius.is_finite()
+                || !(0.0..=64.0).contains(&object.blocking_radius)
+            {
+                return Err(ProcessObjectError::Invalid);
+            }
+            let index = usize::from(object.cell[0]) * 64 + usize::from(object.cell[1]);
+            if !(131..=226).contains(&raw_cells[index])
+                || world
+                    .walls
+                    .iter()
+                    .any(|wall| wall.cell == Some(object.cell))
+            {
+                return Err(ProcessObjectError::Invalid);
+            }
+            if objects.insert(object.cell, object).is_some() {
+                return Err(ProcessObjectError::DuplicateCell);
+            }
+        }
+        Ok(Self::build(
+            script,
+            world,
+            capabilities,
+            capabilities.initial_cell_types.or(Some(raw_cells)),
+            true,
+            Some(objects),
+        ))
+    }
+    /// Mark a collected, destroyed or replaced object unavailable so later
+    /// processes fail closed and any active movement stops emitting effects.
+    pub fn remove_object(&mut self, cell: [u8; 2]) -> bool {
+        self.objects.remove(&cell).is_some()
+    }
+
+    /// Retrieve current process-owned pose by original stable cell.
+    pub fn object_pose(&self, cell: [u8; 2]) -> Option<ProcessObject> {
+        self.objects.get(&cell).copied()
+    }
+
     fn build(
         script: &Script,
         world: &World,
         capabilities: ProcessCapabilities<'_>,
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
+        objects: Option<BTreeMap<[u8; 2], ProcessObject>>,
     ) -> Self {
+        let enabled = objects.is_some();
+        let objects = objects.unwrap_or_default();
         Self {
             processes: script
                 .processes
@@ -791,6 +1023,7 @@ impl ProcessRuntime {
                             capabilities,
                             raw_cells,
                             hazards_enabled,
+                            enabled.then_some(&objects),
                         ),
                     )
                 })
@@ -799,6 +1032,7 @@ impl ProcessRuntime {
             previous_floor: None,
             keys: [false; 3],
             elevations: vec![0.0; world.walls.len()],
+            objects,
             cell_types: capabilities.initial_cell_types.map(|x| x.to_vec()),
             effects: Vec::new(),
         }
@@ -824,7 +1058,9 @@ impl ProcessRuntime {
         self.processes
             .values()
             .filter(|p| {
-                !p.locked && !p.required_keys.iter().any(|&key| key) && !p.motions.is_empty()
+                !p.locked
+                    && !p.required_keys.iter().any(|&key| key)
+                    && (!p.motions.is_empty() || !p.object_motions.is_empty())
             })
             .count()
     }
@@ -836,12 +1072,18 @@ impl ProcessRuntime {
     fn trigger(&mut self, id: u16) -> ProcessEvent {
         let result = match self.processes.get_mut(&id) {
             Some(process)
-                if self.cell_types.as_ref().is_some_and(|types| {
-                    process
-                        .empty_motion_cells
-                        .iter()
-                        .any(|cell| types[usize::from(cell[0]) * 64 + usize::from(cell[1])] != 0)
-                }) =>
+                if process
+                    .object_motions
+                    .iter()
+                    .any(|motion| !self.objects.contains_key(&motion.cell))
+                    || self.cell_types.as_ref().is_some_and(|types| {
+                        process.empty_motion_cells.iter().any(|cell| {
+                            types[usize::from(cell[0]) * 64 + usize::from(cell[1])] != 0
+                        }) || process.object_motions.iter().any(|motion| {
+                            types[usize::from(motion.cell[0]) * 64 + usize::from(motion.cell[1])]
+                                != motion.raw_type
+                        })
+                    }) =>
             {
                 Err(ProcessOutcome::Unsupported)
             }
@@ -997,15 +1239,15 @@ impl ProcessRuntime {
                 events.extend(self.use_at(cell));
             }
         }
+        let mut frame = ProcessFrame {
+            world,
+            elevations: &mut self.elevations,
+            objects: &mut self.objects,
+            cell_types: &mut self.cell_types,
+            effects: &mut self.effects,
+        };
         for (&id, process) in &mut self.processes {
-            process.tick(
-                id,
-                world,
-                dt,
-                &mut self.elevations,
-                &mut self.cell_types,
-                &mut self.effects,
-            );
+            process.tick(id, dt, &mut frame);
         }
         events
     }
@@ -1217,6 +1459,255 @@ mod tests {
             [ProcessEffect::PlayAnimation { object_id: 58 }]
         );
         assert!(runtime.take_effects().is_empty());
+    }
+    fn object_fixture(cell: [u8; 2]) -> ProcessObject {
+        ProcessObject {
+            cell,
+            position: [f32::from(cell[0]) + 0.5, f32::from(cell[1]) + 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.2,
+        }
+    }
+    #[test]
+    fn object_move_is_opt_in_emits_absolute_pose_and_reverses() {
+        let script = Script::parse(
+            "#proc1\nBackWait 0.1\n#action\nmove 2 0 256 0\n#end\n#links\nfloor 0 0 1\n#end\n",
+        );
+        let mut world = world();
+        let mut cells = [0u8; 4096];
+        cells[2 * 64] = 163;
+        let mut disabled =
+            ProcessRuntime::with_cell_data(&script, &world, ProcessCapabilities::default(), &cells);
+        assert_eq!(
+            disabled.tick(&mut world, 1.0 / 60.0, false)[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        let mut runtime = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[object_fixture([2, 0])],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, false)[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert!(matches!(
+            runtime.take_effects().as_slice(),
+            [ProcessEffect::ObjectPose { cell: [2, 0], .. }]
+        ));
+        for _ in 0..60 {
+            runtime.tick(&mut world, 1.0 / 60.0, false);
+            runtime.take_effects();
+        }
+        assert!((runtime.object_pose([2, 0]).unwrap().position[0] - 3.5).abs() < 0.001);
+        for _ in 0..70 {
+            runtime.tick(&mut world, 1.0 / 60.0, false);
+            runtime.take_effects();
+        }
+        assert!((runtime.object_pose([2, 0]).unwrap().position[0] - 2.5).abs() < 0.001);
+        assert_eq!(runtime.object_pose([2, 0]).unwrap().cell, [2, 0]);
+    }
+    #[test]
+    fn object_rotation_and_vertical_actions_emit_complete_poses() {
+        for (action, expected) in [("rotate 2 0 512 0 90", true), ("up 2 0 96", false)] {
+            let script = Script::parse(&format!(
+                "#proc1\n#action\n{action}\n#end\n#links\nfloor 0 0 1\n#end\n"
+            ));
+            let mut world = world();
+            let mut cells = [0u8; 4096];
+            cells[128] = 163;
+            let mut runtime = ProcessRuntime::with_objects_and_hazards(
+                &script,
+                &world,
+                ProcessCapabilities::default(),
+                &cells,
+                &[object_fixture([2, 0])],
+            )
+            .unwrap();
+            assert_eq!(
+                runtime.tick(&mut world, 1.0 / 60.0, false)[0].outcome,
+                ProcessOutcome::Accepted
+            );
+            for _ in 0..240 {
+                runtime.tick(&mut world, 1.0 / 60.0, false);
+            }
+            let pose = runtime.object_pose([2, 0]).unwrap();
+            if expected {
+                assert!((pose.position[0] - 1.5).abs() < 0.002, "{pose:?}");
+                assert!((pose.position[1] - 0.5).abs() < 0.002, "{pose:?}");
+                assert!((pose.angle_radians - std::f32::consts::FRAC_PI_2).abs() < 0.002);
+            } else {
+                assert!((pose.elevation_raw - 96.0).abs() < 0.002);
+            }
+            assert!(runtime
+                .take_effects()
+                .iter()
+                .any(|effect| matches!(effect, ProcessEffect::ObjectPose { cell: [2, 0], .. })));
+        }
+    }
+    #[test]
+    fn moving_object_stops_before_player_and_resumes() {
+        let script =
+            Script::parse("#proc1\n#action\nmove 2 0 -512 0\n#end\n#links\nfloor 0 0 1\n#end\n");
+        let mut world = world();
+        let mut cells = [0u8; 4096];
+        cells[128] = 163;
+        let mut runtime = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[object_fixture([2, 0])],
+        )
+        .unwrap();
+        tick_for(&mut runtime, &mut world, 3.0);
+        let x = runtime.object_pose([2, 0]).unwrap().position[0];
+        assert!((0.5 + 0.18 + 0.2 - 0.001..0.95).contains(&x), "{x}");
+        world.player.position = [0.0, 2.0];
+        tick_for(&mut runtime, &mut world, 3.0);
+        assert!((runtime.object_pose([2, 0]).unwrap().position[0] - 0.5).abs() < 0.001);
+    }
+    #[test]
+    fn object_motion_fails_closed_for_invalid_missing_or_mortal_targets() {
+        let mut world = world();
+        let mut cells = [0u8; 4096];
+        cells[128] = 163;
+        let script =
+            Script::parse("#proc1\n#action\nmove 2 0 256 0\n#end\n#links\nfloor 0 0 1\n#end\n");
+        let mut missing = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            missing.tick(&mut world, 1.0 / 60.0, false)[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        let object = object_fixture([2, 0]);
+        assert!(matches!(
+            ProcessRuntime::with_objects_and_hazards(
+                &script,
+                &world,
+                ProcessCapabilities::default(),
+                &cells,
+                &[object, object]
+            ),
+            Err(ProcessObjectError::DuplicateCell)
+        ));
+        let mut bad = object;
+        bad.position[0] = f32::NAN;
+        assert!(matches!(
+            ProcessRuntime::with_objects_and_hazards(
+                &script,
+                &world,
+                ProcessCapabilities::default(),
+                &cells,
+                &[bad]
+            ),
+            Err(ProcessObjectError::Invalid)
+        ));
+        let lethal = Script::parse(
+            "#proc1\nMortal\n#action\nmove 2 0 256 0\n#end\n#links\nfloor 0 0 1\n#end\n",
+        );
+        let mut runtime = ProcessRuntime::with_objects_and_hazards(
+            &lethal,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[object],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, false)[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        assert!(runtime.take_effects().is_empty());
+    }
+    #[test]
+    fn changed_cell_and_missing_object_disable_whole_mixed_process() {
+        let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\nmove 2 0 256 0\n#end\n#proc2\n#action\nchange 2 0 184\n#end\n#links\nlink 0 0 1\nlink 2 1 2\n#end\n");
+        let mut world = world();
+        let mut cells = [0u8; 4096];
+        cells[64] = 1;
+        cells[128] = 163;
+        let mut missing = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: Some(&cells),
+            },
+            &cells,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            missing.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        tick_for(&mut missing, &mut world, 1.5);
+        assert_eq!(world.walls[0].a, [1.0, 0.0]);
+        let mut runtime = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: Some(&cells),
+            },
+            &cells,
+            &[object_fixture([2, 0])],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("link", [2, 1])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        runtime.tick(&mut world, 1.0 / 60.0, false);
+        assert_eq!(runtime.cell_type([2, 0]), Some(184));
+        runtime.take_effects();
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        tick_for(&mut runtime, &mut world, 1.5);
+        assert_eq!(world.walls[0].a, [1.0, 0.0]);
+        assert!(runtime.take_effects().is_empty());
+    }
+    #[test]
+    fn removing_object_stops_active_motion_and_rejects_future_triggers() {
+        let script =
+            Script::parse("#proc1\n#action\nmove 2 0 256 0\n#end\n#links\nlink 0 0 1\n#end\n");
+        let mut world = world();
+        let mut cells = [0u8; 4096];
+        cells[128] = 163;
+        let mut runtime = ProcessRuntime::with_objects_and_hazards(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[object_fixture([2, 0])],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        runtime.tick(&mut world, 1.0 / 60.0, false);
+        runtime.take_effects();
+        assert!(runtime.remove_object([2, 0]));
+        runtime.tick(&mut world, 1.0 / 60.0, false);
+        assert!(runtime.take_effects().is_empty());
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
     }
     #[test]
     fn floor_trigger_opens_and_automatically_returns_wall() {

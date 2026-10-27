@@ -40,7 +40,7 @@ struct RuntimeProcess {
     waitout: Vec<([f32; 2], f32)>,
     lock_changes: Vec<(u16, bool)>,
     supported: bool,
-    requires_key: bool,
+    required_keys: [bool; 3],
 }
 
 fn property_float(process: &Process, name: &str, default: f32) -> f32 {
@@ -153,10 +153,8 @@ impl RuntimeProcess {
             .map(|m| m.displacement[0].hypot(m.displacement[1]))
             .fold(0.0f32, f32::max);
         let locked = process.properties.iter().any(|cmd| cmd.name == "lock");
-        let requires_key = process
-            .properties
-            .iter()
-            .any(|cmd| matches!(cmd.name.as_str(), "redkey" | "greenkey" | "bluekey"));
+        let required_keys = ["redkey", "greenkey", "bluekey"]
+            .map(|name| process.properties.iter().any(|cmd| cmd.name == name));
         Self {
             motions,
             phase: Phase::Closed,
@@ -169,12 +167,16 @@ impl RuntimeProcess {
             waitout,
             lock_changes,
             supported,
-            requires_key,
+            required_keys,
         }
     }
-    fn trigger(&mut self) -> Option<Vec<(u16, bool)>> {
+    fn trigger(&mut self, keys: [bool; 3]) -> Option<Vec<(u16, bool)>> {
         if self.locked
-            || self.requires_key
+            || self
+                .required_keys
+                .iter()
+                .zip(keys)
+                .any(|(required, owned)| *required && !owned)
             || !self.supported
             || (self.motions.is_empty() && self.lock_changes.is_empty())
         {
@@ -260,6 +262,7 @@ pub struct ProcessRuntime {
     processes: BTreeMap<u16, RuntimeProcess>,
     links: Vec<crate::process::Trigger>,
     previous_floor: Option<[u8; 2]>,
+    keys: [bool; 3],
 }
 
 impl ProcessRuntime {
@@ -272,20 +275,28 @@ impl ProcessRuntime {
                 .collect(),
             links: script.triggers.clone(),
             previous_floor: None,
+            keys: [false; 3],
         }
     }
     /// Number of initially unlocked processes with fully supported wall motion.
     pub fn usable_count(&self) -> usize {
         self.processes
             .values()
-            .filter(|p| !p.locked && !p.requires_key && !p.motions.is_empty())
+            .filter(|p| {
+                !p.locked && !p.required_keys.iter().any(|&key| key) && !p.motions.is_empty()
+            })
             .count()
     }
+    /// Synchronize the owning player's red, green and blue key state.
+    pub fn set_keys(&mut self, keys: [bool; 3]) {
+        self.keys = keys;
+    }
+
     fn trigger(&mut self, id: u16) {
         let changes = self
             .processes
             .get_mut(&id)
-            .and_then(RuntimeProcess::trigger)
+            .and_then(|process| process.trigger(self.keys))
             .unwrap_or_default();
         for (target, locked) in changes {
             if let Some(process) = self.processes.get_mut(&target) {
@@ -437,6 +448,21 @@ mod tests {
             tick_for(&mut runtime, &mut world, 2.0);
             assert_eq!(world.walls[0].a[0], 1.0, "{action}");
         }
+    }
+    #[test]
+    fn required_key_allows_a_door_to_open() {
+        let script = Script::parse(
+            "#proc1\nGreenKey\n#action\nmove 1 0 256 0\n#end\n#links\nlink 1 0 1\n#end\n",
+        );
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        runtime.tick(&mut world, 1.0 / 60.0, true);
+        tick_for(&mut runtime, &mut world, 1.0);
+        assert_eq!(world.walls[0].a[0], 1.0);
+        runtime.set_keys([false, true, false]);
+        runtime.tick(&mut world, 1.0 / 60.0, true);
+        tick_for(&mut runtime, &mut world, 1.0);
+        assert!((world.walls[0].a[0] - 2.0).abs() < 0.001);
     }
     #[test]
     fn a_linked_switch_can_unlock_a_separate_door() {

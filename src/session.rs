@@ -48,6 +48,18 @@ pub struct SessionInput {
     pub fire: bool,
     pub select_weapon: Option<usize>,
 }
+/// The source of a committed explosion, aligned with `SessionEvents::explosions`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplosionOrigin {
+    Projectile {
+        projectile_id: u64,
+        rocket_id: usize,
+    },
+    Mine {
+        mine_id: u64,
+    },
+}
+
 #[derive(Default)]
 pub struct SessionEvents {
     pub pickups: Vec<PickupEvent>,
@@ -57,6 +69,8 @@ pub struct SessionEvents {
     pub projectile_impacts: Vec<Impact>,
     /// Impact explosions and raw pre-armor damage, in deterministic order.
     pub explosions: Vec<Explosion>,
+    /// One source per explosion, in the same order as `explosions`.
+    pub explosion_origins: Vec<ExplosionOrigin>,
     pub explosion_damage: Vec<DamageEvent>,
     /// Stable mine lifecycle events for presentation and networking.
     pub mine_events: Vec<MineEvent>,
@@ -361,6 +375,7 @@ impl Session {
     fn apply_explosion(
         &mut self,
         explosion: Explosion,
+        origin: ExplosionOrigin,
         impact: Option<ImpactTarget>,
         events: &mut SessionEvents,
         attempts: &mut Vec<ProcessEvent>,
@@ -481,6 +496,7 @@ impl Session {
             }
         }
         events.explosions.push(explosion);
+        events.explosion_origins.push(origin);
         events.explosion_damage.extend(damage);
         true
     }
@@ -527,14 +543,21 @@ impl Session {
             let damage_count = events.explosion_damage.len();
             let previous_damage = events.damage;
             for event in &mine_events {
-                if let MineEvent::Detonated { explosion, .. } = event {
-                    if !self.apply_explosion(*explosion, None, events, attempts) {
+                if let MineEvent::Detonated { id, explosion } = event {
+                    if !self.apply_explosion(
+                        *explosion,
+                        ExplosionOrigin::Mine { mine_id: *id },
+                        None,
+                        events,
+                        attempts,
+                    ) {
                         *self = before;
                         attempts.truncate(attempt_count);
                         events.object_hits.truncate(hit_count);
                         events.object_transitions.truncate(transition_count);
                         events.quake_changes.truncate(quake_count);
                         events.explosions.truncate(explosions_count);
+                        events.explosion_origins.truncate(explosions_count);
                         events.explosion_damage.truncate(damage_count);
                         events.damage = previous_damage;
                         return;
@@ -1084,7 +1107,16 @@ impl Session {
                     radius: radius_raw as f32 / 256.0,
                     damage: impact.damage,
                 };
-                self.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
+                self.apply_explosion(
+                    explosion,
+                    ExplosionOrigin::Projectile {
+                        projectile_id: impact.projectile_id,
+                        rocket_id: impact.rocket_id,
+                    },
+                    Some(impact.target),
+                    &mut events,
+                    &mut attempts,
+                );
                 continue;
             }
             match impact.target {
@@ -2671,7 +2703,16 @@ mod tests {
         };
         let mut events = SessionEvents::default();
         let mut attempts = Vec::new();
-        session.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
+        session.apply_explosion(
+            explosion,
+            ExplosionOrigin::Projectile {
+                projectile_id: impact.projectile_id,
+                rocket_id: impact.rocket_id,
+            },
+            Some(impact.target),
+            &mut events,
+            &mut attempts,
+        );
         assert_eq!(session.actors.actors[0].health, 70);
         assert_eq!(
             events
@@ -2763,6 +2804,35 @@ mod tests {
         let mut mined = session.clone();
         mined.set_mines_enabled(true);
         mined.world.player.position = [1.5, 0.5];
+        mined.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 32,
+            actor_radius: 32,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        let placement = Monster {
+            position: [2560, 2560],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        mined.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [10.0, 10.0],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        mined.ai = EnemyAi::new(&mined.actors, Difficulty::Normal);
+        mined.mines.plant(Owner::Player, [10.0, 10.0, 0.0]).unwrap();
         mined.mines.plant(Owner::Player, [1.5, 0.5, 0.0]).unwrap();
         let mut mine_events = SessionEvents::default();
         let mut mine_attempts = Vec::new();
@@ -2771,8 +2841,11 @@ mod tests {
         }
         assert_eq!(mined.mines()[0].age_ticks, explosives::MINE_ARM_TICKS - 1);
         assert_eq!(mined.game.inventory.health, 100);
+        assert_eq!(mined.actors.actors[0].health, 100);
+        assert_eq!(mined.mines().len(), 2);
         assert!(mine_events.mine_events.is_empty());
         assert!(mine_events.explosions.is_empty());
+        assert!(mine_events.explosion_origins.is_empty());
         assert_eq!(
             mined.objects.as_ref().unwrap().is_active([1, 0]),
             Some(true)
@@ -2785,7 +2858,14 @@ mod tests {
             .allow([3, 0], 165);
         mined.tick_mines(&mut mine_events, &mut mine_attempts);
         assert!(mined.mines().is_empty());
-        assert_eq!(mine_events.explosions.len(), 1);
+        assert_eq!(mine_events.explosions.len(), 2);
+        assert_eq!(
+            mine_events.explosion_origins,
+            vec![
+                ExplosionOrigin::Mine { mine_id: 0 },
+                ExplosionOrigin::Mine { mine_id: 1 }
+            ]
+        );
         assert_eq!(mine_events.object_hits, vec![([1, 0], true)]);
         assert!(!mined
             .processes
@@ -2809,7 +2889,16 @@ mod tests {
         };
         let mut events = SessionEvents::default();
         let mut attempts = Vec::new();
-        session.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
+        session.apply_explosion(
+            explosion,
+            ExplosionOrigin::Projectile {
+                projectile_id: impact.projectile_id,
+                rocket_id: impact.rocket_id,
+            },
+            Some(impact.target),
+            &mut events,
+            &mut attempts,
+        );
         assert_eq!(session.game.inventory.health, 100);
         assert_eq!(
             session.objects.as_ref().unwrap().is_active([1, 0]),
@@ -2826,7 +2915,16 @@ mod tests {
             .unwrap()
             .manifest
             .allow([3, 0], 165);
-        session.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
+        session.apply_explosion(
+            explosion,
+            ExplosionOrigin::Projectile {
+                projectile_id: impact.projectile_id,
+                rocket_id: impact.rocket_id,
+            },
+            Some(impact.target),
+            &mut events,
+            &mut attempts,
+        );
         assert!(session.game.inventory.health < 100);
         assert_eq!(
             session.objects.as_ref().unwrap().is_active([1, 0]),
@@ -3001,5 +3099,52 @@ mod tests {
         assert!(events.mine_events.contains(&MineEvent::Expired { id: 0 }));
         assert!(session.mines().is_empty());
         assert_eq!(snapshot.mines()[0].age_ticks, 0);
+    }
+    #[test]
+    fn simultaneous_explosion_origins_match_committed_event_order() {
+        let mut session = mission_session("");
+        session.set_mines_enabled(true);
+        session.mines.plant(Owner::Player, [0.5, 0.5, 0.0]).unwrap();
+        session.mines.plant(Owner::Player, [0.6, 0.5, 0.0]).unwrap();
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        for _ in 0..explosives::MINE_ARM_TICKS {
+            session.tick_mines(&mut events, &mut attempts);
+        }
+        assert_eq!(
+            events.explosion_origins,
+            vec![
+                ExplosionOrigin::Mine { mine_id: 0 },
+                ExplosionOrigin::Mine { mine_id: 1 }
+            ]
+        );
+        assert_eq!(events.explosions.len(), 2);
+        assert_eq!(events.explosions[0].center[0], 0.5);
+        assert_eq!(events.explosions[1].center[0], 0.6);
+        let explosion = Explosion {
+            owner: Owner::Player,
+            center: [2.0, 2.0, 0.75],
+            radius: 1.0,
+            damage: 10,
+        };
+        assert!(session.apply_explosion(
+            explosion,
+            ExplosionOrigin::Projectile {
+                projectile_id: 42,
+                rocket_id: 10
+            },
+            None,
+            &mut events,
+            &mut attempts
+        ));
+        assert_eq!(
+            events.explosion_origins[2],
+            ExplosionOrigin::Projectile {
+                projectile_id: 42,
+                rocket_id: 10
+            }
+        );
+        assert_eq!(events.explosions[2], explosion);
+        assert_eq!(events.explosions.len(), events.explosion_origins.len());
     }
 }

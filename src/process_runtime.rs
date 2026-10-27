@@ -1342,6 +1342,39 @@ pub enum ProcessSnapshotError {
 }
 
 impl ProcessRuntime {
+    /// Validate host hazard/wind memberships and zones against compiled script
+    /// state. This does not reconstruct the history-dependent wind grids.
+    pub fn snapshot_effects_match(
+        &self,
+        hazards: &crate::hazards::HazardsSnapshot,
+        wind: &crate::wind::WindSnapshot,
+    ) -> bool {
+        let active_hazards: Vec<_> = self
+            .processes
+            .iter()
+            .filter(|(_, p)| p.hazard_active)
+            .map(|(&id, p)| (id, &p.death_zones))
+            .collect();
+        let active_wind: Vec<_> = self
+            .processes
+            .iter()
+            .filter(|(_, p)| p.wind_active)
+            .map(|(&id, p)| (id, &p.wind_zones))
+            .collect();
+        active_hazards.len() == hazards.active.len()
+            && active_hazards.iter().all(|(id, zones)| {
+                hazards
+                    .active
+                    .iter()
+                    .any(|h| h.process_id == *id && &h.zones == *zones)
+            })
+            && active_wind.len() == wind.active.len()
+            && active_wind.iter().all(|(id, zones)| {
+                wind.active
+                    .iter()
+                    .any(|(saved_id, saved_zones)| saved_id == id && saved_zones == *zones)
+            })
+    }
     /// Capture only after the host has consumed all process effects.
     pub fn snapshot(&self, world: &World) -> Result<ProcessRuntimeSnapshot, ProcessSnapshotError> {
         if !self.effects.is_empty() || self.staged_authorized {
@@ -2323,6 +2356,40 @@ impl ProcessRuntime {
 mod tests {
     use super::*;
     use crate::world::{Player, Wall};
+
+    #[test]
+    fn snapshot_effects_match_compiled_active_zones() {
+        let script = Script::parse("#proc1\n#action\nnonstop\ndeath 0 0 2 2 0 64 20\nwind 0 0 2 2 4 0\n#end\n#links\nlink 0 0 1\n#end\n");
+        let mut runtime = ProcessRuntime::with_wind(
+            &script,
+            &world(),
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let mut hazards = crate::hazards::Hazards::default();
+        let mut wind = crate::wind::WindField::new();
+        for effect in runtime.take_effects() {
+            hazards.apply_effect(&effect);
+            if let ProcessEffect::WindActivated { process_id, zones } = effect {
+                wind.activate(process_id, &zones).unwrap();
+            }
+        }
+        let hazards = hazards.snapshot();
+        let wind = wind.snapshot();
+        assert!(runtime.snapshot_effects_match(&hazards, &wind));
+        let mut forged = hazards.clone();
+        forged.active[0].zones[0].damage_raw += 1;
+        assert!(!runtime.snapshot_effects_match(&forged, &wind));
+        let mut forged = wind.clone();
+        forged.active[0].1[0].direction[0] += 1;
+        assert!(!runtime.snapshot_effects_match(&hazards, &forged));
+    }
 
     #[test]
     fn forced_mission_stages_unlock_and_fails_closed() {

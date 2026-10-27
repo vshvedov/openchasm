@@ -290,7 +290,504 @@ pub struct Session {
     rockets: RocketDefinitions,
     shot_blocking: [bool; 128],
 }
+
+/// Explicit mutable-state aggregate. The content digest is supplied and
+/// verified by the host; the DTO contains no resource bytes or paths.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSnapshot {
+    pub content: crate::save_format::ContentDigest,
+    pub capabilities: SessionSnapshotCapabilities,
+    pub world: crate::world::WorldSnapshot,
+    pub vertical: crate::vertical::VerticalSnapshot,
+    pub processes: crate::process_runtime::ProcessRuntimeSnapshot,
+    pub actors: crate::actors::ActorStateSnapshot,
+    pub ai: crate::ai::EnemyAiSnapshot,
+    pub inventory: crate::inventory::InventorySnapshot,
+    pub powerups: crate::inventory::ProtectivePowerupsSnapshot,
+    pub pickups: crate::pickups::PickupsSnapshot,
+    pub selected_weapon: u8,
+    pub combat: crate::combat::CombatSnapshot,
+    pub projectiles: crate::projectiles::ProjectileSystemSnapshot,
+    pub projectile_heights: Vec<(u64, f32)>,
+    pub mines: crate::explosives::MineSystemSnapshot,
+    pub object_states: Option<crate::object_states::ObjectStatesSnapshot>,
+    pub object_combat: Option<crate::object_combat::ObjectCombatSnapshot>,
+    pub quake: Option<crate::quake::QuakeSnapshot>,
+    pub mission: Option<crate::mission::MissionSnapshot>,
+    pub hazards: crate::hazards::HazardsSnapshot,
+    pub wind: crate::wind::WindSnapshot,
+    pub ambient: Option<crate::ambient::AmbientSnapshot>,
+    pub teleport: Option<crate::teleport::TeleportSnapshot>,
+    pub wall_elevations: Vec<f32>,
+    pub elevation_by_cell: Vec<f32>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionSnapshotCapabilities {
+    pub wall_collision_mode: WallCollisionMode,
+    pub teleports: bool,
+    pub object_heights: bool,
+    pub explosions: bool,
+    pub addon_boss: bool,
+    pub mines: bool,
+    pub objects: bool,
+    pub scripted_objects: bool,
+    pub mission: bool,
+    pub ambient: bool,
+    pub powerups: bool,
+    pub quake_presentation: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionSnapshotError {
+    Content,
+    Capabilities,
+    PendingEffects,
+    Component(&'static str),
+    Inconsistent(&'static str),
+    Unverifiable(&'static str),
+}
 impl Session {
+    fn snapshot_capabilities(&self) -> SessionSnapshotCapabilities {
+        SessionSnapshotCapabilities {
+            wall_collision_mode: self.wall_collision_mode,
+            teleports: self.teleports.is_some(),
+            object_heights: self.object_heights.is_some(),
+            explosions: self.explosions_enabled,
+            addon_boss: self.addon_boss_rule,
+            mines: self.mines_enabled,
+            objects: self.objects.is_some(),
+            scripted_objects: self.scripted_objects.is_some(),
+            mission: self.mission.is_some(),
+            ambient: self.ambient.is_some(),
+            powerups: self.game.protective_powerups.enabled,
+            quake_presentation: self
+                .scripted_objects
+                .as_ref()
+                .is_some_and(|s| s.quake_enabled),
+        }
+    }
+
+    /// Capture at a completed simulation tick after all effects are consumed.
+    pub fn snapshot(
+        &self,
+        content: crate::save_format::ContentDigest,
+    ) -> Result<SessionSnapshot, SessionSnapshotError> {
+        if !self.pending_wind_errors.is_empty() {
+            return Err(SessionSnapshotError::PendingEffects);
+        }
+        let processes = self
+            .processes
+            .snapshot(&self.world)
+            .map_err(|_| SessionSnapshotError::PendingEffects)?;
+        if self.objects.is_some() != self.scripted_objects.is_some() {
+            return Err(SessionSnapshotError::Unverifiable("object definitions"));
+        }
+        Ok(SessionSnapshot {
+            content,
+            capabilities: self.snapshot_capabilities(),
+            world: self.world.snapshot(),
+            vertical: self.vertical.snapshot(),
+            processes,
+            actors: self
+                .actors
+                .snapshot()
+                .map_err(|_| SessionSnapshotError::Component("actors"))?,
+            ai: self
+                .ai
+                .snapshot()
+                .map_err(|_| SessionSnapshotError::Component("ai"))?,
+            inventory: self.game.inventory.snapshot(),
+            powerups: self.game.protective_powerups.snapshot(),
+            pickups: self
+                .game
+                .pickups
+                .snapshot()
+                .map_err(|_| SessionSnapshotError::Component("pickups"))?,
+            selected_weapon: u8::try_from(self.selected_weapon)
+                .map_err(|_| SessionSnapshotError::Component("weapon"))?,
+            combat: self.combat.snapshot(),
+            projectiles: self
+                .projectiles
+                .snapshot()
+                .map_err(|_| SessionSnapshotError::Component("projectiles"))?,
+            projectile_heights: self
+                .projectile_heights
+                .iter()
+                .map(|(&id, &height)| (id, height))
+                .collect(),
+            mines: self
+                .mines
+                .snapshot()
+                .map_err(|_| SessionSnapshotError::Component("mines"))?,
+            object_states: self.scripted_objects.as_ref().map(|s| s.states.snapshot()),
+            object_combat: self.objects.as_ref().map(|o| o.snapshot()),
+            quake: self.scripted_objects.as_ref().map(|s| s.quake.snapshot()),
+            mission: self.mission.as_ref().map(|m| m.snapshot()),
+            hazards: self.hazards.snapshot(),
+            wind: self.wind.snapshot(),
+            ambient: self.ambient.as_ref().map(|a| a.snapshot()),
+            teleport: self.teleports.as_ref().map(|(_, state)| state.snapshot()),
+            wall_elevations: self.wall_elevations.clone(),
+            elevation_by_cell: self.elevation_by_cell.clone(),
+        })
+    }
+
+    /// Build a candidate from a caller-supplied fresh same-content baseline.
+    /// The caller must verify the digest from actual resolved inputs before
+    /// passing it, and publish the returned Session only after presentation is
+    /// rebuilt. Moving geometry is rejected until its history can be verified.
+    pub fn restore_from_baseline(
+        &self,
+        snapshot: &SessionSnapshot,
+        verified_content: crate::save_format::ContentDigest,
+    ) -> Result<Self, SessionSnapshotError> {
+        use crate::process_runtime::ProcessPhaseSnapshot;
+        if snapshot.content != verified_content {
+            return Err(SessionSnapshotError::Content);
+        }
+        if snapshot.capabilities != self.snapshot_capabilities() {
+            return Err(SessionSnapshotError::Capabilities);
+        }
+        if !self.pending_wind_errors.is_empty() {
+            return Err(SessionSnapshotError::PendingEffects);
+        }
+        let baseline = self
+            .processes
+            .snapshot(&self.world)
+            .map_err(|_| SessionSnapshotError::PendingEffects)?;
+        if baseline.processes.iter().any(|p| {
+            p.phase != ProcessPhaseSnapshot::Closed
+                || p.progress != 0.0
+                || p.wall_progress
+                    .iter()
+                    .chain(&p.object_progress)
+                    .any(|v| *v != 0.0)
+        }) {
+            return Err(SessionSnapshotError::Unverifiable("baseline is not fresh"));
+        }
+        if snapshot.processes.processes.iter().any(|p| {
+            p.wall_progress
+                .iter()
+                .chain(&p.object_progress)
+                .any(|v| *v != 0.0)
+        }) {
+            return Err(SessionSnapshotError::Unverifiable(
+                "moving process geometry",
+            ));
+        }
+        if snapshot.world.walls.len() != self.world.walls.len()
+            || snapshot
+                .world
+                .walls
+                .iter()
+                .zip(&self.world.walls)
+                .any(|(saved, wall)| saved.a != wall.a || saved.b != wall.b)
+        {
+            return Err(SessionSnapshotError::Unverifiable("wall geometry"));
+        }
+        if snapshot.wall_elevations != snapshot.processes.elevations
+            || snapshot.wall_elevations.len() != self.world.walls.len()
+            || snapshot.wall_elevations.iter().any(|v| *v != 0.0)
+            || snapshot.elevation_by_cell.len() != 4096
+            || snapshot.elevation_by_cell.iter().any(|v| *v != 0.0)
+        {
+            return Err(SessionSnapshotError::Unverifiable("wall elevation"));
+        }
+        for object in &snapshot.processes.objects {
+            let original = baseline
+                .objects
+                .iter()
+                .find(|o| o.cell == object.cell)
+                .ok_or(SessionSnapshotError::Inconsistent("process object"))?;
+            if object.position != original.position
+                || object.angle_radians != original.angle_radians
+                || object.elevation_raw != original.elevation_raw
+            {
+                return Err(SessionSnapshotError::Unverifiable("object geometry"));
+            }
+        }
+        if snapshot.processes.keys != snapshot.inventory.keys {
+            return Err(SessionSnapshotError::Inconsistent("keys"));
+        }
+        if snapshot.powerups.enabled != snapshot.capabilities.powerups
+            || snapshot.ai.player_invisible != (snapshot.inventory.invisibility_ticks_remaining > 0)
+        {
+            return Err(SessionSnapshotError::Inconsistent("powerup state"));
+        }
+        // Grids are history-dependent and current component snapshots cannot
+        // prove that arbitrary stored cells were authored by fired processes.
+        if snapshot
+            .wind
+            .cells
+            .iter()
+            .chain(&snapshot.wind.actor_cells)
+            .any(|v| *v != [0, 0])
+        {
+            return Err(SessionSnapshotError::Unverifiable("wind grid history"));
+        }
+        if snapshot.quake.as_ref()
+            != self
+                .scripted_objects
+                .as_ref()
+                .map(|s| s.quake.snapshot())
+                .as_ref()
+        {
+            return Err(SessionSnapshotError::Unverifiable("quake grid history"));
+        }
+        if snapshot.ambient.as_ref() != self.ambient.as_ref().map(|grid| grid.snapshot()).as_ref() {
+            return Err(SessionSnapshotError::Unverifiable("ambient grid history"));
+        }
+        if snapshot.selected_weapon as usize >= snapshot.inventory.weapons.len()
+            || !snapshot.inventory.weapons[snapshot.selected_weapon as usize]
+        {
+            return Err(SessionSnapshotError::Inconsistent("selected weapon"));
+        }
+        let mut candidate = self.clone();
+        candidate
+            .world
+            .restore(&snapshot.world)
+            .map_err(|_| SessionSnapshotError::Component("world"))?;
+        candidate
+            .processes
+            .restore(&snapshot.processes, &candidate.world)
+            .map_err(|_| SessionSnapshotError::Component("processes"))?;
+        candidate
+            .wall_elevations
+            .clone_from(&snapshot.wall_elevations);
+        candidate
+            .elevation_by_cell
+            .clone_from(&snapshot.elevation_by_cell);
+        candidate
+            .vertical
+            .restore(snapshot.vertical, candidate.player_bounds())
+            .map_err(|_| SessionSnapshotError::Component("vertical"))?;
+        candidate
+            .game
+            .inventory
+            .restore(&snapshot.inventory, &candidate.game.weapons)
+            .map_err(|_| SessionSnapshotError::Component("inventory"))?;
+        candidate
+            .game
+            .protective_powerups
+            .restore(snapshot.powerups)
+            .map_err(|_| SessionSnapshotError::Component("powerups"))?;
+        candidate
+            .game
+            .pickups
+            .restore(&snapshot.pickups)
+            .map_err(|_| SessionSnapshotError::Component("pickups"))?;
+        candidate
+            .actors
+            .restore(&snapshot.actors, &candidate.actor_definitions)
+            .map_err(|_| SessionSnapshotError::Component("actors"))?;
+        candidate
+            .ai
+            .restore(&snapshot.ai, &candidate.actors)
+            .map_err(|_| SessionSnapshotError::Component("ai"))?;
+        if candidate.actors.actors.iter().any(|actor| {
+            candidate.ai.mode(actor.source_index) == Some(Mode::Inactive) && actor.health != 0
+        }) {
+            return Err(SessionSnapshotError::Inconsistent("inactive actor health"));
+        }
+        candidate
+            .projectiles
+            .restore(&snapshot.projectiles, &candidate.rockets, &candidate.actors)
+            .map_err(|_| SessionSnapshotError::Component("projectiles"))?;
+        candidate
+            .mines
+            .restore(&snapshot.mines, &candidate.actors)
+            .map_err(|_| SessionSnapshotError::Component("mines"))?;
+        candidate
+            .combat
+            .restore(snapshot.combat, &candidate.game.weapons)
+            .map_err(|_| SessionSnapshotError::Component("combat"))?;
+        candidate.selected_weapon = snapshot.selected_weapon as usize;
+        let ids: BTreeSet<_> = candidate
+            .projectiles
+            .active()
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        let mut heights = BTreeMap::new();
+        for &(id, height) in &snapshot.projectile_heights {
+            if !ids.contains(&id)
+                || !height.is_finite()
+                || height.abs() > 4096.0
+                || heights.insert(id, height).is_some()
+            {
+                return Err(SessionSnapshotError::Inconsistent("projectile heights"));
+            }
+        }
+        candidate.projectile_heights = heights;
+        match (
+            &mut candidate.scripted_objects,
+            &snapshot.object_states,
+            &snapshot.quake,
+        ) {
+            (Some(scripted), Some(states), Some(quake)) => {
+                scripted
+                    .states
+                    .restore(states)
+                    .map_err(|_| SessionSnapshotError::Component("object states"))?;
+                scripted
+                    .quake
+                    .restore(quake)
+                    .map_err(|_| SessionSnapshotError::Component("quake"))?;
+            }
+            (None, None, None) => {}
+            _ => return Err(SessionSnapshotError::Capabilities),
+        }
+        match (
+            &mut candidate.objects,
+            &snapshot.object_combat,
+            &candidate.scripted_objects,
+        ) {
+            (Some(objects), Some(saved), Some(scripted)) => objects
+                .restore(saved, &scripted.definitions)
+                .map_err(|_| SessionSnapshotError::Component("object combat"))?,
+            (None, None, _) => {}
+            _ => return Err(SessionSnapshotError::Unverifiable("object definitions")),
+        }
+        match (&mut candidate.mission, &snapshot.mission) {
+            (Some(target), Some(saved)) => target
+                .restore(saved)
+                .map_err(|_| SessionSnapshotError::Component("mission"))?,
+            (None, None) => {}
+            _ => return Err(SessionSnapshotError::Capabilities),
+        }
+        candidate
+            .hazards
+            .restore(&snapshot.hazards)
+            .map_err(|_| SessionSnapshotError::Component("hazards"))?;
+        candidate
+            .wind
+            .restore(&snapshot.wind)
+            .map_err(|_| SessionSnapshotError::Component("wind"))?;
+        if !candidate
+            .processes
+            .snapshot_effects_match(&snapshot.hazards, &snapshot.wind)
+        {
+            return Err(SessionSnapshotError::Inconsistent("hazards or wind"));
+        }
+        match (&mut candidate.ambient, &snapshot.ambient) {
+            (Some(target), Some(saved)) => target
+                .restore(saved)
+                .map_err(|_| SessionSnapshotError::Component("ambient"))?,
+            (None, None) => {}
+            _ => return Err(SessionSnapshotError::Capabilities),
+        }
+        match (&mut candidate.teleports, snapshot.teleport) {
+            (Some((_, state)), Some(saved)) if state.snapshot().policy == saved.policy => state
+                .restore(saved)
+                .map_err(|_| SessionSnapshotError::Component("teleport"))?,
+            (None, None) => {}
+            _ => return Err(SessionSnapshotError::Capabilities),
+        }
+        if let (Some(states), Some(objects)) = (&snapshot.object_states, &snapshot.object_combat) {
+            for object in &objects.entries {
+                let state = states
+                    .entries
+                    .iter()
+                    .find(|s| s.cell == object.cell)
+                    .ok_or(SessionSnapshotError::Inconsistent("object identity"))?;
+                if object.raw_type != state.raw_type
+                    || object.position != state.position
+                    || object.health.is_some_and(|health| health != state.health)
+                {
+                    return Err(SessionSnapshotError::Inconsistent("object state"));
+                }
+            }
+        }
+        for object in &snapshot.processes.objects {
+            let cell = [usize::from(object.cell[0]), usize::from(object.cell[1])];
+            if let Some(state) = snapshot
+                .object_states
+                .as_ref()
+                .and_then(|states| states.entries.iter().find(|s| s.cell == cell))
+            {
+                if object.position != state.position
+                    || object.angle_radians != state.angle_radians
+                    || candidate
+                        .processes
+                        .cell_type(object.cell)
+                        .is_some_and(|raw| raw != state.raw_type)
+                {
+                    return Err(SessionSnapshotError::Inconsistent("process object state"));
+                }
+                let scripted = candidate
+                    .scripted_objects
+                    .as_ref()
+                    .ok_or(SessionSnapshotError::Capabilities)?;
+                let def = scripted
+                    .definitions
+                    .level_objects
+                    .get(usize::from(state.raw_type - 163))
+                    .ok_or(SessionSnapshotError::Component("object definition"))?;
+                let radius = if def.model_name.eq_ignore_ascii_case("dummy.3o")
+                    || (141..=143).contains(&def.action_code)
+                {
+                    0.0
+                } else {
+                    (def.collision_radius.max(0) as f32 / 256.0).min(2.0)
+                };
+                if object.blocking_radius != radius {
+                    return Err(SessionSnapshotError::Inconsistent("object collision"));
+                }
+            } else if baseline
+                .objects
+                .iter()
+                .find(|o| o.cell == object.cell)
+                .is_some_and(|base| base.blocking_radius != object.blocking_radius)
+            {
+                return Err(SessionSnapshotError::Inconsistent("pickup collision"));
+            }
+            if let Some(pickup) = snapshot
+                .pickups
+                .entries
+                .iter()
+                .find(|p| p.cell == object.cell)
+            {
+                if pickup.position != object.position || pickup.collected {
+                    return Err(SessionSnapshotError::Inconsistent("process pickup"));
+                }
+            }
+        }
+        for original in &baseline.objects {
+            if snapshot
+                .processes
+                .objects
+                .iter()
+                .any(|object| object.cell == original.cell)
+            {
+                continue;
+            }
+            let cell = [usize::from(original.cell[0]), usize::from(original.cell[1])];
+            let collected = snapshot
+                .pickups
+                .entries
+                .iter()
+                .any(|p| p.cell == original.cell && p.collected);
+            let removed = snapshot.object_combat.as_ref().is_some_and(|objects| {
+                objects
+                    .entries
+                    .iter()
+                    .any(|o| o.cell == cell && (o.destroyed || !o.enabled))
+            });
+            if !collected && !removed {
+                return Err(SessionSnapshotError::Inconsistent("removed process object"));
+            }
+        }
+        for (wall, original) in candidate
+            .world
+            .walls
+            .iter()
+            .zip(&candidate.base_wall_blocking)
+        {
+            if wall.blocks_movement != *original {
+                return Err(SessionSnapshotError::Inconsistent("wall collision"));
+            }
+        }
+        Ok(candidate)
+    }
     pub fn new(mut setup: LevelSetup) -> Self {
         let ai = EnemyAi::new(&setup.actors, setup.difficulty);
         // Disabled difficulty placements must not be hittable by combat.
@@ -2010,6 +2507,143 @@ mod tests {
         });
         session.set_mission(MissionPlan::parse(&script, text));
         session
+    }
+
+    #[test]
+    fn aggregate_snapshot_restores_from_fresh_baseline_atomically() {
+        let mut baseline = mission_session("");
+        baseline.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: String::new(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 0, 10],
+        }]);
+        let mut source = baseline.clone();
+        source.game.inventory.health = 73;
+        source.step(SessionInput {
+            fire: true,
+            movement: Input {
+                forward: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let digest = crate::save_format::ContentDigest([9; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
+        assert_eq!(
+            source
+                .step(SessionInput {
+                    fire: true,
+                    ..Default::default()
+                })
+                .shot,
+            restored
+                .step(SessionInput {
+                    fire: true,
+                    ..Default::default()
+                })
+                .shot
+        );
+        assert_eq!(
+            source.snapshot(digest).unwrap(),
+            restored.snapshot(digest).unwrap()
+        );
+        let mut invalid = snapshot.clone();
+        invalid.inventory.health = 201;
+        assert_eq!(
+            baseline.restore_from_baseline(&invalid, digest).err(),
+            Some(SessionSnapshotError::Component("inventory"))
+        );
+        assert_eq!(baseline.game.inventory.health, 100);
+        assert_eq!(
+            baseline
+                .restore_from_baseline(&snapshot, crate::save_format::ContentDigest([8; 32]))
+                .err(),
+            Some(SessionSnapshotError::Content)
+        );
+        invalid = snapshot.clone();
+        invalid.projectile_heights.push((999, 1.0));
+        assert_eq!(
+            baseline.restore_from_baseline(&invalid, digest).err(),
+            Some(SessionSnapshotError::Inconsistent("projectile heights"))
+        );
+        invalid = snapshot.clone();
+        invalid.wind.cells[0] = [1, 0];
+        assert_eq!(
+            baseline.restore_from_baseline(&invalid, digest).err(),
+            Some(SessionSnapshotError::Unverifiable("wind grid history"))
+        );
+        invalid = snapshot.clone();
+        invalid.capabilities.explosions = !invalid.capabilities.explosions;
+        assert_eq!(
+            baseline.restore_from_baseline(&invalid, digest).err(),
+            Some(SessionSnapshotError::Capabilities)
+        );
+        invalid = snapshot.clone();
+        invalid.selected_weapon = 7;
+        assert_eq!(
+            baseline.restore_from_baseline(&invalid, digest).err(),
+            Some(SessionSnapshotError::Inconsistent("selected weapon"))
+        );
+    }
+
+    #[test]
+    fn aggregate_snapshot_rejects_pending_effects_and_unverified_motion() {
+        let digest = crate::save_format::ContentDigest([1; 32]);
+        let text = "#proc1\n#action\nplayani 1\n#end\n#links\nlink 0 0 1\n#end\n";
+        let mut pending = mission_session(text);
+        assert_eq!(
+            pending.processes.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            pending.snapshot(digest).err(),
+            Some(SessionSnapshotError::PendingEffects)
+        );
+        let text = "#proc1\n#action\nmove 1 0 256 0\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let mut baseline = mission_session(text);
+        baseline.world.walls.push(crate::world::Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([1, 0]),
+        });
+        baseline.processes = ProcessRuntime::new(&Script::parse(text), &baseline.world);
+        baseline.wall_elevations = vec![0.0];
+        baseline.base_wall_blocking = vec![true];
+        let mut moved = baseline.clone();
+        moved.step(SessionInput::default());
+        let snapshot = moved.snapshot(digest).unwrap();
+        assert_eq!(
+            baseline.restore_from_baseline(&snapshot, digest).err(),
+            Some(SessionSnapshotError::Unverifiable(
+                "moving process geometry"
+            ))
+        );
+    }
+
+    #[test]
+    fn aggregate_snapshot_preserves_delayed_retry_on_fresh_session() {
+        let text =
+            "#proc1\nstartdelay 0.05\n#action\nambient 0 0 2 2 5\n#end\n#links\nlink 0 0 1\n#end\n";
+        let baseline = ambient_session(text);
+        let mut source = baseline.clone();
+        source
+            .try_staged_process("link", [0, 0], 1, &mut SessionEvents::default())
+            .unwrap();
+        source.step(SessionInput::default());
+        let digest = crate::save_format::ContentDigest([4; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        for _ in 0..5 {
+            let a = source.step(SessionInput::default());
+            let b = restored.step(SessionInput::default());
+            assert_eq!(a.delayed_process_blocked, b.delayed_process_blocked);
+            assert_eq!(source.ambient_grid(), restored.ambient_grid());
+        }
+        assert_eq!(restored.ambient_grid().unwrap().cell([0, 0]), Some(5));
     }
 
     fn ambient_session(text: &str) -> Session {

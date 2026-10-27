@@ -291,7 +291,32 @@ pub struct ShotContext<'a> {
 pub struct Combat {
     cooldown: f32,
 }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CombatSnapshot {
+    pub cooldown: f32,
+}
 impl Combat {
+    pub fn snapshot(&self) -> CombatSnapshot {
+        CombatSnapshot {
+            cooldown: self.cooldown,
+        }
+    }
+    pub fn restore(
+        &mut self,
+        value: CombatSnapshot,
+        weapons: &WeaponDefinitions,
+    ) -> Result<(), &'static str> {
+        let max = weapons
+            .0
+            .iter()
+            .map(|spec| (spec.reload_time as f32 / RELOAD_UNITS_PER_SECOND).max(MIN_COOLDOWN))
+            .fold(0.0_f32, f32::max);
+        if !value.cooldown.is_finite() || value.cooldown < 0.0 || value.cooldown > max {
+            return Err("invalid combat cooldown");
+        }
+        self.cooldown = value.cooldown;
+        Ok(())
+    }
     pub fn new() -> Self {
         Self::default()
     }

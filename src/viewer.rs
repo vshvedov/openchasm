@@ -9,6 +9,7 @@ mod minimap;
 use crate::audio::{Audio, PlayerSound};
 use crate::color_pipeline::{ColorPipeline, LinearRgb, RenderPixel};
 use crate::graphics_settings::{GraphicsMenu, GraphicsSettings, MenuAction, SettingsStore};
+use crate::lighting_worker::{LightingWorker, OwnedShadowTexture};
 use crate::object_render::{
     ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot, Translucency,
 };
@@ -31,6 +32,7 @@ use sdl2::{
 };
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const WIDTH: usize = 640;
@@ -820,7 +822,7 @@ impl FrameScene<'_> {
                         .sample(self.camera.player.position)
                         .unwrap_or(1.0)
                 },
-                |(map, _)| map.sample(self.camera.player.position, [0.0, 0.0, 1.0]),
+                |(map, _)| map.sample_horizontal(self.camera.player.position),
             ),
         );
         timings.weapon = profile_elapsed(started);
@@ -989,40 +991,32 @@ impl LightingGeometry {
 struct LightingCache {
     map: Option<RemasterLightMap>,
     geometry: Option<Vec<LightingGeometry>>,
+    worker: Option<LightingWorker>,
+    generation: u64,
 }
 impl LightingCache {
-    fn update(
-        &mut self,
-        map: &crate::map::Map,
-        world: &World,
-        elevations: &[f32],
+    fn with_worker(
+        map: Arc<crate::map::Map>,
         textures: &[Option<ViewerTexture>],
-    ) -> Result<(), LightingError> {
-        let current = || {
-            world.walls.iter().enumerate().map(|(index, wall)| {
-                LightingGeometry::from_wall(wall, elevations.get(index).copied().unwrap_or(0.0))
-            })
-        };
-        if self
-            .geometry
-            .as_ref()
-            .is_some_and(|previous| previous.iter().copied().eq(current()))
-        {
-            return Ok(());
-        }
-        self.geometry = Some(current().collect());
-        let elevations: Vec<_> = elevations.iter().map(|value| value / 64.0).collect();
-        let textures: Vec<_> = textures
+    ) -> std::io::Result<Self> {
+        let textures = textures
             .iter()
             .map(|texture| {
-                texture.as_ref().map(|texture| ShadowTexture {
-                    width: texture.width,
-                    height: texture.height,
-                    pixels: &texture.pixels,
+                texture.as_ref().map(|texture| {
+                    OwnedShadowTexture::from_argb(texture.width, texture.height, &texture.pixels)
                 })
             })
             .collect();
-        match RemasterLightMap::build(map, world, &elevations, &textures) {
+        Ok(Self {
+            worker: Some(LightingWorker::new(map, textures)?),
+            ..Self::default()
+        })
+    }
+    fn install(
+        &mut self,
+        result: Result<RemasterLightMap, LightingError>,
+    ) -> Result<(), LightingError> {
+        match result {
             Ok(field) => {
                 if field.skipped_sources() != 0 {
                     eprintln!(
@@ -1038,6 +1032,56 @@ impl LightingCache {
                 Err(error)
             }
         }
+    }
+
+    fn update(
+        &mut self,
+        map: &crate::map::Map,
+        world: &World,
+        elevations: &[f32],
+        textures: &[Option<ViewerTexture>],
+    ) -> Result<(), LightingError> {
+        let mut completion_error = None;
+        if let Some(result) = self.worker.as_mut().and_then(LightingWorker::try_result) {
+            if result.generation > self.generation {
+                self.generation = result.generation;
+                completion_error = self.install(result.result).err();
+            }
+        }
+        let current = || {
+            world.walls.iter().enumerate().map(|(index, wall)| {
+                LightingGeometry::from_wall(wall, elevations.get(index).copied().unwrap_or(0.0))
+            })
+        };
+        if self
+            .geometry
+            .as_ref()
+            .is_some_and(|previous| previous.iter().copied().eq(current()))
+        {
+            return completion_error.map_or(Ok(()), Err);
+        }
+        let initial = self.geometry.is_none();
+        self.geometry = Some(current().collect());
+        let elevations: Vec<_> = elevations.iter().map(|value| value / 64.0).collect();
+        // Build the first field during loading; subsequent geometry changes
+        // retain the latest completed field while the worker catches up.
+        if !initial {
+            if let Some(worker) = &mut self.worker {
+                worker.submit(world.clone(), elevations);
+                return completion_error.map_or(Ok(()), Err);
+            }
+        }
+        let textures: Vec<_> = textures
+            .iter()
+            .map(|texture| {
+                texture.as_ref().map(|texture| ShadowTexture {
+                    width: texture.width,
+                    height: texture.height,
+                    pixels: &texture.pixels,
+                })
+            })
+            .collect();
+        self.install(RemasterLightMap::build(map, world, &elevations, &textures))
     }
 }
 
@@ -1079,6 +1123,7 @@ pub fn run(
         content_digest: _content_digest,
         verified_resources: _verified_resources,
     } = feedback;
+    let map = Arc::new(map);
     let difficulty_mask = crate::difficulty_mask(difficulty);
     let initial_session = session.clone();
     let mut warned_actor_clips = HashSet::new();
@@ -1137,7 +1182,11 @@ pub fn run(
     let mut hdr_frame = vec![LinearRgb::default(); WIDTH * HEIGHT];
     let mut rgb_transparency = Translucency::new(WIDTH * HEIGHT);
     let mut hdr_transparency = Translucency::new(WIDTH * HEIGHT);
-    let mut remaster_lighting = LightingCache::default();
+    let mut remaster_lighting = LightingCache::with_worker(Arc::clone(&map), &textures)
+        .unwrap_or_else(|error| {
+            eprintln!("background lighting unavailable; rebuilding synchronously: {error}");
+            LightingCache::default()
+        });
     let mut bloom = crate::bloom::Bloom::new(WIDTH, HEIGHT)?;
     let settings_store = match SettingsStore::for_sdl() {
         Ok(store) => Some(store),

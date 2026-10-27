@@ -10,6 +10,7 @@ mod gltf_model;
 mod graphics_settings;
 mod impact_render;
 mod launcher;
+mod lighting_worker;
 mod object_height_loader;
 mod object_render;
 mod planes;

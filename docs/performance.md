@@ -63,5 +63,9 @@ level-one spawn (plane 11.6 ms, wall 5.8 ms, model 4.3 ms, post 6.0 ms), compare
 with about 44 FPS for HDR using the former scalar field. This is an additional
 CPU fidelity cost and remains a performance target. All 19 installed maps build
 finite fields without skipping sources; release construction was 21 ms for
-MAP01 and 5–44 ms across the maps. Moving geometry requires refreshed shadows,
-so rebuild scheduling must avoid adding that construction time to every frame.
+MAP01 and 5–44 ms across the maps. Moving geometry refreshes shadows on a background worker after the initial
+field is built. The queue retains one pending geometry snapshot and one
+completed result; newer pending snapshots replace older ones. Rendering uses
+the latest completed field, so shadows may lag moving geometry while a build
+finishes. Worker creation failure falls back to synchronous rebuilds with a
+reported error.

@@ -1,20 +1,13 @@
-mod actors;
 mod archive;
 mod content;
-mod map;
-mod model;
-mod monster;
 mod object_render;
-mod objects;
 mod planes;
-mod process;
-mod process_runtime;
 mod texture;
 mod viewer;
-mod world;
 
 use content::{ResourceSet, SourceKind};
 use map::{Map, MAP_SIDE, UNITS_PER_TILE};
+use openchasm::{actors, map, model, monster, objects, process, process_runtime, world};
 use std::env;
 use std::error::Error;
 use std::io::{self, Write};

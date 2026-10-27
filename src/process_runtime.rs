@@ -10,7 +10,7 @@ use crate::process::{Process, Script};
 use crate::quake::QuakeZone;
 use crate::wind::WindZone;
 use crate::world::World;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const USE_RANGE: f32 = 1.25;
 const MAP_UNITS_PER_TILE: f32 = 256.0;
@@ -1185,6 +1185,59 @@ pub struct ProcessCommand {
     pub process_id: u16,
 }
 
+/// Identify walls not referenced by any potentially geometry-changing script
+/// action. Unknown action names or ambiguous coordinates make every wall
+/// unverified; runtime action support does not affect this classification.
+fn static_wall_mask(script: &Script, world: &World) -> Vec<bool> {
+    let mut targets = BTreeSet::new();
+    let mut unknown = !script.diagnostics.is_empty();
+    for action in script
+        .processes
+        .values()
+        .flat_map(|process| &process.actions)
+    {
+        match action.name.as_str() {
+            "move" | "xmove" | "ymove" | "rotate" | "up" | "change" | "explode" => {
+                let cell = action
+                    .arguments
+                    .first()
+                    .and_then(|value| value.parse::<u8>().ok())
+                    .zip(
+                        action
+                            .arguments
+                            .get(1)
+                            .and_then(|value| value.parse::<u8>().ok()),
+                    );
+                match cell {
+                    Some((x, y)) if x < 64 && y < 64 => {
+                        targets.insert([x, y]);
+                    }
+                    _ => unknown = true,
+                }
+            }
+            // These known commands do not transform or replace walls.
+            "lock" | "unlock" | "playani" | "stopani" | "light" | "death" | "quake" | "ambient"
+            | "wind" | "source" | "waitout" | "nonstop" => {}
+            _ => unknown = true,
+        }
+    }
+    world
+        .walls
+        .iter()
+        .map(|wall| {
+            !unknown
+                && wall
+                    .a
+                    .iter()
+                    .chain(wall.b.iter())
+                    .all(|value| value.is_finite())
+                && wall
+                    .cell
+                    .is_some_and(|cell| cell[0] < 64 && cell[1] < 64 && !targets.contains(&cell))
+        })
+        .collect()
+}
+
 /// Process state can be ticked by a client or a headless authoritative server.
 /// The owning world's wall vector must retain its original order and length.
 #[derive(Clone)]
@@ -1194,6 +1247,7 @@ pub struct ProcessRuntime {
     previous_floor: Option<[u8; 2]>,
     keys: [bool; 3],
     elevations: Vec<f32>,
+    static_walls: Vec<bool>,
     objects: BTreeMap<[u8; 2], ProcessObject>,
     cell_types: Option<Vec<u8>>,
     effects: Vec<ProcessEffect>,
@@ -1525,6 +1579,7 @@ impl ProcessRuntime {
             previous_floor: None,
             keys: [false; 3],
             elevations: vec![0.0; world.walls.len()],
+            static_walls: static_wall_mask(script, world),
             objects,
             cell_types: capabilities.initial_cell_types.map(|x| x.to_vec()),
             effects: Vec::new(),
@@ -1535,6 +1590,13 @@ impl ProcessRuntime {
     /// The authoritative host must consume these before advancing another step.
     pub fn take_effects(&mut self) -> Vec<ProcessEffect> {
         std::mem::take(&mut self.effects)
+    }
+    /// Per-original-wall mask: `true` only when no known or unknown script
+    /// action can address it. Walls without valid map cells remain false.
+    /// Callers must invalidate this proof if external code mutates geometry or
+    /// changes the wall vector, script, map or index order.
+    pub fn static_wall_mask(&self) -> &[bool] {
+        &self.static_walls
     }
     pub fn wall_elevation(&self, index: usize) -> Option<f32> {
         self.elevations.get(index).copied()
@@ -3173,6 +3235,83 @@ mod tests {
         assert_eq!(
             fresh.activate_at("link", [3, 0])[0].outcome,
             ProcessOutcome::Unsupported
+        );
+    }
+    #[test]
+    fn static_mask_excludes_all_authored_geometry_targets_even_if_unsupported() {
+        let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\nquake 0 0 2 2 100\n#end\n#proc2\n#action\nxmove 2 0 malformed\nymove 3 0 1 1\nrotate 4 0 1 1 90\nup 5 0 80\nchange 6 0 5\nexplode 7 0\n#end\n");
+        let mut world = world();
+        world.walls = (1..=8)
+            .map(|x| Wall {
+                a: [x as f32, 0.0],
+                b: [x as f32, 1.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([x, 0]),
+            })
+            .collect();
+        world.walls.push(Wall {
+            a: [9.0, 0.0],
+            b: [9.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        let runtime = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            runtime.static_wall_mask(),
+            &[false, false, false, false, false, false, false, true, false]
+        );
+        assert_eq!(
+            runtime.clone().static_wall_mask(),
+            runtime.static_wall_mask()
+        );
+    }
+    #[test]
+    fn ambiguous_actions_or_script_diagnostics_make_all_walls_unverified() {
+        let world = world();
+        for body in [
+            "move unknown 0 256 0",
+            "move 64 0 256 0",
+            "move 1",
+            "unknown 1 0",
+            "call 1",
+        ] {
+            let script = Script::parse(&format!("#proc1\n#action\n{body}\n#end\n"));
+            assert_eq!(
+                ProcessRuntime::new(&script, &world).static_wall_mask(),
+                &[false],
+                "{body}"
+            );
+        }
+        let script = Script::parse("#proc 1\n#end\n#proc 1\n#end\n");
+        assert!(!script.diagnostics.is_empty());
+        assert_eq!(
+            ProcessRuntime::new(&script, &world).static_wall_mask(),
+            &[false]
+        );
+    }
+    #[test]
+    fn static_mask_rejects_invalid_geometry_and_map_cells() {
+        let script = Script::default();
+        let mut world = world();
+        world.walls.push(Wall {
+            a: [f32::NAN, 0.0],
+            b: [2.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([2, 0]),
+        });
+        world.walls.push(Wall {
+            a: [3.0, 0.0],
+            b: [3.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([64, 0]),
+        });
+        assert_eq!(
+            ProcessRuntime::new(&script, &world).static_wall_mask(),
+            &[true, false, false]
         );
     }
 }

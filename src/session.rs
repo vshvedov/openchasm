@@ -1,6 +1,6 @@
 //! Fixed-tick game session: simulation state independent of presentation and transport.
 use crate::actors::{ActorDefinitions, ActorState};
-use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
+use crate::ai::{ActorCollisionSides, EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{
     self, Combat, EnemyShotContext, EnemyShotHit, EnemyShotTarget, FireResult, RocketDefinitions,
     ShotContext, ShotImpact,
@@ -237,9 +237,9 @@ impl Session {
         }
     }
     /// Choose the wall policy for player and wind-driven movement. Defaults to
-    /// two-sided; regular enemy AI and moving-wall obstruction remain separate
-    /// until their owners explicitly support the same policy. Snapshot clones
-    /// retain the selected policy.
+    /// two-sided. Enemy chase uses authored sides only for walls proven static;
+    /// moving-wall obstruction remains conservative. Snapshot clones retain
+    /// the selected policy.
     pub fn set_wall_collision_mode(&mut self, mode: WallCollisionMode) {
         self.wall_collision_mode = mode;
     }
@@ -1261,14 +1261,31 @@ impl Session {
                 radius: object.blocking_radius,
             })
             .collect();
-        events.enemy_attacks = self.ai.tick_with_actor_collision(
-            &mut self.actors,
-            &self.actor_definitions,
-            &self.rockets,
-            &self.world,
-            &|wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
-            &enemy_objects,
-        );
+        let blocks_shots = |wall: &crate::world::Wall| {
+            Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0)
+        };
+        events.enemy_attacks = if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
+            self.ai.tick_with_authored_sides(
+                &mut self.actors,
+                &self.actor_definitions,
+                &self.rockets,
+                &self.world,
+                &blocks_shots,
+                ActorCollisionSides {
+                    objects: &enemy_objects,
+                    static_walls: self.processes.static_wall_mask(),
+                },
+            )
+        } else {
+            self.ai.tick_with_actor_collision(
+                &mut self.actors,
+                &self.actor_definitions,
+                &self.rockets,
+                &self.world,
+                &blocks_shots,
+                &enemy_objects,
+            )
+        };
         for index in 0..events.enemy_attacks.len() {
             let attack = events.enemy_attacks[index];
             if let EnemyAttackKind::Ranged {
@@ -1622,6 +1639,67 @@ mod tests {
             restarted.step(SessionInput::default());
         }
         assert!(restarted.world.player.position[0] < 0.821);
+    }
+
+    #[test]
+    fn enemy_chase_uses_authored_sides_only_for_static_walls() {
+        use crate::world::Wall;
+        fn fixture(script: &str) -> Session {
+            let mut session = mission_session("");
+            session.world.player.position = [0.1, 0.5];
+            session.world.walls.push(Wall {
+                a: [1.0, 0.0],
+                b: [1.0, 1.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: Some([1, 0]),
+            });
+            session.base_wall_blocking.push(true);
+            session.wall_elevations.push(0.0);
+            session.processes = ProcessRuntime::new(&Script::parse(script), &session.world);
+            session.shot_blocking[1] = false;
+            session.actor_definitions.entries.push(ActorDefinition {
+                model_name: "test.car".into(),
+                wall_radius: 64,
+                actor_radius: 64,
+                speed: 30,
+                rotation_speed: 180,
+                health: 30,
+                kick: 0,
+                rocket: -1,
+                separation_limit: 0,
+                extra_fields: vec![],
+                raw_line: "".into(),
+            });
+            session.actors.actors.push(Actor {
+                source_index: 0,
+                definition_index: 0,
+                placement: Monster {
+                    position: [512, 128],
+                    id: 101,
+                    angle: 0,
+                    flags: 2,
+                },
+                position: [2.0, 0.5],
+                angle_radians: 0.0,
+                health: 30,
+            });
+            session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+            session
+        }
+        let mut normal = fixture("");
+        let mut authored = normal.clone();
+        authored.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        let mut dynamic = fixture("#proc1\n#action\nmove 1 0 256 0\n#end\n");
+        dynamic.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        for _ in 0..150 {
+            normal.step(SessionInput::default());
+            authored.step(SessionInput::default());
+            dynamic.step(SessionInput::default());
+        }
+        assert!(normal.actors.actors[0].position[0] > 1.24);
+        assert!(authored.actors.actors[0].position[0] < 1.0);
+        assert!(dynamic.actors.actors[0].position[0] > 1.24);
     }
 
     #[test]

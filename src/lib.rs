@@ -10,6 +10,7 @@ pub mod process_runtime;
 pub mod process_transaction;
 pub mod world;
 
+pub mod actor_clips;
 pub mod actors;
 pub mod ai;
 pub mod combat;

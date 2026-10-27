@@ -3,6 +3,7 @@
 //! The caller advances this once at 60 Hz. Visibility, navigation, attack range,
 //! cooldown and collision are initial approximations, not original AI behavior.
 //! AI emits melee and projectile launch events; the owning simulation resolves damage.
+use crate::actor_clips::ActorClipSet;
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::combat::RocketDefinitions;
 use crate::pickups::Difficulty;
@@ -45,17 +46,34 @@ pub struct EnemyAttack {
     pub kind: EnemyAttackKind,
 }
 
+/// The authoritative local frame of the currently active attack clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttackAnimation {
+    pub slot: usize,
+    pub frame: u32,
+}
+#[derive(Debug, Clone, Copy)]
+struct AttackPhase {
+    slot: usize,
+    frame_count: u32,
+    elapsed_ticks: u32,
+    fired: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Brain {
     mode: Mode,
     last_seen: Option<[f32; 2]>,
     cooldown: u16,
+    run_units: u64,
+    attack_phase: Option<AttackPhase>,
 }
 
 /// Per-actor AI state remains separate from map definitions and rendering.
 #[derive(Debug, Default, Clone)]
 pub struct EnemyAi {
     brains: BTreeMap<usize, Brain>,
+    clips: Vec<Option<ActorClipSet>>,
 }
 
 fn sub(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
@@ -190,15 +208,44 @@ impl EnemyAi {
                         mode,
                         last_seen: None,
                         cooldown: 0,
+                        run_units: 0,
+                        attack_phase: None,
                     },
                 )
             })
             .collect();
-        Self { brains }
+        Self {
+            brains,
+            clips: Vec::new(),
+        }
     }
 
     pub fn mode(&self, source_index: usize) -> Option<Mode> {
         self.brains.get(&source_index).map(|brain| brain.mode)
+    }
+
+    /// Supply one optional clip set per monster definition before simulation.
+    /// A missing entry explicitly retains the legacy provisional attack logic;
+    /// a present set with absent slots disables the corresponding attack.
+    pub fn set_clip_metadata(&mut self, clips: Vec<Option<ActorClipSet>>) {
+        self.clips = clips;
+        for brain in self.brains.values_mut() {
+            brain.run_units = 0;
+            brain.attack_phase = None;
+            if brain.mode == Mode::Attacking {
+                brain.mode = Mode::Chasing;
+            }
+        }
+    }
+    /// Local attack frame uses the same deterministic 60ms/frame clock as AI.
+    pub fn attack_animation(&self, source_index: usize) -> Option<AttackAnimation> {
+        let phase = self.brains.get(&source_index)?.attack_phase?;
+        let frame = ((u64::from(phase.elapsed_ticks) * 5) / 18)
+            .min(u64::from(phase.frame_count - 1)) as u32;
+        Some(AttackAnimation {
+            slot: phase.slot,
+            frame,
+        })
     }
 
     /// Alert an actor to a position, for example when damaged out of sight.
@@ -280,6 +327,7 @@ impl EnemyAi {
             if actor.health <= 0 {
                 brain.mode = Mode::Dead;
                 brain.last_seen = None;
+                brain.attack_phase = None;
                 continue;
             }
             if brain.mode == Mode::Dead
@@ -299,6 +347,52 @@ impl EnemyAi {
             if sees_player {
                 brain.last_seen = Some(target);
             }
+            if let Some(mut phase) = brain.attack_phase {
+                phase.elapsed_ticks = phase.elapsed_ticks.saturating_add(1);
+                let frame = u64::from(phase.elapsed_ticks) * 5 / 18;
+                if !phase.fired && frame >= u64::from(phase.frame_count / 2) {
+                    phase.fired = true;
+                    if phase.slot == 5 {
+                        if sees_player
+                            && shot_clear(actor.position, target, &world.walls, blocks_shots)
+                        {
+                            if let Some((rocket_id, rocket)) = rockets
+                                .and_then(|table| {
+                                    usize::try_from(def.rocket).ok().and_then(|index| {
+                                        table.0.get(index).map(|entry| (index, entry))
+                                    })
+                                })
+                                .filter(|(_, rocket)| rocket.power > 0)
+                            {
+                                attacks.push(EnemyAttack {
+                                    source_index: actor.source_index,
+                                    damage: rocket.power.clamp(0, u16::MAX as i32) as u16,
+                                    kind: EnemyAttackKind::Ranged {
+                                        rocket_id,
+                                        instant: rocket.model_name.is_empty(),
+                                        origin: actor.position,
+                                        target,
+                                    },
+                                });
+                            }
+                        }
+                    } else if sees_player && distance <= MELEE_RANGE && def.kick > 0 {
+                        attacks.push(EnemyAttack {
+                            source_index: actor.source_index,
+                            damage: def.kick.clamp(0, u16::MAX as i32) as u16,
+                            kind: EnemyAttackKind::Melee,
+                        });
+                    }
+                }
+                if u64::from(phase.elapsed_ticks) * 5 >= u64::from(phase.frame_count) * 18 {
+                    brain.attack_phase = None;
+                    brain.mode = Mode::Chasing;
+                } else {
+                    brain.attack_phase = Some(phase);
+                    brain.mode = Mode::Attacking;
+                }
+                continue;
+            }
             let Some(destination) = brain.last_seen else {
                 brain.mode = Mode::Idle;
                 continue;
@@ -313,40 +407,97 @@ impl EnemyAi {
                     def.rotation_speed.clamp(0, 20) as f32 * DT,
                 );
             }
-            if sees_player && distance <= MELEE_RANGE && def.kick > 0 {
-                brain.mode = Mode::Attacking;
-                if brain.cooldown == 0 {
-                    attacks.push(EnemyAttack {
-                        source_index: actor.source_index,
-                        damage: def.kick.clamp(0, u16::MAX as i32) as u16,
-                        kind: EnemyAttackKind::Melee,
-                    });
-                    brain.cooldown = ATTACK_COOLDOWN_TICKS;
+            if let Some(clips) = self
+                .clips
+                .get(actor.definition_index)
+                .and_then(Option::as_ref)
+            {
+                let boundary = if let Some(run) = clips.clips[0]
+                    .filter(|clip| clip.frame_count > 0 && clip.frame_count <= 1_000_000)
+                {
+                    let duration = u64::from(run.frame_count) * 18;
+                    brain.run_units = brain.run_units.saturating_add(5);
+                    if brain.run_units >= duration {
+                        brain.run_units %= duration;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if boundary && sees_player {
+                    let melee = distance <= MELEE_RANGE && def.kick > 0;
+                    let slot = if melee {
+                        (6..=8).find(|&slot| {
+                            clips.clips[slot].is_some_and(|clip| {
+                                clip.frame_count > 0 && clip.frame_count <= 1_000_000
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    let ranged = clips.clips[5]
+                        .is_some_and(|clip| clip.frame_count > 0 && clip.frame_count <= 1_000_000)
+                        && shot_clear(actor.position, target, &world.walls, blocks_shots)
+                        && rockets
+                            .and_then(|table| {
+                                usize::try_from(def.rocket)
+                                    .ok()
+                                    .and_then(|id| table.0.get(id))
+                            })
+                            .is_some_and(|rocket| rocket.power > 0);
+                    if let Some(slot) = slot.or_else(|| ranged.then_some(5)) {
+                        let clip = clips.clips[slot].expect("selected present clip");
+                        brain.run_units = 0;
+                        brain.attack_phase = Some(AttackPhase {
+                            slot,
+                            frame_count: clip.frame_count,
+                            elapsed_ticks: 0,
+                            fired: false,
+                        });
+                        brain.mode = Mode::Attacking;
+                        continue;
+                    }
                 }
-                continue;
-            }
-            if sees_player && shot_clear(actor.position, target, &world.walls, blocks_shots) {
-                let rocket = rockets.and_then(|table| {
-                    usize::try_from(def.rocket)
-                        .ok()
-                        .and_then(|index| table.0.get(index).map(|entry| (index, entry)))
-                });
-                if let Some((rocket_id, rocket)) = rocket.filter(|(_, rocket)| rocket.power > 0) {
+                // Known metadata must not fall back to nonexistent attack slots.
+            } else {
+                if sees_player && distance <= MELEE_RANGE && def.kick > 0 {
                     brain.mode = Mode::Attacking;
                     if brain.cooldown == 0 {
                         attacks.push(EnemyAttack {
                             source_index: actor.source_index,
-                            damage: rocket.power.clamp(0, u16::MAX as i32) as u16,
-                            kind: EnemyAttackKind::Ranged {
-                                rocket_id,
-                                instant: rocket.model_name.is_empty(),
-                                origin: actor.position,
-                                target,
-                            },
+                            damage: def.kick.clamp(0, u16::MAX as i32) as u16,
+                            kind: EnemyAttackKind::Melee,
                         });
                         brain.cooldown = ATTACK_COOLDOWN_TICKS;
                     }
                     continue;
+                }
+                if sees_player && shot_clear(actor.position, target, &world.walls, blocks_shots) {
+                    let rocket = rockets.and_then(|table| {
+                        usize::try_from(def.rocket)
+                            .ok()
+                            .and_then(|index| table.0.get(index).map(|entry| (index, entry)))
+                    });
+                    if let Some((rocket_id, rocket)) = rocket.filter(|(_, rocket)| rocket.power > 0)
+                    {
+                        brain.mode = Mode::Attacking;
+                        if brain.cooldown == 0 {
+                            attacks.push(EnemyAttack {
+                                source_index: actor.source_index,
+                                damage: rocket.power.clamp(0, u16::MAX as i32) as u16,
+                                kind: EnemyAttackKind::Ranged {
+                                    rocket_id,
+                                    instant: rocket.model_name.is_empty(),
+                                    origin: actor.position,
+                                    target,
+                                },
+                            });
+                            brain.cooldown = ATTACK_COOLDOWN_TICKS;
+                        }
+                        continue;
+                    }
                 }
             }
             if !sees_player && goal_distance < 0.05 {
@@ -563,5 +714,136 @@ mod tests {
             .tick(&mut state, &defs, &world([f32::NAN, 0.0], vec![]))
             .is_empty());
         assert_eq!(ai.mode(0), Some(Mode::Idle));
+    }
+    #[test]
+    fn metadata_drives_run_then_melee_midpoint_and_completion() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].speed = 0;
+        let clips = ActorClipSet::parse_gltf(b"0 0 1\n6 1 4\n", Some(5)).unwrap();
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        ai.set_clip_metadata(vec![None, Some(clips)]);
+        let w = world([0.5, 0.0], vec![]);
+        for _ in 0..3 {
+            assert!(ai.tick(&mut state, &defs, &w).is_empty());
+            assert!(ai.attack_animation(0).is_none());
+        }
+        assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        assert_eq!(
+            ai.attack_animation(0),
+            Some(AttackAnimation { slot: 6, frame: 0 })
+        );
+        for _ in 0..7 {
+            assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        }
+        let mut restart_ai = ai.clone();
+        let mut restart_state = state.clone();
+        assert_eq!(
+            ai.tick(&mut state, &defs, &w),
+            vec![EnemyAttack {
+                source_index: 0,
+                damage: 20,
+                kind: EnemyAttackKind::Melee
+            }]
+        );
+        assert_eq!(
+            restart_ai.tick(&mut restart_state, &defs, &w),
+            vec![EnemyAttack {
+                source_index: 0,
+                damage: 20,
+                kind: EnemyAttackKind::Melee
+            }]
+        );
+        assert_eq!(
+            ai.attack_animation(0),
+            Some(AttackAnimation { slot: 6, frame: 2 })
+        );
+        for _ in 0..6 {
+            assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        }
+        assert!(ai.attack_animation(0).is_some());
+        assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        assert!(ai.attack_animation(0).is_none());
+    }
+    #[test]
+    fn metadata_selects_ranged_and_rechecks_target_at_fire_frame() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].speed = 0;
+        defs.entries[1].rocket = 0;
+        let clips = ActorClipSet::parse_gltf(b"0 0 1\n5 1 4\n6 5 4\n", Some(9)).unwrap();
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        ai.set_clip_metadata(vec![None, Some(clips)]);
+        let visible = world([2.0, 0.0], vec![]);
+        for _ in 0..4 {
+            assert!(ai
+                .tick_with_rockets(&mut state, &defs, &rockets(), &visible)
+                .is_empty());
+        }
+        assert_eq!(
+            ai.attack_animation(0),
+            Some(AttackAnimation { slot: 5, frame: 0 })
+        );
+        for _ in 0..7 {
+            assert!(ai
+                .tick_with_rockets(&mut state, &defs, &rockets(), &visible)
+                .is_empty());
+        }
+        let blocked = world([2.0, 0.0], vec![wall(1, true)]);
+        assert!(ai
+            .tick_with_rockets(&mut state, &defs, &rockets(), &blocked)
+            .is_empty());
+        for _ in 0..6 {
+            assert!(ai
+                .tick_with_rockets(&mut state, &defs, &rockets(), &visible)
+                .is_empty());
+        }
+        state.actors[0].health = 0;
+        assert!(ai
+            .tick_with_rockets(&mut state, &defs, &rockets(), &visible)
+            .is_empty());
+        assert_eq!(ai.mode(0), Some(Mode::Dead));
+        assert!(ai.attack_animation(0).is_none());
+    }
+    #[test]
+    fn known_missing_attack_or_run_slots_do_not_use_legacy_fallback() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].speed = 0;
+        let w = world([0.5, 0.0], vec![]);
+        for data in [b"0 0 1\n".as_slice(), b"6 0 1\n".as_slice()] {
+            let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+            ai.set_clip_metadata(vec![
+                None,
+                Some(ActorClipSet::parse_gltf(data, None).unwrap()),
+            ]);
+            for _ in 0..60 {
+                assert!(ai.tick(&mut state, &defs, &w).is_empty());
+            }
+            assert!(ai.attack_animation(0).is_none());
+        }
+        let mut legacy = EnemyAi::new(&state, Difficulty::Normal);
+        legacy.set_clip_metadata(vec![None, None]);
+        assert_eq!(legacy.tick(&mut state, &defs, &w).len(), 1);
+    }
+    #[test]
+    fn single_frame_attack_fires_once_and_completes_without_underflow() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].speed = 0;
+        let clips = ActorClipSet::parse_gltf(b"0 0 1\n6 1 1\n", Some(2)).unwrap();
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        ai.set_clip_metadata(vec![None, Some(clips)]);
+        let w = world([0.5, 0.0], vec![]);
+        for _ in 0..4 {
+            assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        }
+        assert_eq!(
+            ai.attack_animation(0),
+            Some(AttackAnimation { slot: 6, frame: 0 })
+        );
+        assert_eq!(ai.tick(&mut state, &defs, &w).len(), 1);
+        for _ in 0..2 {
+            assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        }
+        assert!(ai.attack_animation(0).is_some());
+        assert!(ai.tick(&mut state, &defs, &w).is_empty());
+        assert!(ai.attack_animation(0).is_none());
     }
 }

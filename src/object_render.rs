@@ -1442,6 +1442,14 @@ impl ObjectScene {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    pub(crate) type RestoreTestEntry = (Option<[usize; 2]>, Option<usize>, [f32; 2], bool);
+    pub(crate) fn restore_test_state(scene: &ObjectScene) -> Vec<RestoreTestEntry> {
+        scene
+            .instances
+            .iter()
+            .map(|i| (i.cell, i.object_definition_index, i.position, i.visible))
+            .collect()
+    }
     #[test]
     fn instance_light_brightens_translucent_mesh_without_changing_depth() {
         use openchasm::light_sources::{

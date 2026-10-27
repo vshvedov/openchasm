@@ -395,4 +395,171 @@ mod tests {
         assert_eq!(frame(&scene), before);
         std::fs::remove_dir_all(path).unwrap();
     }
+
+    #[test]
+    fn installed_level16_restored_session_rebuilds_replacements_atomically() {
+        use openchasm::{
+            object_combat::ObjectCombat,
+            object_states::ObjectStates,
+            process_runtime::{ProcessCapabilities, ProcessObject},
+            process_transaction::PresentationManifest,
+            save_format::ContentDigest,
+            session::{ScriptedObjects, SessionInput},
+        };
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let map = openchasm::map::Map::parse(&resources.read("map/map.16").unwrap()).unwrap();
+        let inf = resources.read("chasm.inf").unwrap();
+        let resource = resources.read("map/resource.16").unwrap();
+        let script = Script::parse(&String::from_utf8_lossy(
+            &resources.read("map/process.16").unwrap(),
+        ));
+        let definitions = ObjectDefinitions::parse(&inf, &resource).unwrap();
+        let instances = openchasm::objects::instances(&map);
+        let heart = instances
+            .iter()
+            .find(|item| item.grid_cell == [27, 47])
+            .unwrap();
+        let graphics = crate::parse_wall_graphics(&resource);
+        let mut world = crate::make_world(&map, &graphics).unwrap();
+        world.player.position = [heart.position[0] - 0.2, heart.position[1]];
+        world.player.angle = 0.0;
+        let cells = crate::raw_cells(&map);
+        let poses: Vec<_> = instances
+            .iter()
+            .filter(|item| item.kind == ObjectKind::LevelObject && item.difficulty_flags & 2 != 0)
+            .filter_map(|item| {
+                let def = definitions.definition(item)?;
+                Some(ProcessObject {
+                    cell: [item.grid_cell[0] as u8, item.grid_cell[1] as u8],
+                    position: item.position,
+                    angle_radians: item.angle_radians,
+                    elevation_raw: 0.0,
+                    blocking_radius: if (141..=143).contains(&def.action_code) {
+                        0.0
+                    } else {
+                        (def.collision_radius.max(0) as f32 / 256.0).min(2.0)
+                    },
+                })
+            })
+            .collect();
+        let processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: None,
+            },
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        let game = GameInventory::new(
+            WeaponDefinitions::parse(&inf).unwrap(),
+            &instances,
+            &definitions,
+            Difficulty::Normal,
+        );
+        let mut rockets = RocketDefinitions::parse(&inf).unwrap();
+        rockets.0[game.weapons.0[0].rocket_type as usize].power = 100_000;
+        let mut source = Session::new(LevelSetup {
+            world,
+            processes,
+            actors: ActorState {
+                player_spawns: vec![],
+                actors: vec![],
+                unresolved: vec![],
+            },
+            actor_definitions: ActorDefinitions::parse(&inf).unwrap(),
+            game,
+            rockets,
+            shot_blocking: [true; 128],
+            difficulty: Difficulty::Normal,
+        });
+        source.set_objects(ObjectCombat::new(
+            &instances,
+            &definitions,
+            &script,
+            Difficulty::Normal,
+        ));
+        let states = ObjectStates::new(&instances, &definitions).unwrap();
+        let mut manifest = PresentationManifest::default();
+        for cell in [[27, 46], [28, 47], [28, 48], [27, 48]] {
+            manifest.allow(cell, 202);
+        }
+        manifest.allow([29, 48], 200);
+        source.set_scripted_objects(ScriptedObjects::new(
+            states,
+            definitions.clone(),
+            manifest,
+            &script,
+            true,
+        ));
+        source.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
+        let baseline = source.clone();
+        let events = source.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert_eq!(events.object_transitions.len(), 5);
+        let digest = ContentDigest([73; 32]);
+        let snapshot = source.snapshot(digest).unwrap();
+        let encoded = openchasm::session_codec::encode(&snapshot).unwrap();
+        let decoded = openchasm::session_codec::decode(&encoded, digest).unwrap();
+        let restored = baseline.restore_from_baseline(&decoded, digest).unwrap();
+        let palette =
+            crate::texture::Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+        let before = crate::object_render::tests::restore_test_state(&scene);
+        let missing_path = std::env::temp_dir().join(format!(
+            "openchasm-missing-restore-assets-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&missing_path).unwrap();
+        let mut missing = ResourceSet::open(&missing_path).unwrap();
+        let failed = rebuild_scene(
+            &mut scene,
+            &mut missing,
+            &restored,
+            &instances,
+            Difficulty::Normal,
+        );
+        assert!(
+            matches!(failed, Err(SceneRestoreError::MissingObjectAsset(_, _))),
+            "{failed:?}"
+        );
+        assert_eq!(
+            crate::object_render::tests::restore_test_state(&scene),
+            before
+        );
+        std::fs::remove_dir_all(missing_path).unwrap();
+        // Reload a fresh scene: failed lookups may be negatively cached.
+        let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+        rebuild_scene(
+            &mut scene,
+            &mut resources,
+            &restored,
+            &instances,
+            Difficulty::Normal,
+        )
+        .unwrap();
+        let rebuilt = crate::object_render::tests::restore_test_state(&scene);
+        for (cell, raw) in [
+            ([27, 46], 202u8),
+            ([28, 47], 202),
+            ([28, 48], 202),
+            ([27, 48], 202),
+            ([29, 48], 200),
+        ] {
+            let row = rebuilt.iter().find(|row| row.0 == Some(cell)).unwrap();
+            assert_eq!(row.1, Some(usize::from(raw - 163)), "{cell:?}");
+        }
+    }
 }

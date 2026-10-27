@@ -213,6 +213,20 @@ fn load_actor_clips(
     clips
 }
 
+/// Resolve actors using exact content signatures; unrecognized custom data
+/// retains the normal authored ID-to-definition identity mapping.
+fn level_actor_state(
+    map: &Map,
+    map_bytes: &[u8],
+    inf: &[u8],
+) -> io::Result<(actors::ActorDefinitions, actors::ActorState)> {
+    let definitions = actors::ActorDefinitions::parse(inf)?;
+    let mapping = actors::ActorMapping::recognize_shipped_addon(map_bytes, inf);
+    let state =
+        actors::ActorState::from_placements_with_mapping(&map.monsters, &definitions, mapping);
+    Ok((definitions, state))
+}
+
 fn make_world(map: &Map, graphics: &[WallGraphic]) -> Result<World, Box<dyn Error>> {
     let spawn = map
         .monsters
@@ -408,8 +422,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 return Err("view expects a two-digit level ID, for example 01".into());
             }
             let mut carry: Option<openchasm::inventory::Inventory> = None;
+            let info = resources.read("chasm.inf")?;
             loop {
-                let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
+                let map_bytes = resources.read(&format!("map/map.{id}"))?;
+                let map = Map::parse(&map_bytes)?;
                 let resource = resources.read(&format!("map/resource.{id}"))?;
                 let name = level_name(&resource);
                 let graphics = parse_wall_graphics(&resource);
@@ -432,18 +448,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     eprintln!("{error}");
                 }
                 let cells = raw_cells(&map);
-                let definitions =
-                    objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
+                let definitions = objects::ObjectDefinitions::parse(&info, &resource)?;
                 let mut object_scene =
                     object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
                 let mine_available = object_scene.preload_mine(&mut resources, &definitions);
                 if !mine_available {
                     eprintln!("mine placement disabled: mine model unavailable");
                 }
-                let actor_definitions =
-                    actors::ActorDefinitions::parse(&resources.read("chasm.inf")?)?;
-                let actor_state =
-                    actors::ActorState::from_placements(&map.monsters, &actor_definitions);
+                let (actor_definitions, actor_state) = level_actor_state(&map, &map_bytes, &info)?;
                 object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
                 let actor_clips =
                     load_actor_clips(&mut resources, &actor_state, &actor_definitions);
@@ -528,7 +540,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                         &process_objects,
                     )?
                 };
-                let info = resources.read("chasm.inf")?;
                 let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
                 let mut audio = audio::Audio::new(&mut resources, &info);
                 audio.play_level_music(&mut resources, &resource);
@@ -707,6 +718,53 @@ fn main() {
 #[cfg(test)]
 mod wall_graphics_tests {
     use super::*;
+    #[test]
+    fn installed_addon_client_maps_authored_actor_ids_to_merged_models() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let inf = resources.read("chasm.inf").unwrap();
+        let mut seen = [false; 3];
+        for level in 17..=19 {
+            let bytes = resources.read(&format!("map/map.{level:02}")).unwrap();
+            let map = Map::parse(&bytes).unwrap();
+            let (defs, state) = level_actor_state(&map, &bytes, &inf).unwrap();
+            assert_eq!(
+                actors::ActorMapping::recognize_shipped_addon(&bytes, &inf),
+                actors::ActorMapping::AddonToRemaster
+            );
+            for actor in &state.actors {
+                if (116..=118).contains(&actor.placement.id) {
+                    let index = usize::from(actor.placement.id - 116);
+                    seen[index] = true;
+                    assert_eq!(actor.definition_index, 21 + index);
+                    assert_eq!(
+                        defs.entries[actor.definition_index]
+                            .model_name
+                            .to_ascii_lowercase(),
+                        ["shot.car", "wolf2.car", "wizard2.car"][index]
+                    );
+                    assert_eq!(actor.health, defs.entries[actor.definition_index].health);
+                }
+            }
+            let mut modified = inf.clone();
+            modified.push(b'\n');
+            let (_, custom) = level_actor_state(&map, &bytes, &modified).unwrap();
+            assert!(custom
+                .actors
+                .iter()
+                .filter(|actor| (116..=118).contains(&actor.placement.id))
+                .all(|actor| actor.definition_index == usize::from(actor.placement.id - 100)));
+        }
+        assert_eq!(seen, [true; 3]);
+    }
+
     #[test]
     fn options_accept_source_and_difficulty_in_either_order() {
         let mut args = ["--difficulty", "easy", "--source", "demo", "view", "01"]

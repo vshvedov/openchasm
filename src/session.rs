@@ -877,10 +877,14 @@ impl Session {
         }
     }
     fn apply_player_damage(&mut self, amount: u16) -> u16 {
-        // Provisional armor: absorbs at most half of each incoming hit.
-        let absorbed = (amount / 2).min(self.game.inventory.armor);
+        // Follows the independent reconstruction; original-game rounding and
+        // protection mechanics still require direct validation.
+        if self.game.inventory.health == 0 {
+            return 0;
+        }
+        let absorbed = amount.min(self.game.inventory.armor);
         self.game.inventory.armor -= absorbed;
-        let damage = amount - absorbed;
+        let damage = (amount - absorbed) + absorbed / 4;
         self.game.inventory.health = self.game.inventory.health.saturating_sub(damage);
         damage
     }
@@ -4252,5 +4256,140 @@ mod tests {
         assert_eq!(session.ai.mode(7), Some(Mode::Idle));
         assert_eq!(raised.ai.mode(7), Some(Mode::Chasing));
         assert!(raised.world.walls[0].blocks_movement);
+    }
+    #[test]
+    fn armor_absorbs_full_hit_and_uses_quarter_health_rounding() {
+        for (health, armor, amount, expected_health, expected_armor, expected_damage) in [
+            (100, 0, 20, 80, 0, 20),
+            (100, 100, 20, 95, 80, 5),
+            (100, 5, 20, 84, 0, 16),
+            (100, 3, 3, 100, 0, 0),
+            (100, 7, 7, 99, 0, 1),
+            (2, 8, 20, 0, 0, 14),
+            (0, 50, 10, 0, 50, 0),
+        ] {
+            let mut session = mission_session("");
+            session.game.inventory.health = health;
+            session.game.inventory.armor = armor;
+            assert_eq!(session.apply_player_damage(amount), expected_damage);
+            assert_eq!(
+                (session.game.inventory.health, session.game.inventory.armor),
+                (expected_health, expected_armor)
+            );
+        }
+    }
+    #[test]
+    fn armor_rules_apply_to_enemy_hitscan_projectiles_and_hazards() {
+        use crate::process_runtime::ProcessCapabilities;
+        let mut instant = mission_session("");
+        instant.game.inventory.armor = 100;
+        let attack = EnemyAttack {
+            source_index: 7,
+            damage: 20,
+            kind: EnemyAttackKind::Ranged {
+                rocket_id: 0,
+                instant: true,
+                origin: [2.5, 0.5],
+                target: [0.5, 0.5],
+            },
+        };
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        instant.resolve_enemy_instant(
+            attack,
+            0,
+            [2.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(
+            (
+                instant.game.inventory.health,
+                instant.game.inventory.armor,
+                events.damage
+            ),
+            (95, 80, 5)
+        );
+        let mut projectile = mission_session("");
+        projectile.game.inventory.armor = 100;
+        projectile.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "arrow.3o".into(),
+            power: 20,
+            raw_fields: vec![1, 0, 120, 0, 20, 0],
+        }]);
+        projectile
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Enemy { source_index: 7 },
+                    rocket_id: 0,
+                    origin: [1.5, 0.5],
+                    direction: [-1.0, 0.0],
+                },
+                &projectile.rockets,
+            )
+            .unwrap();
+        let mut seen = 0;
+        for _ in 0..15 {
+            seen += u32::from(projectile.step(SessionInput::default()).damage);
+        }
+        assert_eq!(
+            (
+                projectile.game.inventory.health,
+                projectile.game.inventory.armor,
+                seen
+            ),
+            (95, 80, 5)
+        );
+        let text =
+            "#proc1\n#action\nnonstop\ndeath 0 0 0 0 0 128 30\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let mut hazard = mission_session(text);
+        hazard.game.inventory.armor = 100;
+        hazard.processes = ProcessRuntime::with_hazards(
+            &Script::parse(text),
+            &hazard.world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+        );
+        let mut seen = 0;
+        for _ in 0..20 {
+            seen += u32::from(hazard.step(SessionInput::default()).damage);
+        }
+        assert_eq!(
+            (
+                hazard.game.inventory.health,
+                hazard.game.inventory.armor,
+                seen
+            ),
+            (93, 70, 7)
+        );
+    }
+    #[test]
+    fn simultaneous_mines_do_not_damage_or_consume_armor_after_death() {
+        let mut session = mission_session("");
+        session.set_mines_enabled(true);
+        session.game.inventory.health = 10;
+        session.game.inventory.armor = 200;
+        session.mines.plant(Owner::Player, [0.5, 0.5, 0.0]).unwrap();
+        session.mines.plant(Owner::Player, [0.5, 0.5, 0.0]).unwrap();
+        for _ in 1..explosives::MINE_ARM_TICKS {
+            session.step(SessionInput::default());
+        }
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.explosions.len(), 2);
+        assert_eq!(events.damage, 35);
+        assert_eq!(
+            (session.game.inventory.health, session.game.inventory.armor),
+            (0, 60)
+        );
+        assert_eq!(
+            events
+                .explosion_damage
+                .iter()
+                .filter(|event| event.target == TargetId::Player)
+                .count(),
+            1
+        );
     }
 }

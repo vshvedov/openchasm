@@ -49,7 +49,7 @@ impl SourceLight {
     }
     fn valid(&self) -> bool {
         self.position_raw.iter().all(|v| *v < RAW_MAP_LIMIT)
-            && self.radius_raw % 64 == 0
+            && self.radius_raw.is_multiple_of(64)
             && self.radius_raw <= 511 * 64
             && self.delay_ms <= i16::MAX as u16
     }

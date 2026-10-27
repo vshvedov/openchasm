@@ -12,12 +12,62 @@ const SCALE: f32 = 8.0;
 pub struct Minimap {
     visible: Vec<bool>,
     pub open: bool,
+    observation: Option<ObservationKey>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WallKey {
+    endpoints: [u32; 4],
+    texture: u8,
+}
+impl WallKey {
+    fn of(wall: &crate::world::Wall) -> Self {
+        Self {
+            endpoints: [
+                wall.a[0].to_bits(),
+                wall.a[1].to_bits(),
+                wall.b[0].to_bits(),
+                wall.b[1].to_bits(),
+            ],
+            texture: wall.texture,
+        }
+    }
+}
+#[derive(Clone)]
+struct ObservationKey {
+    pose: [u32; 3],
+    walls: Vec<WallKey>,
+}
+impl ObservationKey {
+    fn pose(world: &World) -> [u32; 3] {
+        [
+            world.player.position[0].to_bits(),
+            world.player.position[1].to_bits(),
+            world.player.angle.to_bits(),
+        ]
+    }
+    fn matches(&self, world: &World) -> bool {
+        self.pose == Self::pose(world)
+            && self.walls.len() == world.walls.len()
+            && self
+                .walls
+                .iter()
+                .zip(&world.walls)
+                .all(|(saved, wall)| *saved == WallKey::of(wall))
+    }
+    fn new(world: &World) -> Self {
+        Self {
+            pose: Self::pose(world),
+            walls: world.walls.iter().map(WallKey::of).collect(),
+        }
+    }
 }
 impl Minimap {
     pub fn new(world: &World) -> Self {
         Self {
             visible: vec![false; world.walls.len()],
             open: false,
+            observation: None,
         }
     }
     /// Discover only the nearest opaque wall along each approximate view ray.
@@ -28,6 +78,13 @@ impl Minimap {
         if self.visible.len() != world.walls.len()
             || !player.angle.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
+        {
+            return;
+        }
+        if self
+            .observation
+            .as_ref()
+            .is_some_and(|key| key.matches(world))
         {
             return;
         }
@@ -44,6 +101,7 @@ impl Minimap {
                 self.visible[*index] = true;
             }
         }
+        self.observation = Some(ObservationKey::new(world));
     }
     /// Draw current positions of discovered walls and a heading marker.
     pub fn draw(&self, frame: &mut [u32], width: usize, height: usize, world: &World) {
@@ -207,5 +265,41 @@ mod tests {
         world.walls[0].a[0] = f32::NAN;
         map.draw(&mut moved, 640, 400, &world);
         assert_eq!(moved[0], 0);
+    }
+    #[test]
+    fn observation_cache_rechecks_pose_geometry_and_material() {
+        let mut world = World {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            walls: vec![wall(1.0, 1), wall(2.0, 2)],
+        };
+        let mut map = Minimap::new(&world);
+        map.observe(&world);
+        assert_eq!(map.visible, [true, false]);
+        let saved = map.clone();
+        // A cache hit leaves visibility untouched; simulate an externally
+        // cleared bit to distinguish a hit from another raycast in this test.
+        map.visible[0] = false;
+        map.observe(&world);
+        assert_eq!(map.visible, [false, false]);
+        world.player.angle = 0.01;
+        map.observe(&world);
+        assert_eq!(map.visible, [true, false]);
+        world.walls[0].texture = 87;
+        map.observe(&world);
+        assert_eq!(map.visible, [true, true]);
+        map = saved;
+        map.observe(&world);
+        assert_eq!(map.visible, [true, true]);
+        world.walls[0].texture = 1;
+        let mut moved = Minimap::new(&world);
+        moved.observe(&world);
+        assert_eq!(moved.visible, [true, false]);
+        world.walls[0].a[0] = 3.0;
+        world.walls[0].b[0] = 3.0;
+        moved.observe(&world);
+        assert_eq!(moved.visible, [true, true]);
     }
 }

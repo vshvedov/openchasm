@@ -102,7 +102,6 @@ impl PlaneRenderer {
         lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
     ) {
         let position = camera.player.position;
-        let angle = camera.player.angle;
         if !camera.eye_height.is_finite()
             || width == 0
             || height == 0
@@ -113,11 +112,12 @@ impl PlaneRenderer {
         {
             return;
         }
-        let (sin, cos) = angle.sin_cos();
+        let [cos, sin] = camera.player.forward();
+        let [right_x, right_y] = camera.player.right();
         let projection = CameraView::focal_length(height);
         let horizon = camera.horizon(height);
         let half_width = CameraView::half_width(width, height);
-        let camera_plane = [-sin * half_width, cos * half_width];
+        let camera_plane = [right_x * half_width, right_y * half_width];
         for (y, row) in frame.chunks_mut(width).enumerate() {
             let ceiling = (y as f32 + 0.5) < horizon;
             let background = if ceiling {
@@ -254,6 +254,48 @@ mod tests {
         assert!(minimum >= 0.0 && maximum <= 1.3 && maximum - minimum > 0.5);
         assert!(light.sample([-1.0, 0.0]).is_none());
         assert!(light.wall_sample([64, 0], 0.5).is_none());
+    }
+
+    #[test]
+    fn floor_rays_use_same_world_right_as_original_camera() {
+        let mut bytes = vec![0; 0x27001 + 4];
+        bytes[1..0x10001].fill(20);
+        bytes[0x23001..0x24001].fill(63);
+        for x in 0..64 {
+            for y in 0..64 {
+                bytes[0x24001 + x * 64 + y] = u8::from(x >= 16);
+            }
+        }
+        let map = Map::parse(&bytes).unwrap();
+        let mut floor_bytes = vec![0; 64 + 64 * 64 * 86];
+        floor_bytes[64..64 + 4096].fill(1);
+        floor_bytes[64 + 5504..64 + 5504 + 4096].fill(2);
+        let floors = Floors::parse(&floor_bytes).unwrap();
+        let mut palette_bytes = vec![0; 768];
+        palette_bytes[3] = 63;
+        palette_bytes[7] = 63;
+        let palette = Palette::parse(&palette_bytes).unwrap();
+        let planes = PlaneRenderer::new(&map, &floors, &palette);
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [16.5, 16.5],
+                angle: 3.0 * std::f32::consts::FRAC_PI_2,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut frame = vec![0; 64 * 64];
+        planes.render(&mut frame, 64, 64, camera);
+        assert_ne!(
+            frame[48 * 64 + 10] & 0x00ff00,
+            0,
+            "camera-left looks toward larger x"
+        );
+        assert_ne!(
+            frame[48 * 64 + 54] & 0xff0000,
+            0,
+            "camera-right looks toward smaller x"
+        );
     }
 
     #[test]

@@ -88,12 +88,16 @@ impl Minimap {
         {
             return;
         }
-        let (sin, cos) = player.angle.sin_cos();
+        let [cos, sin] = player.forward();
+        let [right_x, right_y] = player.right();
         let mut hits = Vec::new();
         for x in 0..RAYS {
             let camera_x = (2.0 * (x as f32 + 0.5) / RAYS as f32 - 1.0)
                 * crate::object_render::CameraView::half_width(super::WIDTH, super::HEIGHT);
-            world.ray_hits([cos - sin * camera_x, sin + cos * camera_x], &mut hits);
+            world.ray_hits(
+                [cos + right_x * camera_x, sin + right_y * camera_x],
+                &mut hits,
+            );
             if let Some((_, index, _)) = hits
                 .iter()
                 .rev()

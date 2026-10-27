@@ -273,14 +273,15 @@ impl ExplosionRenderer {
         {
             return;
         }
-        let (sin, cos) = camera.player.angle.sin_cos();
+        let [cos, sin] = camera.player.forward();
+        let [right_x, right_y] = camera.player.right();
         let mut sorted = Vec::with_capacity(self.effects.len());
         for effect in &self.effects {
             let dx = effect.position[0] - camera.player.position[0];
             let dy = effect.position[1] - camera.player.position[1];
             let distance = dx * cos + dy * sin;
             if distance > NEAR && distance.is_finite() {
-                sorted.push((distance, -dx * sin + dy * cos, effect));
+                sorted.push((distance, dx * right_x + dy * right_y, effect));
             }
         }
         sorted.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));

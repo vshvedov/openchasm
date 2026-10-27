@@ -71,7 +71,7 @@ impl RelativeLook {
     }
     fn take_yaw(&mut self) -> f32 {
         let dx = std::mem::take(&mut self.pending_dx).clamp(-100_000, 100_000);
-        dx as f32 * MOUSE_SENSITIVITY
+        -(dx as f32) * MOUSE_SENSITIVITY
     }
     fn motion_y(&mut self, dy: i32) {
         if self.focused && self.captured {
@@ -149,7 +149,7 @@ fn held_movement(held: &HashSet<Scancode>) -> Input {
     Input {
         forward: key(Scancode::W) - key(Scancode::S),
         strafe: key(Scancode::D) - key(Scancode::A),
-        turn: key(Scancode::Right) - key(Scancode::Left),
+        turn: key(Scancode::Left) - key(Scancode::Right),
     }
 }
 
@@ -523,13 +523,14 @@ fn render(
             });
         }
     }
-    let (sin, cos) = camera.player.angle.sin_cos();
+    let [cos, sin] = camera.player.forward();
+    let [right_x, right_y] = camera.player.right();
     let mut hits = Vec::new();
     for x in 0..WIDTH {
         // Direction is unnormalized, so hit distance is perpendicular to camera plane.
         let camera_x =
             (2.0 * (x as f32 + 0.5) / WIDTH as f32 - 1.0) * CameraView::half_width(WIDTH, HEIGHT);
-        let direction = [cos - sin * camera_x, sin + cos * camera_x];
+        let direction = [cos + right_x * camera_x, sin + right_y * camera_x];
         world.ray_hits(direction, &mut hits);
         for &(distance, index, along) in &hits {
             let texture = world.walls[index].texture as u32;
@@ -1853,7 +1854,7 @@ mod tests {
         look.set_focus(true);
         assert!(look.capture_with(|| true));
         look.motion(20);
-        assert!((look.take_yaw() - 0.04).abs() < 1e-6);
+        assert!((look.take_yaw() + 0.04).abs() < 1e-6);
         look.motion(80);
         look.set_focus(false);
         assert_eq!(look.take_yaw(), 0.0);
@@ -1863,7 +1864,7 @@ mod tests {
         assert_eq!(look.take_yaw(), 0.0);
         assert!(look.capture_with(|| true));
         look.motion(-10);
-        assert!((look.take_yaw() + 0.02).abs() < 1e-6);
+        assert!((look.take_yaw() - 0.02).abs() < 1e-6);
         look.motion(100);
         assert!(look.capture_with(|| true));
         assert_eq!(look.take_yaw(), 0.0);
@@ -1878,7 +1879,7 @@ mod tests {
         look.captured = true;
         look.motion(10);
         look.motion(-4);
-        assert!((look.take_yaw() - 0.012).abs() < 1e-6);
+        assert!((look.take_yaw() + 0.012).abs() < 1e-6);
         assert_eq!(look.take_yaw(), 0.0);
         look.motion(30);
         look.set_focus(false);
@@ -2117,6 +2118,49 @@ mod tests {
         );
         assert!(top(&depth) > lower_camera_top + 10);
     }
+    #[test]
+    fn wall_to_world_right_renders_on_screen_right() {
+        let world = World {
+            walls: vec![Wall {
+                a: [29.25, 54.5],
+                b: [29.75, 54.5],
+                texture: 1,
+                blocks_movement: true,
+                cell: None,
+            }],
+            player: Player {
+                position: [31.5, 58.5],
+                angle: 3.0 * std::f32::consts::FRAC_PI_2,
+            },
+        };
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[],
+                eye_height: 1.0,
+                yaw_offset: 0.0,
+                pitch: 0.0,
+                mines: &[],
+                lights: None,
+            },
+            &[],
+            None,
+            None,
+        );
+        let columns: Vec<_> = depth
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_finite())
+            .map(|(i, _)| i % WIDTH)
+            .collect();
+        assert!(!columns.is_empty());
+        assert!(columns.iter().all(|&x| x > WIDTH / 2));
+    }
+
     #[test]
     fn authored_wall_light_changes_shading_without_changing_depth() {
         let make_planes = |value| {
@@ -2494,6 +2538,23 @@ mod tests {
         ));
         assert_eq!(restored_notice.unwrap().0, "TELEPORT 4 DESTINATION BLOCKED");
     }
+    #[test]
+    fn right_controls_match_original_screen_right_basis() {
+        let movement = held_movement(&HashSet::from([Scancode::D, Scancode::Right]));
+        assert_eq!(movement.strafe, 1.0);
+        assert_eq!(movement.turn, -1.0);
+        let movement = held_movement(&HashSet::from([Scancode::A, Scancode::Left]));
+        assert_eq!(movement.strafe, -1.0);
+        assert_eq!(movement.turn, 1.0);
+        let mut look = RelativeLook {
+            focused: true,
+            captured: true,
+            ..Default::default()
+        };
+        look.motion(10);
+        assert!(look.take_yaw() < 0.0);
+    }
+
     #[test]
     fn restart_clears_movement_fire_yaw_and_time_without_releasing_capture() {
         let mut held = HashSet::from([Scancode::W, Scancode::D, Scancode::Right]);

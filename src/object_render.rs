@@ -629,7 +629,8 @@ fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: 
         0
     };
     let (sin, cos) = instance.angle.sin_cos();
-    let (camera_sin, camera_cos) = camera.player.angle.sin_cos();
+    let [forward_x, forward_y] = camera.player.forward();
+    let [right_x, right_y] = camera.player.right();
     let dx = instance.position[0] - camera.player.position[0];
     let dy = instance.position[1] - camera.player.position[1];
     for primitive in &model.primitives {
@@ -661,9 +662,9 @@ fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: 
                 let wx = dx + p[0] * cos - p[1] * sin;
                 let wy = dy + p[0] * sin + p[1] * cos;
                 vertices.push(Vertex {
-                    side: -wx * camera_sin + wy * camera_cos,
+                    side: wx * right_x + wy * right_y,
                     up: p[2] + instance.elevation - camera.eye_height,
-                    depth: wx * camera_cos + wy * camera_sin,
+                    depth: wx * forward_x + wy * forward_y,
                     uv: primitive.uv[i],
                 });
             }
@@ -1459,7 +1460,8 @@ impl ObjectScene {
         {
             return;
         }
-        let (camera_sin, camera_cos) = player.angle.sin_cos();
+        let [forward_x, forward_y] = player.forward();
+        let [right_x, right_y] = player.right();
         let mut raster = Raster {
             frame,
             depth,
@@ -1512,8 +1514,8 @@ impl ObjectScene {
             let mesh = &self.meshes[instance.mesh];
             let dx = instance.position[0] - player.position[0];
             let dy = instance.position[1] - player.position[1];
-            let center_depth = dx * camera_cos + dy * camera_sin;
-            let center_side = -dx * camera_sin + dy * camera_cos;
+            let center_depth = dx * forward_x + dy * forward_y;
+            let center_side = dx * right_x + dy * right_y;
             let half_width = CameraView::half_width(width, height);
             if center_depth + mesh.radius < NEAR
                 || center_side.abs()
@@ -1550,9 +1552,9 @@ impl ObjectScene {
                     let world_x = dx + x * cos - y * sin;
                     let world_y = dy + x * sin + y * cos;
                     vertices.push(Vertex {
-                        side: -world_x * camera_sin + world_y * camera_cos,
+                        side: world_x * right_x + world_y * right_y,
                         up: f32::from(p[2]) * MODEL_SCALE + instance.elevation - camera.eye_height,
-                        depth: world_x * camera_cos + world_y * camera_sin,
+                        depth: world_x * forward_x + world_y * forward_y,
                         uv: texture_uv(polygon, corner, mesh.car_uv),
                     });
                 }
@@ -1581,6 +1583,35 @@ impl ObjectScene {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn map01_landmark_projects_right_of_player_spawn() {
+        let mut scene = gltf_scene(255);
+        scene.instances[0].position = [29.5, 54.5];
+        scene.instances[0].angle = std::f32::consts::FRAC_PI_2;
+        let camera = CameraView {
+            player: Player {
+                position: [31.5, 58.5],
+                angle: 3.0 * std::f32::consts::FRAC_PI_2,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let mut frame = vec![0; 640 * 400];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        scene.render(&mut frame, &mut depth, 640, 400, camera);
+        let pixels: Vec<_> = frame
+            .iter()
+            .enumerate()
+            .filter(|(_, pixel)| **pixel != 0)
+            .map(|(i, _)| i % 640)
+            .collect();
+        assert!(!pixels.is_empty());
+        assert!(
+            pixels.iter().all(|&x| x > 320),
+            "landmark must be on camera-right"
+        );
+    }
+
     #[test]
     fn world_fov_matches_original_camera_and_pitch_ray() {
         let focal = CameraView::focal_length(400);

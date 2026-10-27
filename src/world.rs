@@ -52,10 +52,25 @@ pub struct Player {
     pub angle: f32,
 }
 
+impl Player {
+    /// Forward basis in the original map coordinate system.
+    pub fn forward(self) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        [cos, sin]
+    }
+    /// Screen-right basis in the original map coordinate system.
+    pub fn right(self) -> [f32; 2] {
+        let (sin, cos) = self.angle.sin_cos();
+        [sin, -cos]
+    }
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Input {
     pub forward: f32,
+    /// Positive moves toward screen right.
     pub strafe: f32,
+    /// Positive increases the mathematical map angle (turns screen left).
     pub turn: f32,
 }
 
@@ -612,7 +627,8 @@ impl World {
         }
         let dt = dt.min(1.0 / 30.0);
         self.player.angle += input.turn.clamp(-1.0, 1.0) * 2.0 * dt;
-        let (sin, cos) = self.player.angle.sin_cos();
+        let facing = self.player.forward();
+        let right = self.player.right();
         let mut forward = input.forward.clamp(-1.0, 1.0);
         let mut strafe = input.strafe.clamp(-1.0, 1.0);
         let magnitude = (forward * forward + strafe * strafe).sqrt();
@@ -621,8 +637,8 @@ impl World {
             strafe /= magnitude;
         }
         let displacement = [
-            (cos * forward - sin * strafe) * 2.5 * dt + external[0],
-            (sin * forward + cos * strafe) * 2.5 * dt + external[1],
+            (facing[0] * forward + right[0] * strafe) * 2.5 * dt + external[0],
+            (facing[1] * forward + right[1] * strafe) * 2.5 * dt + external[1],
         ];
         self.player.position = if policy.mode == WallCollisionMode::TwoSided {
             move_and_slide(self.player.position, displacement, &self.walls, circles)
@@ -825,6 +841,34 @@ mod tests {
         let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls, &[]);
         assert!(end[0] < 0.83);
     }
+    #[test]
+    fn camera_basis_and_strafe_match_original_right_at_cardinal_angles() {
+        for angle in [0.0, std::f32::consts::FRAC_PI_2, std::f32::consts::PI] {
+            let player = Player {
+                position: [5.0, 5.0],
+                angle,
+            };
+            let f = player.forward();
+            let r = player.right();
+            assert!((f[0] * r[0] + f[1] * r[1]).abs() < 1e-6);
+            assert!((r[0] - angle.sin()).abs() < 1e-6);
+            assert!((r[1] + angle.cos()).abs() < 1e-6);
+            let mut w = World {
+                walls: vec![],
+                player,
+            };
+            w.step(
+                Input {
+                    strafe: 1.0,
+                    ..Default::default()
+                },
+                1.0 / 60.0,
+            );
+            assert!((w.player.position[0] - (5.0 + r[0] * 2.5 / 60.0)).abs() < 1e-5);
+            assert!((w.player.position[1] - (5.0 + r[1] * 2.5 / 60.0)).abs() < 1e-5);
+        }
+    }
+
     #[test]
     fn movement_stops_before_wall() {
         let mut w = test_world();

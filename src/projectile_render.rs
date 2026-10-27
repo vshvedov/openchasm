@@ -188,7 +188,8 @@ impl ProjectileRenderer {
         {
             return;
         }
-        let (camera_sin, camera_cos) = player.angle.sin_cos();
+        let [forward_x, forward_y] = player.forward();
+        let [right_x, right_y] = player.right();
         let mut raster = Raster {
             frame,
             depth,
@@ -232,8 +233,8 @@ impl ProjectileRenderer {
                     let wy =
                         projectile.position[1] + x * yaw_sin + py * yaw_cos - player.position[1];
                     vertices.push(Vertex {
-                        side: -wx * camera_sin + wy * camera_cos,
-                        depth: wx * camera_cos + wy * camera_sin,
+                        side: wx * right_x + wy * right_y,
+                        depth: wx * forward_x + wy * forward_y,
                         up: projectile.position[2] + pz - camera.eye_height,
                         uv: [
                             f32::from(polygon.uv[corner][0]),
@@ -605,6 +606,37 @@ mod tests {
                 .any(|(&pixel, old)| pixel != old && pixel & 0xff0000 != 0),
             "open floor should reveal the same projectile"
         );
+    }
+
+    #[test]
+    fn projectile_at_landmark_uses_original_camera_right() {
+        let renderer = renderer();
+        let camera = CameraView {
+            player: Player {
+                position: [31.5, 58.5],
+                angle: 3.0 * std::f32::consts::FRAC_PI_2,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        let shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [29.5, 54.5, 1.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            elapsed_seconds: 0.0,
+        };
+        let mut frame = vec![0; 640 * 400];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        renderer.render(&mut frame, &mut depth, 640, 400, camera, &[shot]);
+        let columns: Vec<_> = frame
+            .iter()
+            .enumerate()
+            .filter(|(_, pixel)| **pixel != 0)
+            .map(|(i, _)| i % 640)
+            .collect();
+        assert!(!columns.is_empty());
+        assert!(columns.iter().all(|&x| x > 320));
     }
 
     #[test]

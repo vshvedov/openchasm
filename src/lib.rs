@@ -24,5 +24,6 @@ pub mod pickups;
 pub mod projectiles;
 pub mod quake;
 pub mod session;
+pub mod teleport;
 pub mod vertical;
 pub mod wind;

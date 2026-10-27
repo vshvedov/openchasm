@@ -116,6 +116,10 @@ pub enum ShotImpact {
         distance: f32,
     },
     Miss,
+    /// Spawn a physical projectile with this rocket definition.
+    Launch {
+        rocket_id: usize,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FireResult {
@@ -148,6 +152,10 @@ impl Combat {
     }
     pub fn cooldown(&self) -> f32 {
         self.cooldown
+    }
+    /// Revert cooldown if the session could not spawn a projectile.
+    pub fn cancel_shot(&mut self) {
+        self.cooldown = 0.0;
     }
     /// Advance once per fixed simulation step. Invalid times have no effect.
     pub fn tick(&mut self, dt: f32) {
@@ -192,7 +200,12 @@ impl Combat {
         else {
             return FireResult::Unsupported;
         };
-        if !rocket.model_name.is_empty() || rocket.power <= 0 || spec.projectile_count == 0 {
+        if rocket.power <= 0 || spec.projectile_count == 0 {
+            return FireResult::Unsupported;
+        }
+        let physical = !rocket.model_name.is_empty();
+        // Grenade and mine behavior require gravity, bouncing and placement.
+        if physical && !matches!(weapon, 3 | 4 | 7) {
             return FireResult::Unsupported;
         }
         if inventory.ammo[weapon] == 0 {
@@ -204,6 +217,11 @@ impl Combat {
         }
         inventory.ammo[weapon] -= 1;
         self.cooldown = (spec.reload_time as f32 / RELOAD_UNITS_PER_SECOND).max(MIN_COOLDOWN);
+        if physical {
+            return FireResult::Fired(ShotImpact::Launch {
+                rocket_id: spec.rocket_type as usize,
+            });
+        }
         let (sin, cos) = player.angle.sin_cos();
         let direction = [cos, sin];
         let mut hits = Vec::new();

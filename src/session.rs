@@ -5,6 +5,7 @@ use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpa
 use crate::game::GameInventory;
 use crate::pickups::{Difficulty, PickupEvent};
 use crate::process_runtime::ProcessRuntime;
+use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
 use crate::world::{Input, World};
 
 pub struct LevelSetup {
@@ -32,6 +33,7 @@ pub struct SessionEvents {
     pub shot: Option<FireResult>,
     pub damage: u16,
     pub enemy_attacks: Vec<EnemyAttack>,
+    pub projectile_impacts: Vec<Impact>,
 }
 
 #[derive(Clone)]
@@ -43,6 +45,7 @@ pub struct Session {
     pub game: GameInventory,
     pub ai: EnemyAi,
     pub selected_weapon: usize,
+    pub projectiles: ProjectileSystem,
     combat: Combat,
     rockets: RocketDefinitions,
     shot_blocking: [bool; 128],
@@ -64,10 +67,19 @@ impl Session {
             game: setup.game,
             ai,
             selected_weapon: 0,
+            projectiles: ProjectileSystem::new(),
             combat: Combat::new(),
             rockets: setup.rockets,
             shot_blocking: setup.shot_blocking,
         }
+    }
+    fn apply_player_damage(&mut self, amount: u16) -> u16 {
+        // Provisional armor: absorbs at most half of each incoming hit.
+        let absorbed = (amount / 2).min(self.game.inventory.armor);
+        self.game.inventory.armor -= absorbed;
+        let damage = amount - absorbed;
+        self.game.inventory.health = self.game.inventory.health.saturating_sub(damage);
+        damage
     }
     /// Advance exactly one 60 Hz simulation tick, returning presentation events.
     pub fn step(&mut self, input: SessionInput) -> SessionEvents {
@@ -87,7 +99,7 @@ impl Session {
         self.processes.tick(&mut self.world, DT, input.interact);
         self.combat.tick(DT);
         if input.fire {
-            let shot = self.combat.fire(
+            let mut shot = self.combat.fire(
                 self.selected_weapon,
                 ShotContext {
                     inventory: &mut self.game.inventory,
@@ -104,6 +116,21 @@ impl Session {
                         .unwrap_or(true)
                 },
             );
+            if let FireResult::Fired(ShotImpact::Launch { rocket_id }) = shot {
+                let (sin, cos) = self.world.player.angle.sin_cos();
+                let launch = Launch {
+                    owner: Owner::Player,
+                    rocket_id,
+                    origin: self.world.player.position,
+                    direction: [cos, sin],
+                };
+                if self.projectiles.spawn(launch, &self.rockets).is_err() {
+                    self.game.inventory.ammo[self.selected_weapon] =
+                        self.game.inventory.ammo[self.selected_weapon].saturating_add(1);
+                    self.combat.cancel_shot();
+                    shot = FireResult::Unsupported;
+                }
+            }
             if let FireResult::Fired(ShotImpact::Actor {
                 source_index,
                 killed: false,
@@ -121,15 +148,64 @@ impl Session {
             &self.world,
         );
         for attack in &events.enemy_attacks {
-            if matches!(attack.kind, EnemyAttackKind::Ranged { instant: false, .. }) {
+            if let EnemyAttackKind::Ranged {
+                rocket_id,
+                instant: false,
+                origin,
+                target,
+            } = attack.kind
+            {
+                let _ = self.projectiles.spawn(
+                    Launch {
+                        owner: Owner::Enemy {
+                            source_index: attack.source_index,
+                        },
+                        rocket_id,
+                        origin,
+                        direction: [target[0] - origin[0], target[1] - origin[1]],
+                    },
+                    &self.rockets,
+                );
                 continue;
             }
-            // Provisional armor: absorbs at most half of each incoming hit.
-            let absorbed = (attack.damage / 2).min(self.game.inventory.armor);
-            self.game.inventory.armor -= absorbed;
-            let damage = attack.damage - absorbed;
-            self.game.inventory.health = self.game.inventory.health.saturating_sub(damage);
-            events.damage = events.damage.saturating_add(damage);
+            events.damage = events
+                .damage
+                .saturating_add(self.apply_player_damage(attack.damage));
+        }
+        events.projectile_impacts = self.projectiles.tick(
+            DT,
+            &self.world,
+            &self.actors,
+            &self.actor_definitions,
+            |wall| {
+                self.shot_blocking
+                    .get(wall.texture as usize)
+                    .copied()
+                    .unwrap_or(true)
+            },
+        );
+        for impact in &events.projectile_impacts {
+            match impact.target {
+                ImpactTarget::Player => {
+                    events.damage = events.damage.saturating_add(
+                        self.apply_player_damage(impact.damage.clamp(0, u16::MAX as i32) as u16),
+                    )
+                }
+                ImpactTarget::Actor { source_index } => {
+                    if let Some(actor) = self
+                        .actors
+                        .actors
+                        .iter_mut()
+                        .find(|actor| actor.source_index == source_index)
+                    {
+                        actor.health = actor.health.saturating_sub(impact.damage).max(0);
+                        if actor.health > 0 {
+                            self.ai.alert(source_index, self.world.player.position);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         events
     }
@@ -244,5 +320,28 @@ mod tests {
             Some(EnemyAttackKind::Ranged { instant: true, .. })
         ));
         assert_eq!(session.game.inventory.health, 90);
+        let mut projectile_session = initial;
+        projectile_session.game.inventory.weapons[3] = true;
+        projectile_session.game.inventory.ammo[3] = 2;
+        projectile_session.game.weapons.0[3].rocket_type = 1;
+        projectile_session.rockets.0.push(RocketDefinition {
+            model_name: "disk.3o".into(),
+            power: 12,
+            raw_fields: vec![0, 0, 0, 20, 12],
+        });
+        let event = projectile_session.step(SessionInput {
+            fire: true,
+            select_weapon: Some(3),
+            ..SessionInput::default()
+        });
+        assert!(matches!(
+            event.shot,
+            Some(FireResult::Fired(ShotImpact::Launch { rocket_id: 1 }))
+        ));
+        assert_eq!(projectile_session.game.inventory.ammo[3], 1);
+        for _ in 0..40 {
+            projectile_session.step(SessionInput::default());
+        }
+        assert_eq!(projectile_session.actors.actors[0].health, 18);
     }
 }

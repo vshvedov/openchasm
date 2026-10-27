@@ -1,13 +1,13 @@
 //! Validation and staging for process-owned object and quake commands.
 //!
-//! Object transitions are deliberately not committable yet: `PreparedProcess`
-//! cannot update its staged runtime's object cell types and collision poses.
-//! Accepting one would leave movement/collision state inconsistent. The host
-//! must also synchronize presentation resources before enabling such commits.
+//! The host must validate collision clearance and synchronize presentation
+//! resources and emitted transitions when committing.
 use crate::object_combat::ObjectCombat;
 use crate::object_states::{ObjectStateError, ObjectStates, ObjectTransition};
 use crate::objects::ObjectDefinitions;
-use crate::process_runtime::{ImmediateAction, PreparedProcess, ProcessEvent};
+use crate::process_runtime::{
+    ImmediateAction, PreparedProcess, ProcessEvent, RuntimeObjectSyncError, RuntimeObjectTransition,
+};
 use crate::quake::{QuakeError, QuakeField};
 use std::collections::BTreeSet;
 
@@ -30,16 +30,12 @@ impl PresentationManifest {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TransactionError {
     Object(ObjectStateError),
-    CombatRejected {
-        cell: [usize; 2],
-    },
-    PresentationUnavailable {
-        cell: [usize; 2],
-        raw_type: u8,
-    },
+    CombatRejected { cell: [usize; 2] },
+    PresentationUnavailable { cell: [usize; 2], raw_type: u8 },
     Quake(QuakeError),
-    /// ProcessRuntime needs a transactional update for type, pose and radius.
-    RuntimeObjectSynchronizationUnavailable,
+    CollisionNotClear { cell: [usize; 2] },
+    PoseMismatch { cell: [usize; 2] },
+    RuntimeObject(RuntimeObjectSyncError),
 }
 
 /// Holds exclusive borrows until validation and commit are complete. Dropping
@@ -56,17 +52,19 @@ pub struct ProcessTransaction<'a> {
 }
 impl<'a> ProcessTransaction<'a> {
     pub fn prepare(
-        process: PreparedProcess<'a>,
+        mut process: PreparedProcess<'a>,
         states: &'a mut ObjectStates,
         combat: &'a mut ObjectCombat,
         quake: &'a mut QuakeField,
         definitions: &ObjectDefinitions,
         manifest: &PresentationManifest,
+        mut is_clear: impl FnMut([usize; 2], [f32; 2], f32) -> bool,
     ) -> Result<Self, TransactionError> {
         let mut staged_states = states.clone();
         let mut staged_combat = combat.clone();
         let mut staged_quake = quake.clone();
         let mut transitions = Vec::new();
+        let mut runtime_transitions = Vec::new();
         for action in process.actions() {
             match *action {
                 ImmediateAction::Object(action) => {
@@ -83,6 +81,39 @@ impl<'a> ProcessTransaction<'a> {
                     if !staged_combat.apply_transitions(&changes, definitions) {
                         return Err(TransactionError::CombatRejected { cell: change.cell });
                     }
+                    let definition = &definitions.level_objects[usize::from(change.new_type - 163)];
+                    let radius = if definition.model_name.eq_ignore_ascii_case("dummy.3o")
+                        || (141..=143).contains(&definition.action_code)
+                    {
+                        0.0
+                    } else {
+                        (definition.collision_radius.max(0) as f32 / 256.0).min(2.0)
+                    };
+                    let position = staged_states
+                        .get(change.cell)
+                        .expect("resolved transition has object")
+                        .placement
+                        .position;
+                    let runtime_cell = [change.cell[0] as u8, change.cell[1] as u8];
+                    let pose = process.object_pose(runtime_cell).ok_or(
+                        TransactionError::RuntimeObject(RuntimeObjectSyncError::MissingObject),
+                    )?;
+                    let placement = &staged_states
+                        .get(change.cell)
+                        .expect("resolved transition has object")
+                        .placement;
+                    if pose.position != position || pose.angle_radians != placement.angle_radians {
+                        return Err(TransactionError::PoseMismatch { cell: change.cell });
+                    }
+                    if radius > 0.0 && !is_clear(change.cell, position, radius) {
+                        return Err(TransactionError::CollisionNotClear { cell: change.cell });
+                    }
+                    runtime_transitions.push(RuntimeObjectTransition {
+                        cell: [change.cell[0] as u8, change.cell[1] as u8],
+                        previous_type: change.previous_type,
+                        new_type: change.new_type,
+                        blocking_radius: radius,
+                    });
                     transitions.extend(changes);
                 }
                 ImmediateAction::Quake(zone) => staged_quake
@@ -90,6 +121,9 @@ impl<'a> ProcessTransaction<'a> {
                     .map_err(TransactionError::Quake)?,
             }
         }
+        process
+            .stage_object_transitions(&runtime_transitions)
+            .map_err(TransactionError::RuntimeObject)?;
         Ok(Self {
             process,
             object_states: states,
@@ -105,13 +139,9 @@ impl<'a> ProcessTransaction<'a> {
         &self.transitions
     }
 
-    /// Commit only after all external presentation and collision consumers are
-    /// known to accept the change. Object commits are disabled until the
-    /// process runtime can stage corresponding object pose/type updates.
+    /// Publish all validated states; the host must consume the ordered object
+    /// transitions for presentation before advancing simulation again.
     pub fn commit(self) -> Result<ProcessEvent, TransactionError> {
-        if !self.transitions.is_empty() {
-            return Err(TransactionError::RuntimeObjectSynchronizationUnavailable);
-        }
         *self.object_states = self.staged_states;
         *self.object_combat = self.staged_combat;
         *self.quake_field = self.staged_quake;
@@ -175,15 +205,24 @@ mod tests {
         ))
     }
     #[test]
-    fn missing_replacement_and_incomplete_runtime_sync_leave_everything_unchanged() {
+    fn replacement_preflight_rolls_back_or_commits_all_states() {
         let script = script("explode 1 1\nquake 1 1 2 2 99\nchange 1 1 165");
         let (defs, mut states, mut combat, world) = fixtures(&script);
+        let mut cells = [0; 4096];
+        cells[65] = 163;
+        let pose = crate::process_runtime::ProcessObject {
+            cell: [1, 1],
+            position: [1.5, 1.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.125,
+        };
         let mut runtime = ProcessRuntime::with_staged_actions(
             &script,
             &world,
             ProcessCapabilities::default(),
-            &[0; 4096],
-            &[],
+            &cells,
+            &[pose],
         )
         .unwrap();
         let mut quake = QuakeField::new();
@@ -197,6 +236,7 @@ mod tests {
             &mut quake,
             &defs,
             &manifest,
+            |_, _, _| true,
         );
         assert!(matches!(
             result,
@@ -210,6 +250,23 @@ mod tests {
         assert!(runtime.take_effects().is_empty());
         manifest.allow([1, 1], 165);
         let prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        let blocked = ProcessTransaction::prepare(
+            prepared,
+            &mut states,
+            &mut combat,
+            &mut quake,
+            &defs,
+            &manifest,
+            |_, _, _| false,
+        );
+        assert!(matches!(
+            blocked,
+            Err(TransactionError::CollisionNotClear { cell: [1, 1] })
+        ));
+        assert_eq!(states.get([1, 1]).unwrap().raw_type, 163);
+        assert_eq!(quake.cell([1, 1]), Some(0));
+        assert_eq!(runtime.cell_type([1, 1]), Some(163));
+        let prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
         let transaction = ProcessTransaction::prepare(
             prepared,
             &mut states,
@@ -217,6 +274,7 @@ mod tests {
             &mut quake,
             &defs,
             &manifest,
+            |_, _, _| true,
         )
         .unwrap();
         assert_eq!(
@@ -228,11 +286,12 @@ mod tests {
             vec![164, 165]
         );
         assert_eq!(
-            transaction.commit(),
-            Err(TransactionError::RuntimeObjectSynchronizationUnavailable)
+            transaction.commit().unwrap().outcome,
+            ProcessOutcome::Accepted
         );
-        assert_eq!(states.get([1, 1]).unwrap().raw_type, 163);
-        assert_eq!(quake.cell([1, 1]), Some(0));
+        assert_eq!(states.get([1, 1]).unwrap().raw_type, 165);
+        assert_eq!(runtime.cell_type([1, 1]), Some(165));
+        assert_eq!(quake.cell([1, 1]), Some(99));
         assert!(runtime.take_effects().is_empty());
     }
     #[test]
@@ -257,6 +316,7 @@ mod tests {
             &mut quake,
             &defs,
             &manifest,
+            |_, _, _| true,
         )
         .unwrap();
         drop(transaction);
@@ -269,6 +329,7 @@ mod tests {
             &mut quake,
             &defs,
             &manifest,
+            |_, _, _| true,
         )
         .unwrap();
         assert_eq!(
@@ -301,6 +362,7 @@ mod tests {
             &mut quake,
             &defs,
             &manifest,
+            |_, _, _| true,
         );
         assert!(matches!(
             result,

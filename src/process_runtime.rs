@@ -1192,6 +1192,24 @@ pub struct ProcessRuntime {
     staged_authorized: bool,
 }
 
+/// One validated replacement of a stable source map cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuntimeObjectTransition {
+    pub cell: [u8; 2],
+    pub previous_type: u8,
+    pub new_type: u8,
+    pub blocking_radius: f32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeObjectSyncError {
+    ActionMismatch,
+    MissingCellTypes,
+    MissingObject,
+    InvalidTransition,
+    StaleType,
+    ActiveMotion,
+}
+
 /// A process activation staged on a private copy. Dropping it rolls back;
 /// commit publishes the staged runtime and its effects. The exclusive borrow
 /// prevents intervening runtime changes while the host validates the plan.
@@ -1199,13 +1217,97 @@ pub struct PreparedProcess<'a> {
     runtime: &'a mut ProcessRuntime,
     staged: ProcessRuntime,
     actions: Vec<ImmediateAction>,
+    object_sync_complete: bool,
     event: ProcessEvent,
 }
 impl PreparedProcess<'_> {
     pub fn actions(&self) -> &[ImmediateAction] {
         &self.actions
     }
+    /// Pose at the time of preparation, used for collision preflight.
+    pub fn object_pose(&self, cell: [u8; 2]) -> Option<ProcessObject> {
+        self.staged.object_pose(cell)
+    }
+    /// Validate and stage the complete ordered object batch. Pose is preserved;
+    /// the caller must separately validate collision overlap and presentation.
+    pub fn stage_object_transitions(
+        &mut self,
+        transitions: &[RuntimeObjectTransition],
+    ) -> Result<(), RuntimeObjectSyncError> {
+        let actions: Vec<_> = self
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                ImmediateAction::Object(action) => Some(*action),
+                _ => None,
+            })
+            .collect();
+        if actions.len() != transitions.len() {
+            return Err(RuntimeObjectSyncError::ActionMismatch);
+        }
+        let mut staged = self.staged.clone();
+        for (action, transition) in actions.iter().zip(transitions) {
+            let cell = transition.cell;
+            let expected = match *action {
+                ObjectAction::Explode { cell } => (cell, None),
+                ObjectAction::Change { cell, raw_type } => (cell, Some(raw_type)),
+            };
+            if expected.0 != [usize::from(cell[0]), usize::from(cell[1])]
+                || expected.1.is_some_and(|raw| raw != transition.new_type)
+                || (matches!(action, ObjectAction::Explode { .. })
+                    && transition.previous_type.checked_add(1) != Some(transition.new_type))
+            {
+                return Err(RuntimeObjectSyncError::ActionMismatch);
+            }
+            if cell[0] >= 64
+                || cell[1] >= 64
+                || !(163..=226).contains(&transition.previous_type)
+                || !(163..=226).contains(&transition.new_type)
+                || !transition.blocking_radius.is_finite()
+                || !(0.0..=64.0).contains(&transition.blocking_radius)
+            {
+                return Err(RuntimeObjectSyncError::InvalidTransition);
+            }
+            if staged.processes.values().any(|process| {
+                !matches!(process.phase, Phase::Closed)
+                    && process
+                        .object_motions
+                        .iter()
+                        .any(|motion| motion.cell == cell)
+            }) {
+                return Err(RuntimeObjectSyncError::ActiveMotion);
+            }
+            let types = staged
+                .cell_types
+                .as_mut()
+                .ok_or(RuntimeObjectSyncError::MissingCellTypes)?;
+            let index = usize::from(cell[0]) * 64 + usize::from(cell[1]);
+            if types[index] != transition.previous_type {
+                return Err(RuntimeObjectSyncError::StaleType);
+            }
+            let object = staged
+                .objects
+                .get_mut(&cell)
+                .ok_or(RuntimeObjectSyncError::MissingObject)?;
+            types[index] = transition.new_type;
+            object.blocking_radius = transition.blocking_radius;
+        }
+        self.staged = staged;
+        self.object_sync_complete = true;
+        Ok(())
+    }
     pub fn commit(self) -> ProcessEvent {
+        if !self.object_sync_complete
+            && self
+                .actions
+                .iter()
+                .any(|action| matches!(action, ImmediateAction::Object(_)))
+        {
+            return ProcessEvent {
+                process_id: self.event.process_id,
+                outcome: ProcessOutcome::Unsupported,
+            };
+        }
         *self.runtime = self.staged;
         self.event
     }
@@ -1301,6 +1403,7 @@ impl ProcessRuntime {
     ) -> Result<Self, ProcessObjectError> {
         let mut runtime = Self::with_wind(script, world, capabilities, raw_cells, object_poses)?;
         let cells = capabilities.initial_cell_types.or(Some(raw_cells));
+        runtime.cell_types = cells.map(|types| types.to_vec());
         runtime.processes = script
             .processes
             .iter()
@@ -1544,6 +1647,7 @@ impl ProcessRuntime {
             runtime: self,
             staged,
             actions,
+            object_sync_complete: false,
             event,
         })
     }
@@ -2802,12 +2906,22 @@ mod tests {
     fn staged_actions_require_preparation_and_commit_atomically() {
         let script = Script::parse("#proc1\n#action\nnonstop\nexplode 27 46\nchange 29 48 200\nquake 17 40 30 50 10000\nwind 25 47 27 48 12 0\nunlock 2\n#end\n#proc2\nLock\nEndDelay 1\n#end\n#links\ndestroy 27 47 1\nlink 1 0 2\n#end\n");
         let world = world();
+        let mut cells = [0; 4096];
+        cells[27 * 64 + 46] = 163;
+        cells[29 * 64 + 48] = 170;
+        let poses = [[27, 46], [29, 48]].map(|cell| ProcessObject {
+            cell,
+            position: [cell[0] as f32, cell[1] as f32],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.2,
+        });
         let mut runtime = ProcessRuntime::with_staged_actions(
             &script,
             &world,
             ProcessCapabilities::default(),
-            &[0; 4096],
-            &[],
+            &cells,
+            &poses,
         )
         .unwrap();
         assert_eq!(
@@ -2839,9 +2953,27 @@ mod tests {
             runtime.activate_at("link", [1, 0])[0].outcome,
             ProcessOutcome::Locked
         );
-        let prepared = runtime.prepare_at("destroy", [27, 47], 1).unwrap();
+        let mut prepared = runtime.prepare_at("destroy", [27, 47], 1).unwrap();
         assert_eq!(prepared.actions(), expected);
+        prepared
+            .stage_object_transitions(&[
+                RuntimeObjectTransition {
+                    cell: [27, 46],
+                    previous_type: 163,
+                    new_type: 164,
+                    blocking_radius: 0.0,
+                },
+                RuntimeObjectTransition {
+                    cell: [29, 48],
+                    previous_type: 170,
+                    new_type: 200,
+                    blocking_radius: 0.25,
+                },
+            ])
+            .unwrap();
         assert_eq!(prepared.commit().outcome, ProcessOutcome::Accepted);
+        assert_eq!(runtime.cell_type([27, 46]), Some(164));
+        assert_eq!(runtime.object_pose([27, 46]).unwrap().blocking_radius, 0.0);
         assert!(matches!(
             &runtime.take_effects()[..],
             [ProcessEffect::WindActivated { process_id: 1, .. }]
@@ -2878,5 +3010,86 @@ mod tests {
             );
             assert!(runtime.take_effects().is_empty());
         }
+    }
+    #[test]
+    fn staged_replacements_reject_active_motion_and_stale_batches() {
+        let script = Script::parse("#proc1\n#action\nexplode 2 0\n#end\n#proc2\n#action\nmove 2 0 256 0\n#end\n#links\nlink 0 0 1\nlink 3 0 2\n#end\n");
+        let mut cells = [0; 4096];
+        cells[2 * 64] = 163;
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let pose = ProcessObject {
+            cell: [2, 0],
+            position: [2.25, 0.5],
+            angle_radians: 0.5,
+            elevation_raw: 4.0,
+            blocking_radius: 0.2,
+        };
+        let mut runtime = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("link", [3, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        let mut prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        let update = RuntimeObjectTransition {
+            cell: [2, 0],
+            previous_type: 163,
+            new_type: 164,
+            blocking_radius: 0.0,
+        };
+        assert_eq!(
+            prepared.stage_object_transitions(&[update]),
+            Err(RuntimeObjectSyncError::ActiveMotion)
+        );
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Unsupported);
+        assert_eq!(runtime.cell_type([2, 0]), Some(163));
+        runtime.tick(&mut world, 5.0, false);
+        let mut prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        assert_eq!(
+            prepared.stage_object_transitions(&[update]),
+            Err(RuntimeObjectSyncError::ActiveMotion),
+            "open motion can still reverse"
+        );
+        drop(prepared);
+
+        let mut fresh = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        let mut prepared = fresh.prepare_at("link", [0, 0], 1).unwrap();
+        let bad = RuntimeObjectTransition {
+            previous_type: 165,
+            new_type: 166,
+            ..update
+        };
+        assert_eq!(
+            prepared.stage_object_transitions(&[bad]),
+            Err(RuntimeObjectSyncError::StaleType)
+        );
+        prepared.stage_object_transitions(&[update]).unwrap();
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Accepted);
+        assert_eq!(fresh.cell_type([2, 0]), Some(164));
+        assert_eq!(
+            fresh.object_pose([2, 0]),
+            Some(ProcessObject {
+                blocking_radius: 0.0,
+                ..pose
+            })
+        );
+        assert_eq!(
+            fresh.activate_at("link", [3, 0])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
     }
 }

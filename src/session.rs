@@ -901,6 +901,9 @@ impl Session {
                 return events;
             }
         }
+        // Existing effects age once per live tick. Pickups collected below
+        // begin at full duration and affect AI on this same tick.
+        self.game.inventory.tick_effects();
         if let Some(index) = input.select_weapon.filter(|&index| {
             index < self.game.inventory.weapons.len() && self.game.inventory.weapons[index]
         }) {
@@ -1277,6 +1280,8 @@ impl Session {
                 radius: object.blocking_radius,
             })
             .collect();
+        self.ai
+            .set_player_invisible(self.game.inventory.invisibility_ticks_remaining > 0);
         let blocks_shots = |wall: &crate::world::Wall| {
             Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0)
         };
@@ -1589,6 +1594,89 @@ mod tests {
         session.set_mission(MissionPlan::parse(&script, text));
         session
     }
+    #[test]
+    fn invisibility_pickup_suppresses_idle_acquisition_until_expiry() {
+        use crate::inventory::Pickup;
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        let mut session = mission_session("");
+        let def = ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 131,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "invis.3o".into(),
+            animation_name: None,
+        };
+        let placement = ObjectInstance {
+            kind: ObjectKind::Item,
+            definition_index: 0,
+            grid_cell: [0, 0],
+            position: session.world.player.position,
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let definitions = ObjectDefinitions {
+            items: vec![def],
+            level_objects: vec![],
+        };
+        session.game = GameInventory::new(
+            session.game.weapons.clone(),
+            &[placement],
+            &definitions,
+            Difficulty::Normal,
+        );
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "test.car".into(),
+            wall_radius: 64,
+            actor_radius: 64,
+            speed: 30,
+            rotation_speed: 0,
+            health: 30,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: "".into(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 0,
+            definition_index: 0,
+            placement: Monster {
+                position: [512, 128],
+                id: 101,
+                angle: 0,
+                flags: 2,
+            },
+            position: [2.0, 0.5],
+            angle_radians: 0.0,
+            health: 30,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        let e = session.step(SessionInput::default());
+        assert!(e.pickups.iter().any(|p| p.pickup == Pickup::Invisibility));
+        assert_eq!(session.game.inventory.invisibility_ticks_remaining, 2400);
+        assert_eq!(session.ai.mode(0), Some(Mode::Idle));
+        let mut snapshot = session.clone();
+        session.step(SessionInput::default());
+        assert_eq!(session.game.inventory.invisibility_ticks_remaining, 2399);
+        assert_eq!(snapshot.game.inventory.invisibility_ticks_remaining, 2400);
+        snapshot.game.inventory.invisibility_ticks_remaining = 1;
+        snapshot.step(SessionInput::default());
+        assert_eq!(snapshot.game.inventory.invisibility_ticks_remaining, 0);
+        assert_eq!(snapshot.ai.mode(0), Some(Mode::Chasing));
+        assert!(session.ai.alert(0, session.world.player.position));
+        session.step(SessionInput::default());
+        assert_eq!(session.ai.mode(0), Some(Mode::Chasing));
+    }
+
     #[test]
     fn authored_wall_mode_is_opt_in_and_restart_snapshot_retains_it() {
         use crate::wind::WindZone;

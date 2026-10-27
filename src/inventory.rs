@@ -127,6 +127,7 @@ pub enum Pickup {
     Ammo(usize),
     Health,
     Armor,
+    Invisibility,
     Key(Key),
 }
 
@@ -147,6 +148,8 @@ pub struct Inventory {
     pub weapons: [bool; WEAPON_COUNT],
     pub ammo: [u16; WEAPON_COUNT],
     pub keys: [bool; 3],
+    /// Remaining authoritative 60 Hz ticks; zero means visible.
+    pub invisibility_ticks_remaining: u32,
 }
 
 impl Inventory {
@@ -159,10 +162,21 @@ impl Inventory {
             weapons: [false; WEAPON_COUNT],
             ammo: [0; WEAPON_COUNT],
             keys: [false; 3],
+            invisibility_ticks_remaining: 0,
         };
         inventory.weapons[0] = true;
         inventory.ammo[0] = weapons.0[0].ammo_limit;
         inventory
+    }
+
+    /// Advance transient effects by exactly one authoritative 60 Hz tick.
+    pub fn tick_effects(&mut self) {
+        self.invisibility_ticks_remaining = self.invisibility_ticks_remaining.saturating_sub(1);
+    }
+
+    /// Clear per-level effects when changing maps, as in the reconstruction.
+    pub fn clear_level_effects(&mut self) {
+        self.invisibility_ticks_remaining = 0;
     }
 
     /// Apply one action code from an object definition. Unknown and unmodeled
@@ -216,6 +230,12 @@ impl Inventory {
                 let amount = if action_code == 124 { 100 } else { 200 };
                 self.armor = self.armor.saturating_add(amount).min(MAX_ARMOR);
                 PickupOutcome::Collected(Pickup::Armor)
+            }
+            131 => {
+                // PanzerChasm uses 40 seconds and extends existing duration.
+                self.invisibility_ticks_remaining =
+                    self.invisibility_ticks_remaining.saturating_add(40 * 60);
+                PickupOutcome::Collected(Pickup::Invisibility)
             }
             141..=143 => {
                 let (index, key) = match action_code {
@@ -290,6 +310,32 @@ mod tests {
         assert_eq!(player.pickup(21, &defs), PickupOutcome::Full);
         assert_eq!(player.pickup(20, &defs), PickupOutcome::Unsupported);
     }
+    #[test]
+    fn invisibility_stacks_expires_and_clears_on_level_change() {
+        let weapons = WeaponDefinitions::parse(weapon_inf().as_bytes()).unwrap();
+        let mut inventory = Inventory::new(&weapons);
+        assert_eq!(
+            inventory.pickup(131, &weapons),
+            PickupOutcome::Collected(Pickup::Invisibility)
+        );
+        assert_eq!(inventory.invisibility_ticks_remaining, 2400);
+        for _ in 0..10 {
+            inventory.tick_effects();
+        }
+        assert_eq!(inventory.invisibility_ticks_remaining, 2390);
+        inventory.pickup(131, &weapons);
+        assert_eq!(inventory.invisibility_ticks_remaining, 4790);
+        let mut snapshot = inventory.clone();
+        for _ in 0..4790 {
+            inventory.tick_effects();
+        }
+        assert_eq!(inventory.invisibility_ticks_remaining, 0);
+        inventory.tick_effects();
+        assert_eq!(inventory.invisibility_ticks_remaining, 0);
+        snapshot.clear_level_effects();
+        assert_eq!(snapshot.invisibility_ticks_remaining, 0);
+    }
+
     #[test]
     fn health_armor_keys_and_unimplemented_codes() {
         let defs = WeaponDefinitions::parse(weapon_inf().as_bytes()).unwrap();

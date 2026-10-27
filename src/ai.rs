@@ -86,6 +86,7 @@ struct ActorCollision<'a> {
 pub struct EnemyAi {
     brains: BTreeMap<usize, Brain>,
     clips: Vec<Option<ActorClipSet>>,
+    player_invisible: bool,
 }
 
 fn sub(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
@@ -209,11 +210,18 @@ impl EnemyAi {
         Self {
             brains,
             clips: Vec::new(),
+            player_invisible: false,
         }
     }
 
     pub fn mode(&self, source_index: usize) -> Option<Mode> {
         self.brains.get(&source_index).map(|brain| brain.mode)
+    }
+
+    /// Suppress visual acquisition by idle actors while the player is invisible.
+    /// Already alerted actors keep tracking the player, following the reference.
+    pub fn set_player_invisible(&mut self, invisible: bool) {
+        self.player_invisible = invisible;
     }
 
     /// Supply one optional clip set per monster definition before simulation.
@@ -439,7 +447,8 @@ impl EnemyAi {
             let distance = dot(to_player, to_player).sqrt();
             // Visibility follows the material's shot-pass flag, independently
             // of walk collision and of whether the wall is drawn transparent.
-            let sees_player = distance <= SIGHT_RANGE
+            let sees_player = !(self.player_invisible && brain.mode == Mode::Idle)
+                && distance <= SIGHT_RANGE
                 && shot_clear(actor.position, target, &world.walls, blocks_shots);
             if sees_player {
                 brain.last_seen = Some(target);
@@ -687,6 +696,28 @@ mod tests {
             walls,
         }
     }
+    #[test]
+    fn invisible_player_is_not_acquired_by_idle_enemy_but_alerted_enemy_tracks() {
+        let (mut actors, defs) = actor(100, 7);
+        let mut ai = EnemyAi::new(&actors, Difficulty::Normal);
+        let w = world([3.0, 0.0], vec![]);
+        ai.set_player_invisible(true);
+        for _ in 0..10 {
+            ai.tick(&mut actors, &defs, &w);
+        }
+        assert_eq!(ai.mode(0), Some(Mode::Idle));
+        assert!(ai.alert(0, w.player.position));
+        ai.tick(&mut actors, &defs, &w);
+        assert_eq!(ai.mode(0), Some(Mode::Chasing));
+        let (mut actors, defs) = actor(100, 7);
+        let mut ai = EnemyAi::new(&actors, Difficulty::Normal);
+        ai.set_player_invisible(true);
+        ai.tick(&mut actors, &defs, &w);
+        ai.set_player_invisible(false);
+        ai.tick(&mut actors, &defs, &w);
+        assert_eq!(ai.mode(0), Some(Mode::Chasing));
+    }
+
     #[test]
     fn sight_acquires_and_chases_target() {
         let (mut state, defs) = actor(100, 7);

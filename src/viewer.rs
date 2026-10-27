@@ -359,6 +359,7 @@ pub fn run(
         ..RelativeLook::default()
     };
     let mut held = HashSet::new();
+    let mut warned_actor_clips = HashSet::new();
     let mut mouse_fire = false;
     let mut frame = vec![0; WIDTH * HEIGHT];
     let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
@@ -697,6 +698,16 @@ pub fn run(
                     mode != Mode::Inactive,
                 );
                 objects.set_actor_animation(actor.source_index, animation, STEP);
+                let attack_frame = session
+                    .ai
+                    .attack_animation(actor.source_index)
+                    .map(|phase| (phase.slot, phase.frame));
+                if !objects.set_actor_attack_frame(actor.source_index, attack_frame)
+                    && attack_frame.is_some()
+                    && warned_actor_clips.insert(actor.source_index)
+                {
+                    eprintln!("actor {} attack animation is unavailable or inconsistent with simulation metadata", actor.source_index);
+                }
             }
             accumulator -= STEP;
         }

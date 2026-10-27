@@ -10,6 +10,7 @@ use crate::model::{Animation, Model, Vertex as ModelVertex, SKIN_WIDTH};
 use crate::objects::{self, ObjectDefinitions};
 use crate::texture::Palette;
 use crate::world::Player;
+use openchasm::actor_clips::{ActorClip as GltfClip, ActorClipSet};
 use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
@@ -19,57 +20,12 @@ const ACTOR_ANIMATION_FPS: f64 = 18.0;
 const GLTF_OBJECT_FPS: f64 = 20.0;
 const GLTF_ACTOR_FPS: f64 = 1000.0 / 60.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GltfClip {
-    first: usize,
-    count: usize,
-}
-
-/// Parse the remaster's `animation_id first_frame frame_count` table.
+/// Decode the shared clip table and verify its ranges against client geometry.
 fn parse_gltf_clips(bytes: &[u8], frames: usize) -> std::io::Result<[Option<GltfClip>; 20]> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "glTF animation table is not UTF-8",
-        )
+    let frames = u32::try_from(frames).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "too many glTF frames")
     })?;
-    let mut clips = [None; 20];
-    for line in text.lines() {
-        let line = line.split(';').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() != 3 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid glTF animation row",
-            ));
-        }
-        let values = fields
-            .iter()
-            .map(|v| v.parse::<usize>())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid glTF animation value",
-                )
-            })?;
-        let (id, first, count) = (values[0], values[1], values[2]);
-        if id >= clips.len()
-            || count == 0
-            || first.checked_add(count).is_none_or(|end| end > frames)
-            || clips[id].is_some()
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid glTF animation range or duplicate",
-            ));
-        }
-        clips[id] = Some(GltfClip { first, count });
-    }
-    Ok(clips)
+    Ok(ActorClipSet::parse_gltf(bytes, Some(frames))?.clips)
 }
 
 fn actor_gltf_frame(
@@ -82,11 +38,11 @@ fn actor_gltf_frame(
     };
     let elapsed_frame = seconds.max(0.0) * GLTF_ACTOR_FPS;
     let frame = if mode.looping() {
-        elapsed_frame.rem_euclid(clip.count as f64) as usize
+        elapsed_frame.rem_euclid(clip.frame_count as f64) as usize
     } else {
-        elapsed_frame.min((clip.count - 1) as f64) as usize
+        elapsed_frame.min((clip.frame_count - 1) as f64) as usize
     };
-    clip.first + frame
+    clip.first_frame as usize + frame
 }
 
 fn intact_actor_primitive(name: &str, mode: ActorAnimationMode) -> bool {
@@ -159,6 +115,7 @@ struct Instance {
     object_animation_seconds: f64,
     animation_mode: ActorAnimationMode,
     animation_seconds: f64,
+    attack_frame: Option<(usize, u32)>,
     visible: bool,
 }
 
@@ -565,16 +522,40 @@ impl Raster<'_> {
     }
 }
 
-fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: CameraView) {
-    let Some(model) = mesh.gltf.as_ref() else {
-        return;
-    };
-    let frame = if instance.actor_source_index.is_some() {
+fn actor_gltf_instance_frame(mesh: &Mesh, instance: &Instance) -> usize {
+    if let Some((slot, local_frame)) = instance.attack_frame {
+        mesh.gltf_actor_clips
+            .get(slot)
+            .and_then(|clip| *clip)
+            .filter(|clip| local_frame < clip.frame_count)
+            .map_or(0, |clip| (clip.first_frame + local_frame) as usize)
+    } else {
         actor_gltf_frame(
             &mesh.gltf_actor_clips,
             instance.animation_mode,
             instance.animation_seconds,
         )
+    }
+}
+
+fn actor_car_instance_vertices<'a>(mesh: &'a Mesh, instance: &Instance) -> &'a [ModelVertex] {
+    if let Some((slot, frame)) = instance.attack_frame {
+        mesh.animations
+            .get(slot)
+            .and_then(Option::as_ref)
+            .and_then(|animation| animation.frames.get(frame as usize))
+            .map_or(mesh.model.vertices.as_slice(), Vec::as_slice)
+    } else {
+        actor_vertices(mesh, instance.animation_mode, instance.animation_seconds)
+    }
+}
+
+fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: CameraView) {
+    let Some(model) = mesh.gltf.as_ref() else {
+        return;
+    };
+    let frame = if instance.actor_source_index.is_some() {
+        actor_gltf_instance_frame(mesh, instance)
     } else if instance.object_animation_playing {
         (instance.object_animation_seconds.max(0.0) * GLTF_OBJECT_FPS)
             .rem_euclid(model.frame_count as f64) as usize
@@ -795,6 +776,7 @@ impl ObjectScene {
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
+                    attack_frame: None,
                     visible: true,
                 });
             }
@@ -923,6 +905,7 @@ impl ObjectScene {
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
+                    attack_frame: None,
                     visible: true,
                 });
             }
@@ -1149,6 +1132,41 @@ impl ObjectScene {
         true
     }
 
+    /// Set the exact authoritative attack slot and zero-based local frame.
+    /// Passing None clears the override. Missing or out-of-range data returns
+    /// false and keeps the actor in its base pose instead of substituting a
+    /// different attack animation.
+    pub fn set_actor_attack_frame(
+        &mut self,
+        source_index: usize,
+        frame: Option<(usize, u32)>,
+    ) -> bool {
+        let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.actor_source_index == Some(source_index))
+        else {
+            return false;
+        };
+        let valid = frame.is_none_or(|(slot, frame)| {
+            let mesh = &self.meshes[instance.mesh];
+            if mesh.gltf.is_some() {
+                mesh.gltf_actor_clips
+                    .get(slot)
+                    .and_then(|clip| *clip)
+                    .is_some_and(|clip| frame < clip.frame_count)
+            } else {
+                mesh.animations
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|animation| (frame as usize) < animation.frames.len())
+            }
+        });
+        // Invalid phase still requests a base pose; don't show another attack.
+        instance.attack_frame = if valid { frame } else { Some((usize::MAX, 0)) };
+        valid
+    }
+
     /// Start the matching level-object animations after a `playani` effect.
     /// Script values >= 33 identify the `#newobjects` entry `value - 33`;
     /// unknown lower values and entries without compatible ANI data are no-ops.
@@ -1285,6 +1303,7 @@ impl ObjectScene {
                             object_animation_seconds: 0.0,
                             animation_mode: ActorAnimationMode::Idle,
                             animation_seconds: 0.0,
+                            attack_frame: None,
                             visible: true,
                         })
                     })
@@ -1310,7 +1329,7 @@ impl ObjectScene {
             }
             let (sin, cos) = instance.angle.sin_cos();
             let pose_vertices = if mesh.car_uv {
-                actor_vertices(mesh, instance.animation_mode, instance.animation_seconds)
+                actor_car_instance_vertices(mesh, instance)
             } else {
                 object_vertices(
                     mesh,
@@ -1417,6 +1436,7 @@ mod tests {
             object_animation_seconds: 0.0,
             animation_mode: ActorAnimationMode::Idle,
             animation_seconds: 0.0,
+            attack_frame: None,
             visible: true,
         };
         ObjectScene {
@@ -1485,8 +1505,8 @@ mod tests {
         assert_eq!(
             mesh.gltf_actor_clips[2],
             Some(GltfClip {
-                first: 15,
-                count: 17
+                first_frame: 15,
+                frame_count: 17
             })
         );
         assert_eq!(
@@ -1947,6 +1967,76 @@ mod tests {
         assert_eq!(x(ActorAnimationMode::Death, 100.0), 21); // hold last frame
     }
     #[test]
+    fn authoritative_attack_slot_and_frame_override_both_model_formats() {
+        let mut scene = gltf_scene(255);
+        scene.instances[0].actor_source_index = Some(7);
+        scene.instances[0].animation_mode = ActorAnimationMode::Attack;
+        scene.meshes[0].gltf_actor_clips[5] = Some(GltfClip {
+            first_frame: 4,
+            frame_count: 3,
+        });
+        scene.meshes[0].gltf_actor_clips[6] = Some(GltfClip {
+            first_frame: 7,
+            frame_count: 2,
+        });
+        assert!(scene.set_actor_attack_frame(7, Some((5, 1))));
+        assert_eq!(
+            actor_gltf_instance_frame(&scene.meshes[0], &scene.instances[0]),
+            5
+        );
+        assert!(scene.set_actor_attack_frame(7, Some((6, 0))));
+        assert_eq!(
+            actor_gltf_instance_frame(&scene.meshes[0], &scene.instances[0]),
+            7
+        );
+        assert!(!scene.set_actor_attack_frame(7, Some((5, 3))));
+        assert_eq!(
+            actor_gltf_instance_frame(&scene.meshes[0], &scene.instances[0]),
+            0
+        );
+        scene.meshes[0].gltf = None;
+        scene.meshes[0].car_uv = true;
+        scene.meshes[0].model.vertices = vec![ModelVertex {
+            position: [-1, 0, 0],
+        }];
+        scene.meshes[0].animations[5] = Some(Animation {
+            vertex_count: 1,
+            frames: vec![
+                vec![ModelVertex {
+                    position: [50, 0, 0],
+                }],
+                vec![ModelVertex {
+                    position: [51, 0, 0],
+                }],
+            ],
+        });
+        scene.meshes[0].animations[6] = Some(Animation {
+            vertex_count: 1,
+            frames: vec![vec![ModelVertex {
+                position: [60, 0, 0],
+            }]],
+        });
+        assert!(scene.set_actor_attack_frame(7, Some((5, 1))));
+        assert_eq!(
+            actor_car_instance_vertices(&scene.meshes[0], &scene.instances[0])[0].position[0],
+            51
+        );
+        assert!(scene.set_actor_attack_frame(7, Some((6, 0))));
+        assert_eq!(
+            actor_car_instance_vertices(&scene.meshes[0], &scene.instances[0])[0].position[0],
+            60
+        );
+        assert!(!scene.set_actor_attack_frame(7, Some((6, 1))));
+        assert_eq!(
+            actor_car_instance_vertices(&scene.meshes[0], &scene.instances[0])[0].position[0],
+            -1
+        );
+        assert!(scene.set_actor_attack_frame(7, None));
+        assert_eq!(scene.instances[0].attack_frame, None);
+        assert!(!scene.set_actor_attack_frame(8, Some((5, 0))));
+    }
+
+    #[test]
     fn actor_timers_are_independent_and_reset_on_mode_change() {
         let instance = |id| Instance {
             mesh: 0,
@@ -1962,6 +2052,7 @@ mod tests {
             object_animation_seconds: 0.0,
             animation_mode: ActorAnimationMode::Idle,
             animation_seconds: 0.0,
+            attack_frame: None,
             visible: true,
         };
         let mut scene = ObjectScene {
@@ -2003,6 +2094,7 @@ mod tests {
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
+                    attack_frame: None,
                     visible: true,
                 },
                 Instance {
@@ -2019,6 +2111,7 @@ mod tests {
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
+                    attack_frame: None,
                     visible: true,
                 },
             ],

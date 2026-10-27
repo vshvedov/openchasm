@@ -3,6 +3,7 @@ mod audio;
 mod content;
 mod explosion_render;
 mod gltf_model;
+mod object_height_loader;
 mod object_render;
 mod planes;
 mod projectile_render;
@@ -583,6 +584,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                         shot_blocking,
                         difficulty,
                     });
+                let object_heights =
+                    object_height_loader::load_object_heights(&mut resources, &definitions);
+                if !session.set_object_heights(object_heights, cells) {
+                    eprintln!("object height catalog rejected; using conservative collision");
+                }
                 session.ai.set_clip_metadata(actor_clips);
                 session.set_explosions_enabled(true);
                 session.set_mines_enabled(mine_available);

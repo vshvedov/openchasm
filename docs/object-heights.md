@@ -21,6 +21,6 @@ base reference bounds without evidence.
 In installed level 17, `18_cl2.3o` is raw type 165. Its unanimated vertex Z
 range is 4096–9626, or 2.0–4.700195 tiles. The player is below this range at
 flat floor height, so a horizontal-radius-only check incorrectly rejects the
-first teleport landing. Until the host installs a trustworthy catalog and
-threads it through all collision paths, preserve the previous conservative
-behavior and do not mark unknown meshes as clear.
+first teleport landing. The client loads a catalog for every level-object definition and supplies it to the session. An installed-content regression exercises this teleport with the roof retained: the conservative path blocks the landing, while the loaded base bounds permit it. Unknown or invalid assets remain conservatively blocking.
+
+The client loader caches bounds by model path, follows the renderer's explicit 3O versus glTF-only selection, and rejects empty or invalid geometry. It derives bounds from the base pose, including each glTF node transform; replacement definitions are loaded as well so later type changes use their own bounds. If the session rejects the catalog's cell mapping, the preview retains conservative collision and reports the failure.

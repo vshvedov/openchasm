@@ -3,6 +3,18 @@
 #[allow(dead_code)]
 #[path = "../src/archive.rs"]
 mod archive;
+#[cfg(feature = "client")]
+#[allow(dead_code)]
+#[path = "../src/content.rs"]
+mod content;
+#[cfg(feature = "client")]
+#[allow(dead_code)]
+#[path = "../src/gltf_model.rs"]
+mod gltf_model;
+#[cfg(feature = "client")]
+#[allow(dead_code)]
+#[path = "../src/object_height_loader.rs"]
+mod object_height_loader;
 use openchasm::{
     actors::{ActorDefinitions, ActorState},
     combat::RocketDefinitions,
@@ -225,6 +237,18 @@ fn level17_extra_teleport_field_is_ignored() {
     });
     let rows = openchasm::teleport::parse(std::str::from_utf8(&script_data).unwrap()).unwrap();
     session.set_teleports(rows, openchasm::teleport::RearmPolicy::ReferenceContinuous);
+    #[cfg(feature = "client")]
+    {
+        let mut resource_set = content::ResourceSet::open(&path).unwrap();
+        let heights = object_height_loader::load_object_heights(&mut resource_set, &definitions);
+        let mut with_heights = session.clone();
+        assert!(with_heights.set_object_heights(heights, cells));
+        with_heights.world.player.position = [41.5, 53.5];
+        let event = with_heights.step(SessionInput::default());
+        assert_eq!(event.teleport_failure, None);
+        assert_eq!(event.teleport.unwrap().index, 0);
+        assert_eq!(with_heights.world.player.position, [37.5, 16.5]);
+    }
     let mut roof_blocked = session.clone();
     roof_blocked.world.player.position = [41.5, 53.5];
     let blocked = roof_blocked.step(SessionInput::default());

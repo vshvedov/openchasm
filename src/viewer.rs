@@ -535,10 +535,10 @@ fn render(
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
 ) {
-    let _ = render_profiled(frame, depth, scene, textures, planes, objects, false);
+    let _ = render_profiled::<true>(frame, depth, scene, textures, planes, objects, false);
 }
 
-fn render_profiled(
+fn render_profiled<const NEAR_FIRST: bool>(
     frame: &mut [u32],
     depth: &mut [f32],
     scene: RenderWorld<'_>,
@@ -580,6 +580,20 @@ fn render_profiled(
             (2.0 * (x as f32 + 0.5) / WIDTH as f32 - 1.0) * CameraView::half_width(WIDTH, HEIGHT);
         let direction = [cos + right_x * camera_x, sin + right_y * camera_x];
         world.ray_hits(direction, &mut hits);
+        if NEAR_FIRST {
+            // Keep lower wall indices first at equal depth, as in the original
+            // far-to-near order: the depth test rejects later equal hits.
+            hits.reverse();
+            let mut start = 0;
+            while start < hits.len() {
+                let mut end = start + 1;
+                while end < hits.len() && hits[end].0 == hits[start].0 {
+                    end += 1;
+                }
+                hits[start..end].reverse();
+                start = end;
+            }
+        }
         for &(distance, index, along) in &hits {
             let texture = world.walls[index].texture as u32;
             if texture == 120 {
@@ -1610,7 +1624,7 @@ pub fn run(
         let dynamic_lights = session.light_sources.as_ref().map(|sources| {
             openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&sources.snapshot())
         });
-        let mut stage_timings = render_profiled(
+        let mut stage_timings = render_profiled::<true>(
             &mut frame,
             &mut depth,
             RenderWorld {
@@ -1993,6 +2007,87 @@ mod tests {
         look.motion_y(-30);
         look.set_focus(false);
         assert_eq!(look.take_pitch(), 0.0);
+    }
+
+    #[test]
+    fn near_first_walls_match_original_compositing() {
+        let mut bytes = vec![0; 0x27001 + 4];
+        bytes[0x23001..0x25001].fill(0);
+        let map = crate::map::Map::parse(&bytes).unwrap();
+        let floors = crate::map::Floors::parse(&vec![0; 64 + 64 * 64 * 86]).unwrap();
+        let palette = crate::texture::Palette::parse(&[0; 768]).unwrap();
+        let planes = PlaneRenderer::new(&map, &floors, &palette);
+        let wall = |distance, texture| Wall {
+            cell: None,
+            a: [distance, 15.0],
+            b: [distance, 18.0],
+            texture,
+            blocks_movement: true,
+        };
+        let world = World {
+            walls: vec![
+                wall(18.5, 87),
+                wall(18.5, 1),
+                wall(19.5, 2),
+                wall(20.5, 1),
+                wall(17.5, 120),
+            ],
+            player: Player {
+                position: [16.5, 16.5],
+                angle: 0.0,
+            },
+        };
+        let mut textures: Vec<Option<ViewerTexture>> = (0..128).map(|_| None).collect();
+        textures[1] = Some(ViewerTexture {
+            width: 1,
+            height: 1,
+            pixels: vec![0xffff0000],
+        });
+        textures[2] = Some(ViewerTexture {
+            width: 1,
+            height: 1,
+            pixels: vec![0xff00ff00],
+        });
+        textures[87] = Some(ViewerTexture {
+            width: 1,
+            height: 2,
+            pixels: vec![0, 0xff0000ff],
+        });
+        for pitch in [-0.25, 0.0, 0.3] {
+            let scene = || RenderWorld {
+                world: &world,
+                elevations: &[0.0, 0.0, 48.0, -16.0, 0.0],
+                eye_height: 1.0,
+                pitch,
+                yaw_offset: 0.0,
+                mines: &[],
+                lights: None,
+            };
+            let mut old_frame = vec![0; WIDTH * HEIGHT];
+            let mut old_depth = vec![0.0; old_frame.len()];
+            let mut new_frame = old_frame.clone();
+            let mut new_depth = old_depth.clone();
+            render_profiled::<false>(
+                &mut old_frame,
+                &mut old_depth,
+                scene(),
+                &textures,
+                Some(&planes),
+                None,
+                false,
+            );
+            render_profiled::<true>(
+                &mut new_frame,
+                &mut new_depth,
+                scene(),
+                &textures,
+                Some(&planes),
+                None,
+                false,
+            );
+            assert_eq!(old_frame, new_frame, "colors differ at pitch {pitch}");
+            assert_eq!(old_depth, new_depth, "depth differs at pitch {pitch}");
+        }
     }
 
     #[test]

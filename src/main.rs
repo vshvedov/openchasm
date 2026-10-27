@@ -4,6 +4,7 @@ mod map;
 mod model;
 mod planes;
 mod process;
+mod process_runtime;
 mod texture;
 mod viewer;
 mod world;
@@ -224,6 +225,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let script_bytes = resources.read(&format!("map/process.{id}"))?;
                 let script_text = String::from_utf8_lossy(&script_bytes);
                 let script = process::Script::parse(&script_text);
+                let supported_processes =
+                    process_runtime::ProcessRuntime::new(&script, &world).usable_count();
                 for diagnostic in &script.diagnostics {
                     eprintln!("process.{id}: {diagnostic}");
                 }
@@ -238,7 +241,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     map.trailing_data.len(),
                 );
                 println!(
-                    "{id}: {} walls, {} actors",
+                    "{id}: {} walls, {} actors, {supported_processes} supported moving processes",
                     world
                         .walls
                         .iter()
@@ -263,7 +266,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
             let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
             let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
-            viewer::run(world, textures, planes, &format!("{id}: {name}"))?;
+            let script_data = resources.read(&format!("map/process.{id}"))?;
+            let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
+            let processes = process_runtime::ProcessRuntime::new(&script, &world);
+            viewer::run(world, textures, planes, processes, &format!("{id}: {name}"))?;
         }
         "model-info" => {
             let name = args

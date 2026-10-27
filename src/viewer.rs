@@ -1,9 +1,10 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
 use crate::planes::PlaneRenderer;
+use crate::process_runtime::ProcessRuntime;
 use crate::texture::CelImage;
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
-use minifb::{Key, ScaleMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -115,7 +116,12 @@ fn render(
         }
     }
     text(frame, 8, 8, label);
-    text(frame, 8, 20, "WASD: MOVE   LEFT/RIGHT: TURN   ESC: QUIT");
+    text(
+        frame,
+        8,
+        20,
+        "WASD: MOVE   LEFT/RIGHT: TURN   E: USE   ESC: QUIT",
+    );
     text(frame, 8, 32, "GEOMETRY PREVIEW - GAMEPLAY NOT IMPLEMENTED");
 }
 
@@ -123,6 +129,7 @@ pub fn run(
     mut world: World,
     textures: Vec<Option<CelImage>>,
     planes: PlaneRenderer,
+    mut processes: ProcessRuntime,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
     let textures: Vec<Option<ViewerTexture>> = textures
@@ -143,6 +150,7 @@ pub fn run(
     let mut frame = vec![0; WIDTH * HEIGHT];
     let mut last = Instant::now();
     let mut accumulator = 0.0f32;
+    let mut pending_interact = false;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
         accumulator += now
@@ -156,8 +164,11 @@ pub fn run(
             strafe: key(Key::D) - key(Key::A),
             turn: key(Key::Right) - key(Key::Left),
         };
+        pending_interact |= window.is_key_pressed(Key::E, KeyRepeat::No);
         while accumulator >= STEP {
             world.step(input, STEP);
+            processes.tick(&mut world, STEP, pending_interact);
+            pending_interact = false;
             accumulator -= STEP;
         }
         render(&mut frame, &world, &textures, Some(&planes), label);

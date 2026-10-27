@@ -4,7 +4,7 @@
 //! simulation and scene instance/animation state; transient explosion sprites
 //! are cleared on load and already-playing audio is not rewound. No data is
 //! written to disk; the checkpoint is lost on leaving the viewer/level.
-use crate::audio::Audio;
+use crate::audio::{Audio, PlayerSound};
 use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot};
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
@@ -105,6 +105,52 @@ fn fire_feedback(result: Option<FireResult>) -> Option<&'static str> {
         Some(FireResult::OutOfAmmo) => Some("OUT OF AMMO"),
         Some(FireResult::Unsupported) => Some("WEAPON NOT AVAILABLE"),
         _ => None,
+    }
+}
+
+/// Provisional bounded red damage flash and deterministic pain throttling.
+/// State is presentation-only and cloned with the same-level checkpoint.
+#[derive(Clone, Copy, Default)]
+struct DamageFeedback {
+    flash: u8,
+    pain_cooldown: u8,
+    next_pain_variant: bool,
+}
+impl DamageFeedback {
+    fn tick(&mut self, before: u16, after: u16, damage: u16) -> Option<PlayerSound> {
+        self.flash = self.flash.saturating_sub(12);
+        self.pain_cooldown = self.pain_cooldown.saturating_sub(1);
+        if before == 0 || damage == 0 {
+            return None;
+        }
+        self.flash = self.flash.max((u32::from(damage) * 3 + 20).min(128) as u8);
+        if after == 0 {
+            return Some(PlayerSound::Death);
+        }
+        if self.pain_cooldown != 0 {
+            return None;
+        }
+        self.pain_cooldown = 30;
+        let sound = if self.next_pain_variant {
+            PlayerSound::Pain1
+        } else {
+            PlayerSound::Pain0
+        };
+        self.next_pain_variant = !self.next_pain_variant;
+        Some(sound)
+    }
+}
+
+fn apply_damage_tint(frame: &mut [u32], alpha: u8) {
+    if alpha == 0 {
+        return;
+    }
+    let alpha = u32::from(alpha.min(128));
+    for pixel in frame {
+        let red = ((*pixel >> 16) & 255) * (255 - alpha) / 255 + alpha;
+        let green = ((*pixel >> 8) & 255) * (255 - alpha) / 255;
+        let blue = (*pixel & 255) * (255 - alpha) / 255;
+        *pixel = (red << 16) | (green << 8) | blue;
     }
 }
 
@@ -340,6 +386,7 @@ struct QuickSave {
     scene: ObjectSceneSnapshot,
     animation_tick: u64,
     weapon_clock: WeaponAnimationClock,
+    damage_feedback: DamageFeedback,
     current_message: Option<(Vec<String>, f32)>,
     completed: bool,
     shot_feedback: Option<(&'static str, f32)>,
@@ -470,6 +517,7 @@ pub fn run(
     let mut pending_jump = false;
     let mut pending_weapon = None;
     let mut weapon_clock = WeaponAnimationClock::default();
+    let mut damage_feedback = DamageFeedback::default();
     let mut current_message: Option<(Vec<String>, f32)> = None;
     let mut shot_feedback: Option<(&'static str, f32)> = None;
     let mut quicksave: Option<QuickSave> = None;
@@ -616,6 +664,7 @@ pub fn run(
             pending_jump = false;
             pending_weapon = None;
             weapon_clock = WeaponAnimationClock::default();
+            damage_feedback = DamageFeedback::default();
             animation_tick = 0;
             current_message = None;
             shot_feedback = None;
@@ -630,6 +679,7 @@ pub fn run(
                         scene: objects.snapshot(),
                         animation_tick,
                         weapon_clock,
+                        damage_feedback,
                         current_message: current_message.clone(),
                         completed,
                         shot_feedback,
@@ -643,6 +693,7 @@ pub fn run(
                             session = saved.session.clone();
                             animation_tick = saved.animation_tick;
                             weapon_clock = saved.weapon_clock;
+                            damage_feedback = saved.damage_feedback;
                             current_message = saved.current_message.clone();
                             completed = saved.completed;
                             shot_feedback = saved.shot_feedback;
@@ -680,6 +731,7 @@ pub fn run(
             let yaw_delta = look.take_yaw();
             animation_tick = animation_tick.saturating_add(1);
             let old_weapon = session.selected_weapon;
+            let health_before = session.game.inventory.health;
             let events = session.step(SessionInput {
                 movement,
                 yaw_delta,
@@ -693,6 +745,11 @@ pub fn run(
             pending_weapon = None;
             if session.selected_weapon != old_weapon {
                 shot_feedback = None;
+            }
+            if let Some(sound) =
+                damage_feedback.tick(health_before, session.game.inventory.health, events.damage)
+            {
+                audio.play_player_sound(sound);
             }
             let fired = matches!(events.shot, Some(FireResult::Fired(_)));
             weapon_clock.tick(
@@ -888,6 +945,7 @@ pub fn run(
             pose,
             frame_index,
         );
+        apply_damage_tint(&mut frame, damage_feedback.flash);
         draw_header(&mut frame, label);
         let cx = WIDTH / 2;
         let cy = HEIGHT / 2;
@@ -1257,5 +1315,35 @@ mod tests {
         assert!((clock.sample(start + Duration::from_millis(276), true) - 0.016).abs() < 0.00001);
         assert_eq!(clock.sample(start + Duration::from_millis(300), false), 0.0);
         assert!((clock.sample(start + Duration::from_millis(310), true) - 0.01).abs() < 0.00001);
+    }
+    #[test]
+    fn damage_feedback_throttles_pain_emits_death_once_and_snapshots() {
+        let mut feedback = DamageFeedback::default();
+        assert_eq!(feedback.tick(100, 90, 10), Some(PlayerSound::Pain0));
+        let saved = feedback;
+        assert!(feedback.flash > 0 && feedback.flash <= 128);
+        assert_eq!(feedback.tick(90, 85, 5), None);
+        for _ in 0..29 {
+            feedback.tick(85, 85, 0);
+        }
+        assert_eq!(feedback.tick(85, 80, 5), Some(PlayerSound::Pain1));
+        assert_eq!(feedback.tick(80, 0, 100), Some(PlayerSound::Death));
+        assert_eq!(feedback.tick(0, 0, 100), None);
+        feedback = saved;
+        assert_eq!(feedback.tick(90, 89, 1), None); // restored throttle
+        feedback = DamageFeedback::default(); // restart
+        assert_eq!(feedback.tick(100, 99, 1), Some(PlayerSound::Pain0));
+    }
+
+    #[test]
+    fn damage_tint_is_bounded_and_zero_is_identity() {
+        let mut pixels = [0x000000, 0xffffff, 0x004080];
+        let before = pixels;
+        apply_damage_tint(&mut pixels, 0);
+        assert_eq!(pixels, before);
+        apply_damage_tint(&mut pixels, 255);
+        assert_eq!(pixels[0], 0x800000);
+        assert_eq!(pixels[1], 0xff7f7f);
+        assert!(pixels[2] >> 16 > (before[2] >> 16));
     }
 }

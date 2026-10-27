@@ -7,6 +7,7 @@
 //! Enemy attack samples use the documented model-name WAV convention and a
 //! provisional distance-based volume; other sounds are non-spatial. Authored
 //! volume metadata and original spatialization are not yet implemented.
+//! Player damage uses the first monster definition's documented pain/death WAVs.
 use crate::content::ResourceSet;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::collections::BTreeMap;
@@ -180,10 +181,34 @@ fn enemy_attack_samples(
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerSound {
+    Pain0,
+    Pain1,
+    Death,
+}
+impl PlayerSound {
+    fn slot(self) -> usize {
+        match self {
+            Self::Pain0 => 0,
+            Self::Pain1 => 1,
+            Self::Death => 2,
+        }
+    }
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Pain0 => "pain0",
+            Self::Pain1 => "pain1",
+            Self::Death => "death",
+        }
+    }
+}
+
 pub struct Audio {
     sink: Option<MixerDeviceSink>,
     sounds: BTreeMap<u8, Arc<[u8]>>,
     enemy_sounds: Vec<[Option<Arc<[u8]>>; 2]>,
+    player_sounds: [Option<Arc<[u8]>>; 3],
     music: Option<Player>,
 }
 impl Audio {
@@ -204,8 +229,21 @@ impl Audio {
             .map(|name| (name.to_ascii_lowercase(), name.to_owned()))
             .collect();
         let mut enemy_sounds = Vec::new();
+        let mut player_sounds: [Option<Arc<[u8]>>; 3] = [None, None, None];
         let mut loaded_bytes = 0usize;
         if let Ok(definitions) = openchasm::actors::ActorDefinitions::parse(inf) {
+            if let Some(hero) = definitions.entries.first() {
+                for kind in [PlayerSound::Pain0, PlayerSound::Pain1, PlayerSound::Death] {
+                    let name = format!("sound/{}_{}.wav", hero.model_name, kind.suffix());
+                    if let Some(path) = paths.get(&name.to_ascii_lowercase()) {
+                        if let Ok(bytes) = resources.read(path) {
+                            if bytes.len() <= 2 * 1024 * 1024 {
+                                player_sounds[kind.slot()] = Some(Arc::from(bytes));
+                            }
+                        }
+                    }
+                }
+            }
             for definition in definitions.entries {
                 let mut slots: [Option<Arc<[u8]>>; 2] = [None, None];
                 for kind in [EnemySound::Melee, EnemySound::Ranged] {
@@ -240,9 +278,30 @@ impl Audio {
             sink,
             sounds,
             enemy_sounds,
+            player_sounds,
             music: None,
         }
     }
+    /// Play one committed player pain/death cue. A missing pain variant falls
+    /// back to the other; unavailable audio or missing files are silent.
+    pub fn play_player_sound(&self, kind: PlayerSound) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let sample = self.player_sounds[kind.slot()]
+            .as_ref()
+            .or_else(|| match kind {
+                PlayerSound::Pain0 => self.player_sounds[PlayerSound::Pain1.slot()].as_ref(),
+                PlayerSound::Pain1 => self.player_sounds[PlayerSound::Pain0.slot()].as_ref(),
+                PlayerSound::Death => None,
+            });
+        if let Some(bytes) = sample {
+            if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(bytes))) {
+                player.detach();
+            }
+        }
+    }
+
     /// Play committed attacks using authored model-name samples. Missing
     /// actors, files, decoders and audio output are silently ignored.
     pub fn play_enemy_attacks(

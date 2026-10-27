@@ -38,6 +38,9 @@ struct RuntimeProcess {
     open_time: f32,
     locked: bool,
     waitout: Vec<([f32; 2], f32)>,
+    lock_changes: Vec<(u16, bool)>,
+    supported: bool,
+    requires_key: bool,
 }
 
 fn property_float(process: &Process, name: &str, default: f32) -> f32 {
@@ -55,8 +58,22 @@ impl RuntimeProcess {
     fn new(process: &Process, world: &World) -> Self {
         let mut motions = Vec::new();
         let mut waitout = Vec::new();
+        let mut lock_changes = Vec::new();
         let mut supported = true;
         for action in &process.actions {
+            if matches!(action.name.as_str(), "lock" | "unlock") {
+                if action.arguments.len() != 1 {
+                    supported = false;
+                    break;
+                }
+                if let Ok(id) = action.arguments[0].parse::<u16>() {
+                    lock_changes.push((id, action.name == "lock"));
+                } else {
+                    supported = false;
+                    break;
+                }
+                continue;
+            }
             if action.name == "waitout" {
                 let values: Option<Vec<f32>> = action
                     .arguments
@@ -126,6 +143,7 @@ impl RuntimeProcess {
         }
         if !supported {
             motions.clear();
+            lock_changes.clear();
         }
         // The manual labels Speed but does not specify units. At speed 8 we use
         // one tile per second; each process completes when its longest move does.
@@ -134,12 +152,11 @@ impl RuntimeProcess {
             .iter()
             .map(|m| m.displacement[0].hypot(m.displacement[1]))
             .fold(0.0f32, f32::max);
-        let locked = process.properties.iter().any(|cmd| {
-            matches!(
-                cmd.name.as_str(),
-                "lock" | "redkey" | "greenkey" | "bluekey"
-            )
-        });
+        let locked = process.properties.iter().any(|cmd| cmd.name == "lock");
+        let requires_key = process
+            .properties
+            .iter()
+            .any(|cmd| matches!(cmd.name.as_str(), "redkey" | "greenkey" | "bluekey"));
         Self {
             motions,
             phase: Phase::Closed,
@@ -150,25 +167,36 @@ impl RuntimeProcess {
             open_time: 0.0,
             locked,
             waitout,
+            lock_changes,
+            supported,
+            requires_key,
         }
     }
-    fn trigger(&mut self) {
-        if self.locked || self.motions.is_empty() {
-            return;
+    fn trigger(&mut self) -> Option<Vec<(u16, bool)>> {
+        if self.locked
+            || self.requires_key
+            || !self.supported
+            || (self.motions.is_empty() && self.lock_changes.is_empty())
+        {
+            return None;
         }
         match self.phase {
             Phase::Closed => {
-                self.phase = if self.delay > 0.0 {
-                    Phase::Delay(self.delay)
-                } else {
-                    Phase::Opening
+                if !self.motions.is_empty() {
+                    self.phase = if self.delay > 0.0 {
+                        Phase::Delay(self.delay)
+                    } else {
+                        Phase::Opening
+                    };
                 }
+                Some(self.lock_changes.clone())
             }
-            Phase::Open => {
+            Phase::Open if !self.motions.is_empty() => {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
+                Some(Vec::new())
             }
-            _ => {}
+            _ => None,
         }
     }
     fn tick(&mut self, world: &mut World, dt: f32) {
@@ -250,8 +278,20 @@ impl ProcessRuntime {
     pub fn usable_count(&self) -> usize {
         self.processes
             .values()
-            .filter(|p| !p.locked && !p.motions.is_empty())
+            .filter(|p| !p.locked && !p.requires_key && !p.motions.is_empty())
             .count()
+    }
+    fn trigger(&mut self, id: u16) {
+        let changes = self
+            .processes
+            .get_mut(&id)
+            .and_then(RuntimeProcess::trigger)
+            .unwrap_or_default();
+        for (target, locked) in changes {
+            if let Some(process) = self.processes.get_mut(&target) {
+                process.locked = locked;
+            }
+        }
     }
     /// Call after movement once per simulation step. `interact_pressed` must be
     /// true on the press edge only, not every frame while the key is held.
@@ -273,12 +313,14 @@ impl ProcessRuntime {
         };
         if floor != self.previous_floor {
             if let Some(cell) = floor {
-                for trigger in &self.links {
-                    if trigger.kind == "floor" && [trigger.x, trigger.y] == cell {
-                        if let Some(process) = self.processes.get_mut(&trigger.process) {
-                            process.trigger();
-                        }
-                    }
+                let processes: Vec<u16> = self
+                    .links
+                    .iter()
+                    .filter(|trigger| trigger.kind == "floor" && [trigger.x, trigger.y] == cell)
+                    .map(|trigger| trigger.process)
+                    .collect();
+                for id in processes {
+                    self.trigger(id);
                 }
             }
             self.previous_floor = floor;
@@ -298,9 +340,7 @@ impl ProcessRuntime {
                 .filter(|(_, distance)| *distance <= USE_RANGE * USE_RANGE)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((id, _)) = nearest {
-                if let Some(process) = self.processes.get_mut(&id) {
-                    process.trigger();
-                }
+                self.trigger(id);
             }
         }
         for process in self.processes.values_mut() {
@@ -397,6 +437,18 @@ mod tests {
             tick_for(&mut runtime, &mut world, 2.0);
             assert_eq!(world.walls[0].a[0], 1.0, "{action}");
         }
+    }
+    #[test]
+    fn a_linked_switch_can_unlock_a_separate_door() {
+        let script = Script::parse("#proc1\nLock\n#action\nmove 1 0 256 0\n#end\n#proc2\n#action\nunlock 1\n#end\n#links\nlink 1 0 2\nfloor 0 0 1\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        runtime.tick(&mut world, 1.0 / 60.0, true);
+        world.player.position = [2.5, 0.5];
+        runtime.tick(&mut world, 1.0 / 60.0, false);
+        world.player.position = [0.5, 0.5];
+        tick_for(&mut runtime, &mut world, 1.1);
+        assert!((world.walls[0].a[0] - 2.0).abs() < 0.001);
     }
     #[test]
     fn waitout_reopens_a_closing_door_when_player_enters() {

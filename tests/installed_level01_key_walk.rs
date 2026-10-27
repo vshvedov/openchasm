@@ -313,6 +313,50 @@ fn spawn_can_reach_first_green_key() {
             [21.625, 57.125],
         ],
     );
+    // Retrace through the open green-key doorway and approach the window.
+    for _ in 0..60 {
+        session.step(SessionInput::default());
+    }
+    let mut route = Vec::new();
+    for y in 1..=6 {
+        route.push([21.625, 57.125 - 0.25 * y as f32]);
+    }
+    for x in 1..=7 {
+        route.push([21.625 + 0.25 * x as f32, 55.625]);
+    }
+    for y in 1..=13 {
+        route.push([23.375, 55.625 - 0.25 * y as f32]);
+    }
+    walk(&mut session, &route);
+    let p = session.world.player.position;
+    let desired = (51.5 - p[1]).atan2(23.5 - p[0]);
+    let yaw = (desired - session.world.player.angle + std::f32::consts::PI)
+        .rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    session.step(SessionInput {
+        yaw_delta: yaw,
+        ..Default::default()
+    });
+    let mut destroyed = false;
+    for _ in 0..90 {
+        let events = session.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        if events
+            .object_hits
+            .iter()
+            .any(|hit| *hit == ([23, 51], true))
+        {
+            destroyed = true;
+            break;
+        }
+    }
+    assert!(destroyed, "reachable window should be destructible");
+    assert!(
+        session.processes.object_pose([23, 51]).is_none(),
+        "destroyed window must stop blocking movement"
+    );
 }
 
 fn walk(session: &mut Session, checkpoints: &[[f32; 2]]) {

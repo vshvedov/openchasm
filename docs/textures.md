@@ -18,7 +18,7 @@ All 691 files under `texture/` ending in `.cel` in the inspected full-game archi
 
 All inspected images have a declared pixel byte count equal to width × height, and their file size equals that count plus 800 bytes. Most wall images are 64 × 128 or 128 × 128; there are also sky and other image dimensions. A decoded example (`001a.cel`) was visually inspected to verify the pixel order. The standalone `chasm2.pal` contains 768 bytes with the same RGB6 layout. The 256 × 1 `palette.png` in the release confirms conversion to RGB8 by multiplying each component by four; it is not normalized to 255.
 
-CEL palettes can differ slightly from the standalone palette, including at index 255. Transparency is supplied by the caller rather than assumed for every image; which materials require it remains to be verified against the game. `CelImage` preserves embedded palette entries, and supports optional explicit transparency when converting to RGBA.
+CEL palettes can differ slightly from the standalone palette, including at index 255. Transparency is supplied by the caller rather than assumed for every image. The viewer treats palette index 255 as transparent for wall IDs 87–119, and draws invisible ID 120 only for collision. `CelImage` preserves embedded palette entries, and supports optional explicit transparency when converting to RGBA.
 
 The archive also includes PNG assets; the game's bundled modding manual documents `.cel.png` overrides. These are separate from CEL decoding and are not currently resolved by `CelImage`.
 

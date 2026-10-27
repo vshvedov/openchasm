@@ -6,6 +6,8 @@ pub struct Wall {
     pub a: [f32; 2],
     pub b: [f32; 2],
     pub texture: u8,
+    /// Whether this wall blocks the player. Visual opacity is independent.
+    pub blocks_movement: bool,
     /// Original map cell, used by map processes to address the wall.
     pub cell: Option<[u8; 2]>,
 }
@@ -133,6 +135,7 @@ fn move_and_slide(mut position: [f32; 2], mut displacement: [f32; 2], walls: &[W
         }
         let hit = walls
             .iter()
+            .filter(|wall| wall.blocks_movement)
             .filter_map(|wall| sweep_wall(position, displacement, wall))
             .min_by(|a, b| a.0.total_cmp(&b.0));
         let Some((time, normal)) = hit else {
@@ -149,10 +152,10 @@ fn move_and_slide(mut position: [f32; 2], mut displacement: [f32; 2], walls: &[W
 }
 
 impl World {
-    /// Return perpendicular distance and wall index of the nearest forward hit.
-    pub fn cast_ray(&self, direction: [f32; 2]) -> Option<(f32, usize, f32)> {
-        let mut nearest = f32::INFINITY;
-        let mut hit = None;
+    /// Gather ray intersections from far to near for transparent compositing.
+    /// Distance is perpendicular to the camera plane for an unnormalized camera ray.
+    pub fn ray_hits(&self, direction: [f32; 2], hits: &mut Vec<(f32, usize, f32)>) {
+        hits.clear();
         for (index, wall) in self.walls.iter().enumerate() {
             let segment = sub(wall.b, wall.a);
             let denominator = cross(direction, segment);
@@ -162,12 +165,11 @@ impl World {
             let offset = sub(wall.a, self.player.position);
             let distance = cross(offset, segment) / denominator;
             let along = cross(offset, direction) / denominator;
-            if distance > 0.001 && distance < nearest && (0.0..=1.0).contains(&along) {
-                nearest = distance;
-                hit = Some((distance, index, along));
+            if distance > 0.001 && (0.0..=1.0).contains(&along) {
+                hits.push((distance, index, along));
             }
         }
-        hit
+        hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     }
 
     /// Advance a bounded time step using a swept circular player and wall sliding.
@@ -208,6 +210,7 @@ mod tests {
                 a: [1.0, -1.0],
                 b: [1.0, 1.0],
                 texture: 1,
+                blocks_movement: true,
                 cell: None,
             }],
             player: Player {
@@ -219,9 +222,24 @@ mod tests {
     #[test]
     fn ray_hits_segment_and_ignores_opposite_direction() {
         let w = test_world();
-        assert_eq!(w.cast_ray([1.0, 0.0]), Some((1.0, 0, 0.5)));
-        assert_eq!(w.cast_ray([-1.0, 0.0]), None);
-        assert_eq!(w.cast_ray([0.0, 1.0]), None);
+        let mut hits = Vec::new();
+        w.ray_hits([1.0, 0.0], &mut hits);
+        assert_eq!(hits, [(1.0, 0, 0.5)]);
+        w.ray_hits([-1.0, 0.0], &mut hits);
+        assert!(hits.is_empty());
+        w.ray_hits([0.0, 1.0], &mut hits);
+        assert!(hits.is_empty());
+    }
+    #[test]
+    fn nonblocking_wall_allows_passage_but_invisible_wall_blocks() {
+        let mut w = test_world();
+        w.walls[0].texture = 87;
+        w.walls[0].blocks_movement = false;
+        assert_eq!(move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls), [2.0, 0.0]);
+        w.walls[0].texture = 120;
+        w.walls[0].blocks_movement = true;
+        let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls);
+        assert!(end[0] < 0.83);
     }
     #[test]
     fn movement_stops_before_wall() {
@@ -249,6 +267,7 @@ mod tests {
             a: [0.0, 0.0],
             b: [4.0, 4.0],
             texture: 1,
+            blocks_movement: true,
             cell: None,
         };
         let end = move_and_slide([1.0, 0.5], [0.0, 1.0], &[wall]);
@@ -264,6 +283,7 @@ mod tests {
             a: [1.0, 0.0],
             b: [1.0, 1.0],
             texture: 1,
+            blocks_movement: true,
             cell: None,
         };
         let end = move_and_slide([0.0, -0.1], [2.0, 0.0], &[wall]);
@@ -276,6 +296,7 @@ mod tests {
             a: [1.0, -2.0],
             b: [1.0, 2.0],
             texture: 1,
+            blocks_movement: true,
             cell: None,
         };
         let end = move_and_slide([0.9, 0.0], [-0.5, 0.0], &[wall]);

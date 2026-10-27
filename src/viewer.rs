@@ -19,9 +19,14 @@ struct ViewerTexture {
 impl From<CelImage> for ViewerTexture {
     fn from(image: CelImage) -> Self {
         let pixels = image
-            .rgba8(None)
+            .rgba8(Some(255))
             .chunks(4)
-            .map(|p| (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2]))
+            .map(|p| {
+                (u32::from(p[3]) << 24)
+                    | (u32::from(p[0]) << 16)
+                    | (u32::from(p[1]) << 8)
+                    | u32::from(p[2])
+            })
             .collect();
         Self {
             width: image.width as usize,
@@ -68,15 +73,20 @@ fn render(
         }
     }
     let (sin, cos) = world.player.angle.sin_cos();
+    let mut hits = Vec::new();
     for x in 0..WIDTH {
         // Direction is unnormalized, so hit distance is perpendicular to camera plane.
         let camera = (2.0 * x as f32 / WIDTH as f32 - 1.0) * 0.66;
         let direction = [cos - sin * camera, sin + cos * camera];
-        if let Some((distance, index, along)) = world.cast_ray(direction) {
+        world.ray_hits(direction, &mut hits);
+        for &(distance, index, along) in &hits {
+            let texture = world.walls[index].texture as u32;
+            if texture == 120 {
+                continue;
+            }
             let half = (HEIGHT as f32 * 0.5 / distance).min(HEIGHT as f32) as usize;
             let top = (HEIGHT / 2).saturating_sub(half);
             let bottom = (HEIGHT / 2 + half).min(HEIGHT);
-            let texture = world.walls[index].texture as u32;
             let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
             let channel = |base: u32| ((base as f32 * attenuation) as u32).min(255);
             let color = (channel(75 + texture * 37 % 110) << 16)
@@ -91,6 +101,9 @@ fn render(
                     let ty = (((y as isize - screen_origin) as usize * image.height) / height)
                         .min(image.height - 1);
                     let rgb = image.pixels[ty * image.width + tx];
+                    if (87..=119).contains(&texture) && rgb >> 24 == 0 {
+                        continue;
+                    }
                     (channel((rgb >> 16) & 255) << 16)
                         | (channel((rgb >> 8) & 255) << 8)
                         | channel(rgb & 255)
@@ -159,6 +172,41 @@ mod tests {
     use crate::world::{Player, Wall};
 
     #[test]
+    fn composites_masked_walls_over_the_walls_behind_them() {
+        let wall = |distance: f32, texture: u8| Wall {
+            cell: None,
+            a: [distance, -1.0],
+            b: [distance, 1.0],
+            texture,
+            blocks_movement: true,
+        };
+        let world = World {
+            walls: vec![wall(1.0, 87), wall(2.0, 1), wall(0.5, 120)],
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+        };
+        let mut textures: Vec<Option<ViewerTexture>> = (0..128).map(|_| None).collect();
+        textures[1] = Some(ViewerTexture {
+            width: 1,
+            height: 1,
+            pixels: vec![0xffff0000],
+        });
+        textures[87] = Some(ViewerTexture {
+            width: 1,
+            height: 2,
+            pixels: vec![0x00000000, 0xff0000ff],
+        });
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        render(&mut frame, &world, &textures, None, "");
+        let visible_behind = frame[(HEIGHT / 2 - 10) * WIDTH + WIDTH / 2];
+        let visible_in_front = frame[(HEIGHT / 2 + 10) * WIDTH + WIDTH / 2];
+        assert!(visible_behind & 0xff0000 > 0, "{visible_behind:06x}");
+        assert!(visible_in_front & 0x0000ff > 0, "{visible_in_front:06x}");
+    }
+
+    #[test]
     fn paints_a_textured_wall_at_screen_center() {
         let world = World {
             walls: vec![Wall {
@@ -166,6 +214,7 @@ mod tests {
                 a: [1.0, -1.0],
                 b: [1.0, 1.0],
                 texture: 1,
+                blocks_movement: true,
             }],
             player: Player {
                 position: [0.0, 0.0],

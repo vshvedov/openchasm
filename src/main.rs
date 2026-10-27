@@ -49,12 +49,17 @@ fn select_source(selection: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
     sources.into_iter().find(|s| kind.is_none() || Some(s.kind) == kind).map(|s| s.path)
         .ok_or_else(|| format!("no matching content source found for {}; run 'openchasm sources' or pass --source PATH", selection.unwrap_or("default")).into())
 }
-fn load_wall_textures(
-    resources: &mut ResourceSet,
-    resource: &[u8],
-) -> Vec<Option<texture::CelImage>> {
+#[derive(Clone, Default, Debug)]
+struct WallGraphic {
+    filename: Option<String>,
+    disable_walk_collision: bool,
+}
+
+/// Decode level-specific #GFX rows. Flag slots are g/s/o; only g has
+/// movement semantics here. Preserve the default for absent rows.
+fn parse_wall_graphics(resource: &[u8]) -> Vec<WallGraphic> {
     let text = String::from_utf8_lossy(resource);
-    let mut textures = vec![None; 128];
+    let mut graphics = vec![WallGraphic::default(); 128];
     let mut in_gfx = false;
     for line in text.lines().map(str::trim) {
         if line.eq_ignore_ascii_case("#gfx") {
@@ -73,22 +78,39 @@ fn load_wall_textures(
         let Ok(id) = number.trim().parse::<usize>() else {
             continue;
         };
-        let Some(name) = value.split_whitespace().next() else {
+        let Some(graphic) = graphics.get_mut(id) else {
             continue;
         };
-        if id >= textures.len() || !name.to_ascii_lowercase().ends_with(".cel") {
+        let mut fields = value.split_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().ends_with(".cel") {
             continue;
         }
-        let path = format!("texture/{}", name.to_ascii_lowercase());
-        if let Ok(bytes) = resources.read(&path) {
-            if let Ok(image) = texture::CelImage::parse(&bytes) {
-                textures[id] = Some(image);
-            }
+        graphic.filename = Some(name.to_ascii_lowercase());
+        if (87..=119).contains(&id) {
+            graphic.disable_walk_collision = fields
+                .next()
+                .is_some_and(|flags| flags.starts_with('g') || flags.starts_with('G'));
         }
     }
-    textures
+    graphics
 }
-fn make_world(map: &Map) -> Result<World, Box<dyn Error>> {
+fn load_wall_textures(
+    resources: &mut ResourceSet,
+    graphics: &[WallGraphic],
+) -> Vec<Option<texture::CelImage>> {
+    graphics
+        .iter()
+        .map(|graphic| {
+            let path = format!("texture/{}", graphic.filename.as_ref()?);
+            let bytes = resources.read(&path).ok()?;
+            texture::CelImage::parse(&bytes).ok()
+        })
+        .collect()
+}
+fn make_world(map: &Map, graphics: &[WallGraphic]) -> Result<World, Box<dyn Error>> {
     let spawn = map
         .monsters
         .iter()
@@ -110,6 +132,9 @@ fn make_world(map: &Map) -> Result<World, Box<dyn Error>> {
                     a: convert(wall.start),
                     b: convert(wall.end),
                     texture: wall.texture_id,
+                    blocks_movement: !graphics
+                        .get(wall.texture_id as usize)
+                        .is_some_and(|g| g.disable_walk_collision),
                 });
             }
         }
@@ -193,7 +218,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let id = level_id(path);
                 let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
                 let floor = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
-                let world = make_world(&map)?;
+                let graphic_resource = resources.read(path)?;
+                let graphics = parse_wall_graphics(&graphic_resource);
+                let world = make_world(&map, &graphics)?;
                 let script_bytes = resources.read(&format!("map/process.{id}"))?;
                 let script_text = String::from_utf8_lossy(&script_bytes);
                 let script = process::Script::parse(&script_text);
@@ -230,8 +257,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
             let resource = resources.read(&format!("map/resource.{id}"))?;
             let name = level_name(&resource);
-            let textures = load_wall_textures(&mut resources, &resource);
-            let world = make_world(&map)?;
+            let graphics = parse_wall_graphics(&resource);
+            let textures = load_wall_textures(&mut resources, &graphics);
+            let world = make_world(&map, &graphics)?;
             let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
             let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
             let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
@@ -281,5 +309,20 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("openchasm: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod wall_graphics_tests {
+    use super::*;
+    #[test]
+    fn reads_transparent_wall_flags_without_affecting_invisible_or_opaque_walls() {
+        let graphics = parse_wall_graphics(b"#GFX\n001: wall.cel gso\n087: grate.cel gs.\n088: fence.cel .s.\n120: hidden.cel gso\n#end.\n089: after.cel gso\n");
+        assert_eq!(graphics[87].filename.as_deref(), Some("grate.cel"));
+        assert!(graphics[87].disable_walk_collision);
+        assert!(!graphics[88].disable_walk_collision);
+        assert!(!graphics[1].disable_walk_collision);
+        assert!(!graphics[120].disable_walk_collision);
+        assert_eq!(graphics[89].filename, None);
     }
 }

@@ -543,10 +543,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err("launcher takes no options or arguments".into());
         }
         let mut message = None;
-        while let Some(choice) = launcher::run(message.take())? {
+        let mut previous = None;
+        while let Some(choice) = launcher::run(previous.as_ref(), message.take())? {
             let result = ResourceSet::open(&choice.path)
                 .map_err(|error| format!("{}: {error}", choice.path.display()).into())
-                .and_then(|mut resources| play(&mut resources, choice.difficulty, choice.level));
+                .and_then(|mut resources| {
+                    play(&mut resources, choice.difficulty, choice.level.clone())
+                });
+            previous = Some(choice);
             if let Err(error) = result {
                 eprintln!("{error}");
                 message = Some(error.to_string());

@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone)]
 pub struct Choice {
     pub path: PathBuf,
     pub level: String,
@@ -35,7 +36,7 @@ struct Menu {
 }
 
 impl Menu {
-    fn new(sources: Vec<Source>, error: Option<String>) -> Self {
+    fn new(sources: Vec<Source>, previous: Option<&Choice>, error: Option<String>) -> Self {
         let mut menu = Self {
             sources,
             source: 0,
@@ -46,7 +47,29 @@ impl Menu {
             row: 0,
             error: None,
         };
+        if let Some(previous) = previous {
+            menu.difficulty = previous.difficulty;
+            if let Some(index) = menu
+                .sources
+                .iter()
+                .position(|source| source.path == previous.path)
+            {
+                menu.source = index;
+            } else {
+                menu.source = menu.sources.len();
+                menu.custom = previous.path.to_string_lossy().into_owned();
+            }
+        }
         menu.refresh();
+        if let Some(previous) = previous {
+            if let Some(index) = menu
+                .levels
+                .iter()
+                .position(|entry| entry.0 == previous.level)
+            {
+                menu.level = index;
+            }
+        }
         if error.is_some() {
             menu.error = error;
         }
@@ -125,6 +148,33 @@ fn cycle(index: usize, count: usize, direction: i32) -> usize {
         (index + 1) % count
     }
 }
+
+fn path_display(path: &str) -> String {
+    const WIDTH: usize = 86;
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= WIDTH {
+        return path.to_owned();
+    }
+    format!(
+        "...{}",
+        chars[chars.len() - (WIDTH - 3)..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+// Arrows are drawn inline, so use their actual position instead of the window midpoint.
+fn mouse_direction(row_text: &str, x: i32) -> i32 {
+    let right_arrow = row_text
+        .rfind('>')
+        .map(|byte| row_text[..byte].chars().count())
+        .unwrap_or(0);
+    if x >= 40 + right_arrow as i32 * 8 - 4 {
+        1
+    } else {
+        -1
+    }
+}
 fn levels_for(path: &Path) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let mut resources = ResourceSet::open(path)?;
     let ids: Vec<String> = resources
@@ -165,8 +215,11 @@ fn text(canvas: &mut Canvas<Window>, x: i32, y: i32, value: &str) {
     }
 }
 
-pub fn run(initial_error: Option<String>) -> Result<Option<Choice>, Box<dyn Error>> {
-    let mut menu = Menu::new(content::discover(), initial_error);
+pub fn run(
+    previous: Option<&Choice>,
+    initial_error: Option<String>,
+) -> Result<Option<Choice>, Box<dyn Error>> {
+    let mut menu = Menu::new(content::discover(), previous, initial_error);
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
     let window = video
@@ -249,7 +302,26 @@ pub fn run(initial_error: Option<String>) -> Result<Option<Choice>, Box<dyn Erro
                             }
                         } else if row == 1 && menu.custom_selected() {
                         } else {
-                            menu.change(if x < 400 { -1 } else { 1 });
+                            let value = match row {
+                                0 => format!(
+                                    "SOURCE: < {} >",
+                                    if menu.custom_selected() {
+                                        "CUSTOM PATH"
+                                    } else {
+                                        menu.sources[menu.source].kind.label()
+                                    }
+                                ),
+                                2 => format!(
+                                    "LEVEL: < {} >",
+                                    menu.levels
+                                        .get(menu.level)
+                                        .map(|(id, name)| format!("{id}  {name}"))
+                                        .unwrap_or_else(|| "(NONE AVAILABLE)".into())
+                                ),
+                                3 => format!("DIFFICULTY: < {:?} >", menu.difficulty),
+                                _ => String::new(),
+                            };
+                            menu.change(mouse_direction(&value, x));
                         }
                     }
                 }
@@ -282,7 +354,7 @@ pub fn run(initial_error: Option<String>) -> Result<Option<Choice>, Box<dyn Erro
             .unwrap_or_else(|| "(NONE AVAILABLE)".into());
         for (index, value) in [
             format!("SOURCE: < {source} >"),
-            format!("PATH: {path}"),
+            format!("PATH: {}", path_display(&path)),
             format!("LEVEL: < {level} >"),
             format!("DIFFICULTY: < {:?} >", menu.difficulty),
             "START GAME".into(),
@@ -318,7 +390,7 @@ mod tests {
     use super::*;
     #[test]
     fn menu_handles_missing_and_custom_sources() {
-        let mut menu = Menu::new(vec![], None);
+        let mut menu = Menu::new(vec![], None, None);
         assert!(menu.custom_selected());
         assert!(menu.choice().is_none());
         menu.custom = "/no/such/openchasm/content".into();
@@ -333,6 +405,20 @@ mod tests {
     fn cycling_wraps_in_both_directions() {
         assert_eq!(cycle(0, 3, -1), 2);
         assert_eq!(cycle(2, 3, 1), 0);
+    }
+
+    #[test]
+    fn mouse_arrows_follow_drawn_label_and_long_paths_show_tail() {
+        let label = "SOURCE: < Steam full installation >";
+        let right = 40 + label.chars().position(|c| c == '>').unwrap() as i32 * 8;
+        let left = 40 + label.chars().position(|c| c == '<').unwrap() as i32 * 8;
+        assert_eq!(mouse_direction(label, left), -1);
+        assert_eq!(mouse_direction(label, right), 1);
+        let path = format!("/{}important", "a".repeat(100));
+        let displayed = path_display(&path);
+        assert_eq!(displayed.chars().count(), 86);
+        assert!(displayed.starts_with("..."));
+        assert!(displayed.ends_with("important"));
     }
 
     #[test]
@@ -351,7 +437,7 @@ mod tests {
             }
         }
         std::fs::write(map.join("resource.03"), b"#name=Incomplete\n").unwrap();
-        let mut menu = Menu::new(vec![], None);
+        let mut menu = Menu::new(vec![], None, None);
         menu.custom = root.to_string_lossy().into_owned();
         menu.refresh();
         assert_eq!(menu.levels.len(), 2);
@@ -359,6 +445,15 @@ mod tests {
         let choice = menu.choice().unwrap();
         assert_eq!(choice.path, root);
         assert_eq!(choice.level, "02");
+        let previous = Choice {
+            difficulty: Difficulty::Hard,
+            ..choice
+        };
+        let restored = Menu::new(vec![], Some(&previous), Some("load failed".into()));
+        assert_eq!(restored.path(), root);
+        assert_eq!(restored.levels[restored.level].0, "02");
+        assert_eq!(restored.difficulty, Difficulty::Hard);
+        assert_eq!(restored.error.as_deref(), Some("load failed"));
         menu.sources.push(Source {
             kind: content::SourceKind::LocalArchive,
             path: root.clone(),

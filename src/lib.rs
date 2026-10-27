@@ -26,6 +26,7 @@ pub mod object_states;
 pub mod pickups;
 pub mod projectiles;
 pub mod quake;
+pub mod save_format;
 pub mod session;
 pub mod teleport;
 pub mod vertical;

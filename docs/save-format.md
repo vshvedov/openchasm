@@ -1,0 +1,7 @@
+# Save envelope and content identity
+
+`save_format` supplies bounded, in-memory primitives. It does not yet serialize a Session, read or write files, reconstruct content, or implement a user-facing save feature. No game asset bytes are stored by the envelope or manifest.
+
+Version 1.0 is eight-byte magic `OPCHSAVE`, little-endian u16 major and minor, 32-byte content identity, little-endian u32 payload length, opaque payload, and SHA-256 of all preceding envelope bytes. The payload is limited to 16 MiB; decoding rejects unsupported versions, truncation, trailing data, oversized payloads, checksum mismatch, and, when requested, content mismatch. SHA-256 is an integrity check, not authentication. Any future payload decoder must validate its own schema and bounds before changing live state.
+
+A content manifest hashes an ordered, length-delimited canonical manifest: each normalized lowercase relative resource name is paired with an explicit missing marker or a byte length and SHA-256. Sorting makes insertion order irrelevant, and missing differs from present-but-empty. The host must include all actual gameplay dependencies and decisions, including resolved asset fallbacks, rules version, difficulty, and capability configuration; merely using the source label or map filename is insufficient. The streaming digest API trusts the caller's provided byte count and digest. File access and atomic replacement remain future work.

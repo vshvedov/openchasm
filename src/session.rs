@@ -74,6 +74,7 @@ pub struct ScriptedObjects {
     /// The host promises to consume and present quake changes.
     pub quake_enabled: bool,
     destroy_links: Vec<([u8; 2], u16)>,
+    pickup_links: Vec<([u8; 2], u16)>,
     required_objects: Vec<u16>,
 }
 impl ScriptedObjects {
@@ -100,6 +101,12 @@ impl ScriptedObjects {
                         .any(|a| matches!(a.name.as_str(), "explode" | "change"))
                         .then_some(id)
                 })
+                .collect(),
+            pickup_links: script
+                .triggers
+                .iter()
+                .filter(|t| t.kind == "link")
+                .map(|t| ([t.x, t.y], t.process))
                 .collect(),
             destroy_links: script
                 .triggers
@@ -199,8 +206,79 @@ impl Session {
             }
         }
     }
-    /// Activate destroy links in script order. A validation failure rolls back
-    /// the complete destroy-link group and tells the caller to restore the hit.
+    /// Execute one prepared process. The bool in an error indicates a failure
+    /// during external validation, rather than a denied runtime activation.
+    fn try_staged_process(
+        &mut self,
+        kind: &str,
+        cell: [u8; 2],
+        id: u16,
+        events: &mut SessionEvents,
+    ) -> Result<ProcessEvent, (ProcessOutcome, bool)> {
+        let prepared = self
+            .processes
+            .prepare_at(kind, cell, id)
+            .map_err(|outcome| (outcome, false))?;
+        let quakes: Vec<_> = prepared
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                ImmediateAction::Quake(zone) => Some(*zone),
+                _ => None,
+            })
+            .collect();
+        let scripted = self.scripted_objects.as_mut().expect("opted-in state");
+        if !quakes.is_empty() && !scripted.quake_enabled {
+            return Err((ProcessOutcome::Unsupported, true));
+        }
+        let combat = self
+            .objects
+            .as_mut()
+            .ok_or((ProcessOutcome::Unsupported, true))?;
+        let player = self.world.player.position;
+        let actor_circles: Vec<_> = self
+            .actors
+            .actors
+            .iter()
+            .filter_map(|actor| {
+                if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive) {
+                    return None;
+                }
+                let radius = self
+                    .actor_definitions
+                    .entries
+                    .get(actor.definition_index)
+                    .map(|def| (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0))
+                    .unwrap_or(2.0);
+                Some((actor.position, radius))
+            })
+            .collect();
+        let transaction = ProcessTransaction::prepare(
+            prepared,
+            &mut scripted.states,
+            combat,
+            &mut scripted.quake,
+            &scripted.definitions,
+            &scripted.manifest,
+            |_, position, radius| {
+                let distance = |p: [f32; 2]| (p[0] - position[0]).hypot(p[1] - position[1]);
+                player.iter().all(|v| v.is_finite())
+                    && distance(player) >= radius + 0.18
+                    && actor_circles
+                        .iter()
+                        .all(|(p, r)| p.iter().all(|v| v.is_finite()) && distance(*p) >= radius + r)
+            },
+        )
+        .map_err(|_| (ProcessOutcome::Unsupported, true))?;
+        let transitions = transaction.transitions().to_vec();
+        let event = transaction
+            .commit()
+            .map_err(|_| (ProcessOutcome::Unsupported, true))?;
+        events.object_transitions.extend(transitions);
+        events.quake_changes.extend(quakes);
+        Ok(event)
+    }
+    /// Destroy-link group failure rolls back its already committed processes.
     fn activate_destroy(
         &mut self,
         cell: [u8; 2],
@@ -210,7 +288,7 @@ impl Session {
             return (self.processes.activate_at("destroy", cell), true);
         };
         let required_objects = scripted.required_objects.clone();
-        let ids: Vec<u16> = scripted
+        let ids: Vec<_> = scripted
             .destroy_links
             .iter()
             .filter_map(|(at, id)| (*at == cell).then_some(*id))
@@ -221,104 +299,26 @@ impl Session {
         let replacement_start = events.object_transitions.len();
         let quake_start = events.quake_changes.len();
         let mut attempts = Vec::new();
-        let mut failed = false;
         for id in ids {
-            let prepared = match self.processes.prepare_at("destroy", cell, id) {
-                Ok(value) => value,
-                Err(outcome) => {
-                    if required_objects.contains(&id) {
-                        failed = true;
-                        break;
-                    }
+            match self.try_staged_process("destroy", cell, id, events) {
+                Ok(event) => attempts.push(event),
+                Err((outcome, preflight_failed))
+                    if !preflight_failed && !required_objects.contains(&id) =>
+                {
                     attempts.push(ProcessEvent {
                         process_id: id,
                         outcome,
-                    });
-                    continue;
-                }
-            };
-            let quakes: Vec<_> = prepared
-                .actions()
-                .iter()
-                .filter_map(|action| match action {
-                    ImmediateAction::Quake(zone) => Some(*zone),
-                    _ => None,
-                })
-                .collect();
-            let scripted = self.scripted_objects.as_mut().expect("opted-in state");
-            if !quakes.is_empty() && !scripted.quake_enabled {
-                drop(prepared);
-                failed = true;
-                break;
-            }
-            let Some(combat) = self.objects.as_mut() else {
-                drop(prepared);
-                failed = true;
-                break;
-            };
-            let player = self.world.player.position;
-            let actor_circles: Vec<_> = self
-                .actors
-                .actors
-                .iter()
-                .filter_map(|actor| {
-                    if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive)
-                    {
-                        return None;
-                    }
-                    let radius = self
-                        .actor_definitions
-                        .entries
-                        .get(actor.definition_index)
-                        .map(|def| (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0))
-                        .unwrap_or(2.0);
-                    Some((actor.position, radius))
-                })
-                .collect();
-            let prepared = ProcessTransaction::prepare(
-                prepared,
-                &mut scripted.states,
-                combat,
-                &mut scripted.quake,
-                &scripted.definitions,
-                &scripted.manifest,
-                |_, position, radius| {
-                    let distance = |p: [f32; 2]| (p[0] - position[0]).hypot(p[1] - position[1]);
-                    player.iter().all(|v| v.is_finite())
-                        && distance(player) >= radius + 0.18
-                        && actor_circles.iter().all(|(p, r)| {
-                            p.iter().all(|v| v.is_finite()) && distance(*p) >= radius + r
-                        })
-                },
-            );
-            match prepared {
-                Ok(transaction) => {
-                    let transitions = transaction.transitions().to_vec();
-                    match transaction.commit() {
-                        Ok(event) => {
-                            attempts.push(event);
-                            events.object_transitions.extend(transitions);
-                            events.quake_changes.extend(quakes);
-                        }
-                        Err(_) => {
-                            failed = true;
-                            break;
-                        }
-                    }
+                    })
                 }
                 Err(_) => {
-                    failed = true;
-                    break;
+                    self.processes = saved_processes;
+                    self.scripted_objects = saved_scripted;
+                    self.objects = saved_objects;
+                    events.object_transitions.truncate(replacement_start);
+                    events.quake_changes.truncate(quake_start);
+                    return (Vec::new(), false);
                 }
             }
-        }
-        if failed {
-            self.processes = saved_processes;
-            self.scripted_objects = saved_scripted;
-            self.objects = saved_objects;
-            events.object_transitions.truncate(replacement_start);
-            events.quake_changes.truncate(quake_start);
-            return (Vec::new(), false);
         }
         (attempts, true)
     }
@@ -565,19 +565,103 @@ impl Session {
                 self.world
                     .move_circle(position, displacement, radius, &obstacles);
         }
-        events.pickups = self.game.collect_near(self.world.player.position);
+        // First stage only inventory/pickup data. The larger simulation snapshot
+        // is needed only on ticks where a collection actually occurs.
+        let pickup_backup = if self.scripted_objects.is_some() {
+            let mut staged_game = self.game.clone();
+            events.pickups = staged_game.collect_near(self.world.player.position);
+            if events.pickups.is_empty() {
+                None
+            } else {
+                let game = std::mem::replace(&mut self.game, staged_game);
+                Some((
+                    game,
+                    self.processes.clone(),
+                    self.objects.clone(),
+                    self.scripted_objects.clone(),
+                ))
+            }
+        } else {
+            events.pickups = self.game.collect_near(self.world.player.position);
+            None
+        };
         self.processes.set_keys(self.game.inventory.keys);
         let mut attempts = Vec::new();
-        for pickup in &events.pickups {
+        let mut pickup_failed = false;
+        for pickup in events.pickups.clone() {
             self.invalidate_process_object(pickup.cell);
             if let Some(objects) = &mut self.objects {
                 objects.set_enabled(pickup.cell, false);
             }
             if let (Ok(x), Ok(y)) = (u8::try_from(pickup.cell[0]), u8::try_from(pickup.cell[1])) {
-                attempts.extend(self.processes.activate_links_at([x, y]));
+                if let Some(scripted) = &self.scripted_objects {
+                    let ids: Vec<_> = scripted
+                        .pickup_links
+                        .iter()
+                        .filter_map(|(at, id)| (*at == [x, y]).then_some(*id))
+                        .collect();
+                    let required = scripted.required_objects.clone();
+                    for id in ids {
+                        match self.try_staged_process("link", [x, y], id, &mut events) {
+                            Ok(event) => attempts.push(event),
+                            Err((outcome, preflight)) if !preflight && !required.contains(&id) => {
+                                attempts.push(ProcessEvent {
+                                    process_id: id,
+                                    outcome,
+                                })
+                            }
+                            Err(_) => {
+                                pickup_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    attempts.extend(self.processes.activate_links_at([x, y]));
+                }
+            }
+            if pickup_failed {
+                break;
             }
         }
-        attempts.extend(self.processes.tick(&mut self.world, DT, input.interact));
+        if pickup_failed {
+            if let Some((game, processes, objects, scripted)) = pickup_backup {
+                self.game = game;
+                self.processes = processes;
+                self.objects = objects;
+                self.scripted_objects = scripted;
+            }
+            events.pickups.clear();
+            events.object_transitions.clear();
+            events.quake_changes.clear();
+            attempts.clear();
+        }
+        if self.scripted_objects.is_none() {
+            attempts.extend(self.processes.tick(&mut self.world, DT, input.interact));
+        } else {
+            let commands = self
+                .processes
+                .collect_tick_commands(self.world.player.position, input.interact);
+            for command in commands {
+                if matches!(command.kind.as_str(), "return" | "returnf") {
+                    self.processes.dispatch_tick_command(&command);
+                } else {
+                    let event = self
+                        .try_staged_process(
+                            &command.kind,
+                            command.cell,
+                            command.process_id,
+                            &mut events,
+                        )
+                        .unwrap_or_else(|(outcome, _)| ProcessEvent {
+                            process_id: command.process_id,
+                            outcome,
+                        });
+                    attempts.push(event);
+                }
+            }
+            self.processes.advance_motions(&mut self.world, DT);
+        }
         // Process-owned object positions must be applied before this tick's
         // hitscan or projectile queries and before enemy simulation.
         events.process_effects.extend(self.apply_process_effects());
@@ -1912,5 +1996,249 @@ mod tests {
                 .cell([2, 0]),
             Some(10)
         );
+    }
+    #[test]
+    fn staged_floor_and_return_preserve_order_and_atomic_wall_motion() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        use crate::world::Wall;
+        let text = "#proc1\n#action\nchange 3 0 164\nmove 2 0 256 0\nunlock 2\n#end\n#proc2\nLock\n#action\nplayani 55\n#end\n#links\nfloor 0 0 1\nfloor 0 0 2\nreturn 0 0 1\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        session.world.walls.push(Wall {
+            a: [2.0, 0.0],
+            b: [2.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([2, 0]),
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        let def = |name: &str| ObjectDefinition {
+            collision_radius: 32,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![def("a.3o"), def("b.3o")],
+        };
+        let instance = ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index: 0,
+            grid_cell: [3, 0],
+            position: [3.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let mut cells = [0; 4096];
+        cells[3 * 64] = 163;
+        let pose = ProcessObject {
+            cell: [3, 0],
+            position: instance.position,
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.125,
+        };
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            std::slice::from_ref(&instance),
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        let states = ObjectStates::new(&[instance], &defs).unwrap();
+        session.set_scripted_objects(ScriptedObjects::new(
+            states,
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        let mut failed = session.clone();
+        let rejected = failed.step(SessionInput::default());
+        assert!(rejected.object_transitions.is_empty());
+        assert!(!rejected
+            .process_effects
+            .iter()
+            .any(|e| matches!(e, ProcessEffect::PlayAnimation { object_id: 55 })));
+        assert_eq!(failed.world.walls[0].a[0], 2.0);
+        assert_eq!(failed.processes.cell_type([3, 0]), Some(163));
+        session
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([3, 0], 164);
+        let use_text = text.replace("floor 0 0 1\nfloor 0 0 2", "link 0 0 1\nlink 0 0 2");
+        let use_script = Script::parse(&use_text);
+        let mut use_session = session.clone();
+        use_session.processes = ProcessRuntime::with_staged_actions(
+            &use_script,
+            &use_session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        let previous = use_session.scripted_objects.take().unwrap();
+        use_session.set_scripted_objects(ScriptedObjects::new(
+            previous.states,
+            previous.definitions,
+            previous.manifest,
+            &use_script,
+            false,
+        ));
+        // Avoid the same-cell return here, which is intentionally processed in source order.
+        use_session.processes = ProcessRuntime::with_staged_actions(
+            &Script::parse(&use_text.replace("return 0 0 1\n", "")),
+            &use_session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        let use_events = use_session.step(SessionInput {
+            interact: true,
+            ..Default::default()
+        });
+        assert_eq!(use_events.object_transitions.len(), 1);
+        assert!(use_events
+            .process_effects
+            .iter()
+            .any(|e| matches!(e, ProcessEffect::PlayAnimation { object_id: 55 })));
+        assert!(use_session.world.walls[0].a[0] > 2.0);
+        let accepted = session.step(SessionInput::default());
+        assert_eq!(accepted.object_transitions.len(), 1);
+        assert!(accepted
+            .process_effects
+            .iter()
+            .any(|e| matches!(e, ProcessEffect::PlayAnimation { object_id: 55 })));
+        assert!(session.world.walls[0].a[0] > 2.0);
+        session.step(SessionInput {
+            interact: true,
+            ..Default::default()
+        });
+        for _ in 0..10 {
+            session.step(SessionInput::default());
+        }
+        assert!((session.world.walls[0].a[0] - 2.0).abs() < 0.001);
+        assert_eq!(session.processes.cell_type([3, 0]), Some(164));
+    }
+    #[test]
+    fn staged_pickup_rolls_back_on_missing_replacement_then_retries() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text = "#proc1\n#action\nchange 3 0 164\n#end\n#links\nlink 0 0 1\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        let def = |name: &str, code| ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: code,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![def("key.3o", 142)],
+            level_objects: vec![def("a.3o", 0), def("b.3o", 0)],
+        };
+        let key = ObjectInstance {
+            kind: ObjectKind::Item,
+            definition_index: 0,
+            grid_cell: [0, 0],
+            position: [0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let object = ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index: 0,
+            grid_cell: [3, 0],
+            position: [3.5, 0.5],
+            ..key.clone()
+        };
+        let instances = [key, object];
+        session.game = GameInventory::new(
+            session.game.weapons.clone(),
+            &instances,
+            &defs,
+            Difficulty::Normal,
+        );
+        let mut cells = [0; 4096];
+        cells[3 * 64] = 163;
+        let pose = ProcessObject {
+            cell: [3, 0],
+            position: [3.5, 0.5],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.0,
+        };
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        let states = ObjectStates::new(&instances, &defs).unwrap();
+        session.set_scripted_objects(ScriptedObjects::new(
+            states,
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        let rejected = session.step(SessionInput::default());
+        assert!(rejected.pickups.is_empty());
+        assert!(!session.game.inventory.keys[1]);
+        assert_eq!(session.game.pickups.is_visible([0, 0]), Some(true));
+        assert_eq!(session.processes.cell_type([3, 0]), Some(163));
+        session
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([3, 0], 164);
+        let accepted = session.step(SessionInput::default());
+        assert_eq!(accepted.pickups.len(), 1);
+        assert!(session.game.inventory.keys[1]);
+        assert_eq!(session.game.pickups.is_visible([0, 0]), Some(false));
+        assert_eq!(session.processes.cell_type([3, 0]), Some(164));
+        assert_eq!(accepted.object_transitions.len(), 1);
     }
 }

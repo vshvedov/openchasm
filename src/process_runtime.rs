@@ -1177,6 +1177,14 @@ pub struct ProcessEvent {
     pub outcome: ProcessOutcome,
 }
 
+/// One floor, use, or reverse command selected for a simulation tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessCommand {
+    pub kind: String,
+    pub cell: [u8; 2],
+    pub process_id: u16,
+}
+
 /// Process state can be ticked by a client or a headless authoritative server.
 /// The owning world's wall vector must retain its original order and length.
 #[derive(Clone)]
@@ -1696,42 +1704,14 @@ impl ProcessRuntime {
     pub fn activate_links_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
         self.activate_at("link", cell)
     }
-    /// Apply use and reverse links at one cell in source order. Reverse links
-    /// do not emit activation events or schedule mission completion.
-    fn use_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
-        let links: Vec<(String, u16)> = self
-            .links
-            .iter()
-            .filter(|link| {
-                matches!(link.kind.as_str(), "link" | "return") && [link.x, link.y] == cell
-            })
-            .map(|link| (link.kind.clone(), link.process))
-            .collect();
-        let mut events = Vec::new();
-        for (kind, id) in links {
-            if kind == "return" {
-                if let Some(process) = self.processes.get_mut(&id) {
-                    process.return_to_start(id, &mut self.effects);
-                }
-            } else {
-                events.push(self.trigger(id));
-            }
-        }
-        events
-    }
-    /// Call after movement once per simulation step. `interact_pressed` must be
-    /// true on the press edge only, not every frame while the key is held.
-    pub fn tick(
+    /// Gather floor and use commands in authored order. Floor entry is sampled
+    /// once; the caller must dispatch every returned command before advancing.
+    pub fn collect_tick_commands(
         &mut self,
-        world: &mut World,
-        dt: f32,
+        position: [f32; 2],
         interact_pressed: bool,
-    ) -> Vec<ProcessEvent> {
-        if !dt.is_finite() || dt <= 0.0 {
-            return Vec::new();
-        }
-        let mut events = Vec::new();
-        let p = world.player.position;
+    ) -> Vec<ProcessCommand> {
+        let p = position;
         let floor = if p[0].is_finite()
             && p[1].is_finite()
             && p[0] >= 0.0
@@ -1743,32 +1723,25 @@ impl ProcessRuntime {
         } else {
             None
         };
+        let mut commands = Vec::new();
         if floor != self.previous_floor {
             if let Some(cell) = floor {
-                let links: Vec<(String, u16)> = self
-                    .links
-                    .iter()
-                    .filter(|trigger| {
-                        matches!(trigger.kind.as_str(), "floor" | "returnf")
-                            && [trigger.x, trigger.y] == cell
-                    })
-                    .map(|trigger| (trigger.kind.clone(), trigger.process))
-                    .collect();
-                for (kind, id) in links {
-                    if kind == "returnf" {
-                        if let Some(process) = self.processes.get_mut(&id) {
-                            process.return_to_start(id, &mut self.effects);
-                        }
-                    } else {
-                        events.push(self.trigger(id));
-                    }
-                }
+                commands.extend(
+                    self.links
+                        .iter()
+                        .filter(|t| {
+                            matches!(t.kind.as_str(), "floor" | "returnf") && [t.x, t.y] == cell
+                        })
+                        .map(|t| ProcessCommand {
+                            kind: t.kind.clone(),
+                            cell,
+                            process_id: t.process,
+                        }),
+                );
             }
             self.previous_floor = floor;
         }
         if interact_pressed && p[0].is_finite() && p[1].is_finite() {
-            // A linked cell may contain an object, which the current preview has
-            // not loaded. Cell-center distance is a provisional interaction test.
             let nearest = self
                 .links
                 .iter()
@@ -1781,8 +1754,44 @@ impl ProcessRuntime {
                 .filter(|(_, distance)| *distance <= USE_RANGE * USE_RANGE)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((cell, _)) = nearest {
-                events.extend(self.use_at(cell));
+                commands.extend(
+                    self.links
+                        .iter()
+                        .filter(|t| {
+                            matches!(t.kind.as_str(), "link" | "return") && [t.x, t.y] == cell
+                        })
+                        .map(|t| ProcessCommand {
+                            kind: t.kind.clone(),
+                            cell,
+                            process_id: t.process,
+                        }),
+                );
             }
+        }
+        commands
+    }
+    /// Dispatch one gathered command. Reverse commands have no activation event.
+    pub fn dispatch_tick_command(&mut self, command: &ProcessCommand) -> Option<ProcessEvent> {
+        if !self.links.iter().any(|t| {
+            t.kind == command.kind && [t.x, t.y] == command.cell && t.process == command.process_id
+        }) {
+            return None;
+        }
+        if matches!(command.kind.as_str(), "return" | "returnf") {
+            if let Some(process) = self.processes.get_mut(&command.process_id) {
+                process.return_to_start(command.process_id, &mut self.effects);
+            }
+            None
+        } else if matches!(command.kind.as_str(), "floor" | "link") {
+            Some(self.trigger(command.process_id))
+        } else {
+            None
+        }
+    }
+    /// Advance processes after all commands for this tick have been dispatched.
+    pub fn advance_motions(&mut self, world: &mut World, dt: f32) {
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
         }
         let mut frame = ProcessFrame {
             world,
@@ -1794,6 +1803,24 @@ impl ProcessRuntime {
         for (&id, process) in &mut self.processes {
             process.tick(id, dt, &mut frame);
         }
+    }
+    /// Call after movement once per simulation step. `interact_pressed` must be
+    /// true on the press edge only, not every frame while the key is held.
+    pub fn tick(
+        &mut self,
+        world: &mut World,
+        dt: f32,
+        interact_pressed: bool,
+    ) -> Vec<ProcessEvent> {
+        if !dt.is_finite() || dt <= 0.0 {
+            return Vec::new();
+        }
+        let commands = self.collect_tick_commands(world.player.position, interact_pressed);
+        let events = commands
+            .iter()
+            .filter_map(|command| self.dispatch_tick_command(command))
+            .collect();
+        self.advance_motions(world, dt);
         events
     }
 }

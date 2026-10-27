@@ -128,6 +128,8 @@ pub enum Pickup {
     Health,
     Armor,
     Invisibility,
+    Reflector,
+    Chojin,
     Key(Key),
 }
 
@@ -139,6 +141,38 @@ pub enum PickupOutcome {
     Full,
     /// The action is not yet modeled and must not be consumed by the caller.
     Unsupported,
+}
+
+/// Optional fixed-tick power-ups owned by the game session. Durations and
+/// stacking follow an independent reconstruction and remain unverified.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtectivePowerups {
+    pub enabled: bool,
+    pub reflector_ticks_remaining: u32,
+    pub chojin_ticks_remaining: u32,
+}
+impl ProtectivePowerups {
+    pub fn tick(&mut self) {
+        self.reflector_ticks_remaining = self.reflector_ticks_remaining.saturating_sub(1);
+        self.chojin_ticks_remaining = self.chojin_ticks_remaining.saturating_sub(1);
+    }
+    pub fn pickup(&mut self, action_code: i32) -> PickupOutcome {
+        if !self.enabled {
+            return PickupOutcome::Unsupported;
+        }
+        match action_code {
+            132 => {
+                self.reflector_ticks_remaining =
+                    self.reflector_ticks_remaining.saturating_add(40 * 60);
+                PickupOutcome::Collected(Pickup::Reflector)
+            }
+            133 => {
+                self.chojin_ticks_remaining = self.chojin_ticks_remaining.saturating_add(30 * 60);
+                PickupOutcome::Collected(Pickup::Chojin)
+            }
+            _ => PickupOutcome::Unsupported,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,5 +407,46 @@ mod tests {
         let previous = player.clone();
         assert_eq!(player.pickup(133, &defs), PickupOutcome::Unsupported);
         assert_eq!(player, previous);
+    }
+    #[test]
+    fn protective_powerups_are_opt_in_stack_and_expire_at_tick_boundaries() {
+        let mut effects = ProtectivePowerups::default();
+        assert_eq!(effects.pickup(132), PickupOutcome::Unsupported);
+        assert_eq!(effects.pickup(133), PickupOutcome::Unsupported);
+        effects.enabled = true;
+        assert_eq!(
+            effects.pickup(132),
+            PickupOutcome::Collected(Pickup::Reflector)
+        );
+        assert_eq!(
+            effects.pickup(133),
+            PickupOutcome::Collected(Pickup::Chojin)
+        );
+        assert_eq!(
+            (
+                effects.reflector_ticks_remaining,
+                effects.chojin_ticks_remaining
+            ),
+            (2400, 1800)
+        );
+        effects.tick();
+        effects.pickup(132);
+        effects.pickup(133);
+        assert_eq!(
+            (
+                effects.reflector_ticks_remaining,
+                effects.chojin_ticks_remaining
+            ),
+            (4799, 3599)
+        );
+        for _ in 0..3599 {
+            effects.tick();
+        }
+        assert_eq!(effects.chojin_ticks_remaining, 0);
+        assert_eq!(effects.reflector_ticks_remaining, 1200);
+        for _ in 0..1200 {
+            effects.tick();
+        }
+        assert_eq!(effects.reflector_ticks_remaining, 0);
     }
 }

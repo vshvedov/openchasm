@@ -266,6 +266,53 @@ impl ProjectileSystem {
         Some(self.projectiles.remove(index))
     }
 
+    /// Reinsert a taken projectile after a player reflector impact. Preserve
+    /// ID, speed and remaining lifetime; point radially away from the player.
+    /// Returns false without changing the system if the projectile is invalid.
+    pub fn reflect_from_player(
+        &mut self,
+        mut projectile: Projectile,
+        player_position: [f32; 2],
+    ) -> bool {
+        if self.projectiles.len() >= MAX_PROJECTILES
+            || projectile.id >= self.next_id
+            || !projectile.radius.is_finite()
+            || !(0.0..=2.0).contains(&projectile.radius)
+            || projectile.damage <= 0
+            || self.projectiles.iter().any(|p| p.id == projectile.id)
+            || !player_position
+                .iter()
+                .chain(projectile.position.iter())
+                .chain(projectile.velocity.iter())
+                .all(|v| v.is_finite())
+            || !projectile.remaining.is_finite()
+            || projectile.remaining < 0.0
+        {
+            return false;
+        }
+        let speed = projectile.velocity[0].hypot(projectile.velocity[1]);
+        if !speed.is_finite() || speed < 1e-6 {
+            return false;
+        }
+        let mut outward = [
+            projectile.position[0] - player_position[0],
+            projectile.position[1] - player_position[1],
+        ];
+        let distance = outward[0].hypot(outward[1]);
+        if distance > 1e-6 {
+            outward = [outward[0] / distance, outward[1] / distance];
+        } else {
+            outward = [
+                -projectile.velocity[0] / speed,
+                -projectile.velocity[1] / speed,
+            ];
+        }
+        projectile.velocity = [outward[0] * speed, outward[1] * speed];
+        projectile.owner = Owner::Player;
+        self.projectiles.push(projectile);
+        true
+    }
+
     /// Only non-instant, positive-power rocket definitions can be spawned.
     pub fn spawn(
         &mut self,

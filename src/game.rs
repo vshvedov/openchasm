@@ -8,6 +8,7 @@ pub struct GameInventory {
     pub inventory: Inventory,
     pub pickups: Pickups,
     pub weapons: WeaponDefinitions,
+    pub protective_powerups: crate::inventory::ProtectivePowerups,
 }
 impl GameInventory {
     pub fn new(
@@ -20,6 +21,7 @@ impl GameInventory {
             inventory: Inventory::new(&weapons),
             pickups: Pickups::new(instances, definitions, difficulty),
             weapons,
+            protective_powerups: crate::inventory::ProtectivePowerups::default(),
         }
     }
     pub fn weapons(&self) -> &WeaponDefinitions {
@@ -28,8 +30,12 @@ impl GameInventory {
 
     /// Update inventory on overlap and return presentation/script events.
     pub fn collect_near(&mut self, position: [f32; 2]) -> Vec<PickupEvent> {
-        self.pickups
-            .collect_near(position, &mut self.inventory, &self.weapons)
+        self.pickups.collect_near_with_powerups(
+            position,
+            &mut self.inventory,
+            &self.weapons,
+            Some(&mut self.protective_powerups),
+        )
     }
 }
 

@@ -99,6 +99,16 @@ impl Pickups {
         inventory: &mut Inventory,
         weapons: &WeaponDefinitions,
     ) -> Vec<PickupEvent> {
+        self.collect_near_with_powerups(position, inventory, weapons, None)
+    }
+    /// Optional protection effects are owned by the game session.
+    pub fn collect_near_with_powerups(
+        &mut self,
+        position: [f32; 2],
+        inventory: &mut Inventory,
+        weapons: &WeaponDefinitions,
+        mut powerups: Option<&mut crate::inventory::ProtectivePowerups>,
+    ) -> Vec<PickupEvent> {
         let mut events = Vec::new();
         if !position.iter().all(|value| value.is_finite()) {
             return events;
@@ -112,9 +122,16 @@ impl Pickups {
             if dx * dx + dy * dy > candidate.radius * candidate.radius {
                 continue;
             }
-            if let PickupOutcome::Collected(pickup) =
+            let outcome = if matches!(candidate.action_code, 132 | 133) {
+                powerups
+                    .as_deref_mut()
+                    .map_or(PickupOutcome::Unsupported, |effects| {
+                        effects.pickup(candidate.action_code)
+                    })
+            } else {
                 inventory.pickup(candidate.action_code, weapons)
-            {
+            };
+            if let PickupOutcome::Collected(pickup) = outcome {
                 candidate.collected = true;
                 events.push(PickupEvent {
                     cell: candidate.cell,

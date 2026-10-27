@@ -51,6 +51,16 @@ pub struct SessionInput {
     pub fire: bool,
     pub select_weapon: Option<usize>,
 }
+/// A physical projectile redirected by the active player reflector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProjectileReflection {
+    pub projectile_id: u64,
+    pub rocket_id: usize,
+    pub previous_owner: Owner,
+    pub position: [f32; 2],
+    pub time: f32,
+}
+
 /// Result of one authoritative enemy instant-shot trace.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnemyHitscanEvent {
@@ -79,6 +89,7 @@ pub struct SessionEvents {
     pub enemy_attacks: Vec<EnemyAttack>,
     pub enemy_hits: Vec<EnemyHitscanEvent>,
     pub projectile_impacts: Vec<Impact>,
+    pub projectile_reflections: Vec<ProjectileReflection>,
     /// Impact explosions and raw pre-armor damage, in deterministic order.
     pub explosions: Vec<Explosion>,
     /// One source per explosion, in the same order as `explosions`.
@@ -262,6 +273,16 @@ impl Session {
     /// Stable authoritative snapshot for presenting or synchronizing mines.
     pub fn mines(&self) -> &[Mine] {
         self.mines.active()
+    }
+
+    /// Enable provisional reflector/chojin pickups and effects. Disabling
+    /// clears both timers so an unavailable presentation cannot hide them.
+    pub fn set_protective_powerups_enabled(&mut self, enabled: bool) {
+        self.game.protective_powerups.enabled = enabled;
+        if !enabled {
+            self.game.protective_powerups.reflector_ticks_remaining = 0;
+            self.game.protective_powerups.chojin_ticks_remaining = 0;
+        }
     }
 
     /// Install shootable object state before taking the restart snapshot.
@@ -879,7 +900,9 @@ impl Session {
     fn apply_player_damage(&mut self, amount: u16) -> u16 {
         // Follows the independent reconstruction; original-game rounding and
         // protection mechanics still require direct validation.
-        if self.game.inventory.health == 0 {
+        if self.game.inventory.health == 0
+            || self.game.protective_powerups.chojin_ticks_remaining > 0
+        {
             return 0;
         }
         let absorbed = amount.min(self.game.inventory.armor);
@@ -904,6 +927,7 @@ impl Session {
         // Existing effects age once per live tick. Pickups collected below
         // begin at full duration and affect AI on this same tick.
         self.game.inventory.tick_effects();
+        self.game.protective_powerups.tick();
         if let Some(index) = input.select_weapon.filter(|&index| {
             index < self.game.inventory.weapons.len() && self.game.inventory.weapons[index]
         }) {
@@ -1351,7 +1375,9 @@ impl Session {
                 .damage
                 .saturating_add(self.apply_player_damage(attack.damage));
         }
-        let pre_tick_projectiles = self.explosions_enabled.then(|| self.projectiles.clone());
+        let pre_tick_projectiles = (self.explosions_enabled
+            || self.game.protective_powerups.reflector_ticks_remaining > 0)
+            .then(|| self.projectiles.clone());
         let mut frozen = BTreeSet::new();
         let mut elapsed = 0.0_f32;
         loop {
@@ -1376,14 +1402,40 @@ impl Session {
             }
             elapsed = (elapsed + impact.time).min(DT);
             impact.time = elapsed;
-            if self.projectiles.take(impact.projectile_id).is_none() {
+            let Some(projectile) = self.projectiles.take(impact.projectile_id) else {
                 break;
-            }
+            };
             events.projectile_impacts.push(impact);
             let height = self
                 .projectile_heights
                 .remove(&impact.projectile_id)
                 .unwrap_or(0.75);
+            if impact.target == ImpactTarget::Player
+                && self.game.protective_powerups.reflector_ticks_remaining > 0
+            {
+                if self
+                    .projectiles
+                    .reflect_from_player(projectile, self.world.player.position)
+                {
+                    self.projectile_heights.insert(impact.projectile_id, height);
+                    events.projectile_impacts.pop();
+                    events.projectile_reflections.push(ProjectileReflection {
+                        projectile_id: impact.projectile_id,
+                        rocket_id: impact.rocket_id,
+                        previous_owner: impact.owner,
+                        position: impact.position,
+                        time: impact.time,
+                    });
+                } else if pre_tick_projectiles.as_ref().is_some_and(|snapshot| {
+                    self.projectiles
+                        .restore_impact(snapshot, impact.projectile_id)
+                }) {
+                    self.projectile_heights.insert(impact.projectile_id, height);
+                    events.projectile_impacts.pop();
+                    frozen.insert(impact.projectile_id);
+                }
+                continue;
+            }
             let radius_raw = self
                 .rockets
                 .0
@@ -3066,99 +3118,115 @@ mod tests {
     fn staged_pickup_rolls_back_on_missing_replacement_then_retries() {
         use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
         use crate::process_runtime::{ProcessCapabilities, ProcessObject};
-        let text = "#proc1\n#action\nchange 3 0 164\n#end\n#links\nlink 0 0 1\n#end\n";
-        let script = Script::parse(text);
-        let mut session = mission_session(text);
-        let def = |name: &str, code| ObjectDefinition {
-            collision_radius: 0,
-            shadow: 0,
-            bmp_object: 0,
-            bmp_z: 0,
-            action_code: code,
-            blow_up: 0,
-            break_limit: 0,
-            ambient_sound: 0,
-            break_sound: 0,
-            model_name: name.into(),
-            animation_name: None,
-        };
-        let defs = ObjectDefinitions {
-            items: vec![def("key.3o", 142)],
-            level_objects: vec![def("a.3o", 0), def("b.3o", 0)],
-        };
-        let key = ObjectInstance {
-            kind: ObjectKind::Item,
-            definition_index: 0,
-            grid_cell: [0, 0],
-            position: [0.5, 0.5],
-            angle_radians: 0.0,
-            flags: 0,
-            difficulty_flags: 2,
-            extra: 0,
-            size: 0,
-        };
-        let object = ObjectInstance {
-            kind: ObjectKind::LevelObject,
-            definition_index: 0,
-            grid_cell: [3, 0],
-            position: [3.5, 0.5],
-            ..key.clone()
-        };
-        let instances = [key, object];
-        session.game = GameInventory::new(
-            session.game.weapons.clone(),
-            &instances,
-            &defs,
-            Difficulty::Normal,
-        );
-        let mut cells = [0; 4096];
-        cells[3 * 64] = 163;
-        let pose = ProcessObject {
-            cell: [3, 0],
-            position: [3.5, 0.5],
-            angle_radians: 0.0,
-            elevation_raw: 0.0,
-            blocking_radius: 0.0,
-        };
-        session.processes = ProcessRuntime::with_staged_actions(
-            &script,
-            &session.world,
-            ProcessCapabilities::default(),
-            &cells,
-            &[pose],
-        )
-        .unwrap();
-        session.set_objects(ObjectCombat::new(
-            &instances,
-            &defs,
-            &script,
-            Difficulty::Normal,
-        ));
-        let states = ObjectStates::new(&instances, &defs).unwrap();
-        session.set_scripted_objects(ScriptedObjects::new(
-            states,
-            defs,
-            PresentationManifest::default(),
-            &script,
-            false,
-        ));
-        let rejected = session.step(SessionInput::default());
-        assert!(rejected.pickups.is_empty());
-        assert!(!session.game.inventory.keys[1]);
-        assert_eq!(session.game.pickups.is_visible([0, 0]), Some(true));
-        assert_eq!(session.processes.cell_type([3, 0]), Some(163));
-        session
-            .scripted_objects
-            .as_mut()
-            .unwrap()
-            .manifest
-            .allow([3, 0], 164);
-        let accepted = session.step(SessionInput::default());
-        assert_eq!(accepted.pickups.len(), 1);
-        assert!(session.game.inventory.keys[1]);
-        assert_eq!(session.game.pickups.is_visible([0, 0]), Some(false));
-        assert_eq!(session.processes.cell_type([3, 0]), Some(164));
-        assert_eq!(accepted.object_transitions.len(), 1);
+        for pickup_code in [142, 132, 133] {
+            let text = "#proc1\n#action\nchange 3 0 164\n#end\n#links\nlink 0 0 1\n#end\n";
+            let script = Script::parse(text);
+            let mut session = mission_session(text);
+            let def = |name: &str, code| ObjectDefinition {
+                collision_radius: 0,
+                shadow: 0,
+                bmp_object: 0,
+                bmp_z: 0,
+                action_code: code,
+                blow_up: 0,
+                break_limit: 0,
+                ambient_sound: 0,
+                break_sound: 0,
+                model_name: name.into(),
+                animation_name: None,
+            };
+            let defs = ObjectDefinitions {
+                items: vec![def("pickup.3o", pickup_code)],
+                level_objects: vec![def("a.3o", 0), def("b.3o", 0)],
+            };
+            let key = ObjectInstance {
+                kind: ObjectKind::Item,
+                definition_index: 0,
+                grid_cell: [0, 0],
+                position: [0.5, 0.5],
+                angle_radians: 0.0,
+                flags: 0,
+                difficulty_flags: 2,
+                extra: 0,
+                size: 0,
+            };
+            let object = ObjectInstance {
+                kind: ObjectKind::LevelObject,
+                definition_index: 0,
+                grid_cell: [3, 0],
+                position: [3.5, 0.5],
+                ..key.clone()
+            };
+            let instances = [key, object];
+            session.game = GameInventory::new(
+                session.game.weapons.clone(),
+                &instances,
+                &defs,
+                Difficulty::Normal,
+            );
+            let mut cells = [0; 4096];
+            cells[3 * 64] = 163;
+            let pose = ProcessObject {
+                cell: [3, 0],
+                position: [3.5, 0.5],
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 0.0,
+            };
+            session.processes = ProcessRuntime::with_staged_actions(
+                &script,
+                &session.world,
+                ProcessCapabilities::default(),
+                &cells,
+                &[pose],
+            )
+            .unwrap();
+            session.set_objects(ObjectCombat::new(
+                &instances,
+                &defs,
+                &script,
+                Difficulty::Normal,
+            ));
+            let states = ObjectStates::new(&instances, &defs).unwrap();
+            session.set_scripted_objects(ScriptedObjects::new(
+                states,
+                defs,
+                PresentationManifest::default(),
+                &script,
+                false,
+            ));
+            session.set_protective_powerups_enabled(true);
+            let rejected = session.step(SessionInput::default());
+            assert!(rejected.pickups.is_empty());
+            assert!(!session.game.inventory.keys[1]);
+            assert_eq!(
+                session.game.protective_powerups.reflector_ticks_remaining,
+                0
+            );
+            assert_eq!(session.game.protective_powerups.chojin_ticks_remaining, 0);
+            assert_eq!(session.game.pickups.is_visible([0, 0]), Some(true));
+            assert_eq!(session.processes.cell_type([3, 0]), Some(163));
+            session
+                .scripted_objects
+                .as_mut()
+                .unwrap()
+                .manifest
+                .allow([3, 0], 164);
+            let accepted = session.step(SessionInput::default());
+            assert_eq!(accepted.pickups.len(), 1);
+            assert_eq!(session.game.inventory.keys[1], pickup_code == 142);
+            assert_eq!(
+                session.game.protective_powerups.reflector_ticks_remaining,
+                if pickup_code == 132 { 2400 } else { 0 }
+            );
+            assert_eq!(
+                session.game.protective_powerups.chojin_ticks_remaining,
+                if pickup_code == 133 { 1800 } else { 0 }
+            );
+            assert_eq!(session.game.pickups.is_visible([0, 0]), Some(false));
+            assert_eq!(session.processes.cell_type([3, 0]), Some(164));
+            assert_eq!(accepted.object_transitions.len(), 1);
+        }
     }
     #[test]
     fn grenade_opt_in_explodes_once_and_hurts_owner() {
@@ -4479,5 +4547,312 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn reflector_redirects_and_retraces_enemy_projectile_in_same_tick() {
+        let mut session = mission_session("");
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 0,
+            actor_radius: 0,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        let placement = Monster {
+            position: [195, 128],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [0.76, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "arrow.3o".into(),
+            power: 20,
+            raw_fields: vec![1, 0, 120, 0, 20, 0],
+        }]);
+        session.set_protective_powerups_enabled(true);
+        session.game.protective_powerups.reflector_ticks_remaining = 100;
+        session
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Enemy { source_index: 7 },
+                    rocket_id: 0,
+                    origin: [0.8, 0.5],
+                    direction: [-1.0, 0.0],
+                },
+                &session.rockets,
+            )
+            .unwrap();
+        let events = session.step(SessionInput::default());
+        assert_eq!(session.game.inventory.health, 100);
+        assert_eq!(events.projectile_reflections.len(), 1);
+        assert_eq!(
+            events.projectile_reflections[0].previous_owner,
+            Owner::Enemy { source_index: 7 }
+        );
+        assert!(events
+            .projectile_impacts
+            .iter()
+            .all(|impact| impact.target != ImpactTarget::Player));
+        assert!(events.projectile_impacts.iter().any(|impact| impact.target
+            == ImpactTarget::Actor { source_index: 7 }
+            && impact.owner == Owner::Player));
+        assert_eq!(session.actors.actors[0].health, 80);
+    }
+    #[test]
+    fn chojin_preserves_health_and_armor_across_damage_and_expiry() {
+        let mut session = mission_session("");
+        session.set_protective_powerups_enabled(true);
+        session.game.inventory.armor = 50;
+        session.game.protective_powerups.chojin_ticks_remaining = 2;
+        assert_eq!(session.apply_player_damage(20), 0);
+        assert_eq!(
+            (session.game.inventory.health, session.game.inventory.armor),
+            (100, 50)
+        );
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        let attack = EnemyAttack {
+            source_index: 7,
+            damage: 20,
+            kind: EnemyAttackKind::Ranged {
+                rocket_id: 0,
+                instant: true,
+                origin: [2.5, 0.5],
+                target: [0.5, 0.5],
+            },
+        };
+        session.resolve_enemy_instant(
+            attack,
+            0,
+            [2.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(events.damage, 0);
+        let explosion = Explosion {
+            owner: Owner::Player,
+            center: [0.5, 0.5, 0.5],
+            radius: 2.0,
+            damage: 100,
+        };
+        assert!(session.apply_explosion(
+            explosion,
+            ExplosionOrigin::Mine { mine_id: 0 },
+            None,
+            &mut events,
+            &mut attempts
+        ));
+        assert_eq!(
+            (
+                session.game.inventory.health,
+                session.game.inventory.armor,
+                events.damage
+            ),
+            (100, 50, 0)
+        );
+        session.step(SessionInput::default());
+        assert_eq!(session.game.protective_powerups.chojin_ticks_remaining, 1);
+        session.step(SessionInput::default());
+        assert_eq!(session.game.protective_powerups.chojin_ticks_remaining, 0);
+        assert_eq!(session.apply_player_damage(20), 5);
+        assert_eq!(
+            (session.game.inventory.health, session.game.inventory.armor),
+            (95, 30)
+        );
+    }
+    #[test]
+    fn reflector_suppresses_player_contact_explosion_but_not_instant_hits() {
+        let mut session = mission_session("");
+        session.set_protective_powerups_enabled(true);
+        session.game.protective_powerups.reflector_ticks_remaining = 100;
+        session.set_explosions_enabled(true);
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "grenade.3o".into(),
+            power: 20,
+            raw_fields: vec![2, 0, 424, 0, 20, 0],
+        }]);
+        session
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Enemy { source_index: 7 },
+                    rocket_id: 0,
+                    origin: [0.8, 0.5],
+                    direction: [-1.0, 0.0],
+                },
+                &session.rockets,
+            )
+            .unwrap();
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.projectile_reflections.len(), 1);
+        assert!(events.projectile_impacts.is_empty());
+        assert!(events.explosions.is_empty());
+        assert_eq!(session.game.inventory.health, 100);
+        assert_eq!(session.projectiles.active()[0].owner, Owner::Player);
+        let attack = EnemyAttack {
+            source_index: 7,
+            damage: 20,
+            kind: EnemyAttackKind::Ranged {
+                rocket_id: 1,
+                instant: true,
+                origin: [2.5, 0.5],
+                target: [0.5, 0.5],
+            },
+        };
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        session.resolve_enemy_instant(
+            attack,
+            1,
+            [2.5, 0.5],
+            [0.5, 0.5],
+            &mut events,
+            &mut attempts,
+        );
+        assert_eq!(events.damage, 20);
+        assert_eq!(session.game.inventory.health, 80);
+        let blast = Explosion {
+            owner: Owner::Enemy { source_index: 7 },
+            center: [0.5, 0.5, 0.5],
+            radius: 1.0,
+            damage: 20,
+        };
+        assert!(session.apply_explosion(
+            blast,
+            ExplosionOrigin::Mine { mine_id: 9 },
+            None,
+            &mut events,
+            &mut attempts
+        ));
+        assert_eq!(
+            session.game.inventory.health, 60,
+            "reflector does not prevent nearby blast damage"
+        );
+    }
+    #[test]
+    fn disabled_protection_items_remain_available_and_enabled_collection_is_authoritative() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        let mut session = mission_session("");
+        let definition = |code| ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: code,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "power.3o".into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![definition(132), definition(133)],
+            level_objects: vec![],
+        };
+        let placement = |index| ObjectInstance {
+            kind: ObjectKind::Item,
+            definition_index: index,
+            grid_cell: [index, 0],
+            position: [0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        session.game = GameInventory::new(
+            session.game.weapons.clone(),
+            &[placement(0), placement(1)],
+            &defs,
+            Difficulty::Normal,
+        );
+        assert!(session.step(SessionInput::default()).pickups.is_empty());
+        assert_eq!(session.game.pickups.is_visible([0, 0]), Some(true));
+        assert_eq!(session.game.pickups.is_visible([1, 0]), Some(true));
+        session.set_protective_powerups_enabled(true);
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.pickups.len(), 2);
+        assert!(events
+            .pickups
+            .iter()
+            .any(|event| event.pickup == crate::inventory::Pickup::Reflector));
+        assert!(events
+            .pickups
+            .iter()
+            .any(|event| event.pickup == crate::inventory::Pickup::Chojin));
+        assert_eq!(
+            (
+                session.game.protective_powerups.reflector_ticks_remaining,
+                session.game.protective_powerups.chojin_ticks_remaining
+            ),
+            (2400, 1800)
+        );
+        let snapshot = session.clone();
+        session.step(SessionInput::default());
+        assert_eq!(
+            session.game.protective_powerups.reflector_ticks_remaining,
+            2399
+        );
+        assert_eq!(
+            snapshot.game.protective_powerups.reflector_ticks_remaining,
+            2400
+        );
+        session.set_protective_powerups_enabled(false);
+        assert_eq!(
+            (
+                session.game.protective_powerups.reflector_ticks_remaining,
+                session.game.protective_powerups.chojin_ticks_remaining
+            ),
+            (0, 0)
+        );
+    }
+    #[test]
+    fn reflector_expiry_precedes_physical_contact_on_same_tick() {
+        let mut session = mission_session("");
+        session.set_protective_powerups_enabled(true);
+        session.game.protective_powerups.reflector_ticks_remaining = 1;
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "arrow.3o".into(),
+            power: 20,
+            raw_fields: vec![1, 0, 120, 0, 20, 0],
+        }]);
+        session
+            .projectiles
+            .spawn(
+                Launch {
+                    owner: Owner::Enemy { source_index: 7 },
+                    rocket_id: 0,
+                    origin: [0.8, 0.5],
+                    direction: [-1.0, 0.0],
+                },
+                &session.rockets,
+            )
+            .unwrap();
+        let events = session.step(SessionInput::default());
+        assert!(events.projectile_reflections.is_empty());
+        assert!(events
+            .projectile_impacts
+            .iter()
+            .any(|impact| impact.target == ImpactTarget::Player));
+        assert_eq!(events.damage, 20);
+        assert_eq!(session.game.inventory.health, 80);
     }
 }

@@ -192,7 +192,7 @@ impl Combat {
             actors,
             definitions,
             world,
-            mut objects,
+            objects,
         } = context;
         let Some(spec) = weapons.0.get(weapon) else {
             return FireResult::InvalidWeapon;
@@ -286,10 +286,7 @@ impl Combat {
             let damage = rocket
                 .power
                 .saturating_mul(i32::from(spec.projectile_count));
-            if let Some(event) = objects
-                .as_deref_mut()
-                .and_then(|objects| objects.apply_hit(hit.cell, damage))
-            {
+            if let Some(event) = objects.and_then(|objects| objects.apply_hit(hit.cell, damage)) {
                 return FireResult::Fired(ShotImpact::Object {
                     cell: event.cell,
                     damage,

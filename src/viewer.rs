@@ -991,7 +991,13 @@ pub fn run(
         .resizable()
         .position_centered()
         .build()?;
-    let mut canvas = window.into_canvas().software().build()?;
+    // Let SDL choose its preferred presentation backend, falling back to
+    // software when no accelerated driver is available. Scene rasterization
+    // remains CPU-based; only the final texture scaling/blit is delegated.
+    let mut canvas = window.into_canvas().build()?;
+    if std::env::var("OPENCHASM_PROFILE").as_deref() == Ok("1") {
+        eprintln!("presentation renderer: {}", canvas.info().name);
+    }
     canvas.set_logical_size(WIDTH as u32, HEIGHT as u32)?;
     let texture_creator = canvas.texture_creator();
     let mut texture = texture_creator.create_texture_streaming(

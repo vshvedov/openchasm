@@ -46,3 +46,12 @@ A subsequent native Wayland run at 640×400 measured these presets with the same
 The default HDR pipeline improves colour correctness at a measurable CPU cost. Enhanced bloom is optional; these numbers do not establish 60 FPS or native runtime performance on macOS/Windows. Non-neutral gamma/saturation are more expensive because their luminance/chroma powers are evaluated in the software post-process.
 
 Live Linux checks exercised all three presets, individual colour controls, console queries and `options`, menu closing and mouse recapture, persisted cap changes, and clean console exits. A temporary SDL preference directory isolated these checks from the user's settings. Launching with `OPENCHASM_UNCAPPED=1` keeps the override in memory; unrelated graphics changes preserve the stored cap.
+
+## Accelerated presentation
+
+Letting SDL select its preferred presentation backend, with software fallback,
+reduced final texture presentation to approximately 0.8 ms on this Linux box
+(`opengl` was selected). The world remains software-rasterized. Repeating the
+same uncapped preset checks showed roughly 57 FPS legacy, 44 FPS remaster HDR,
+and 34 FPS enhanced. This targets scaling/blit overhead, not a GPU world
+renderer, and still needs physical runtime validation on macOS/Windows.

@@ -27,6 +27,7 @@ pub mod pickups;
 pub mod projectiles;
 pub mod quake;
 pub mod save_format;
+pub mod sound_definitions;
 pub mod session;
 pub mod teleport;
 pub mod vertical;

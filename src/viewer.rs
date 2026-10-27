@@ -742,6 +742,8 @@ pub struct ClientFeedback {
     pub teleport_load_error: Option<String>,
     /// Verified identity of the loaded gameplay inputs, if fingerprinting succeeded.
     pub content_digest: Option<openchasm::save_format::ContentDigest>,
+    /// Checked-read ledger retained for future verified scene staging.
+    pub verified_resources: Option<crate::content::VerifiedResources>,
 }
 
 pub fn run(
@@ -761,6 +763,7 @@ pub fn run(
         difficulty,
         teleport_load_error,
         content_digest: _content_digest,
+        verified_resources: _verified_resources,
     } = feedback;
     let difficulty_mask = crate::difficulty_mask(difficulty);
     let initial_session = session.clone();

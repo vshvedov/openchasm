@@ -356,7 +356,7 @@ fn finish_level_fingerprint(
     clips: &[Option<openchasm::actor_clips::ActorClipSet>],
     heights: &openchasm::object_heights::ObjectHeightCatalog,
     wall_materials: &openchasm::wall_transitions::WallMaterialCatalog,
-) -> Result<openchasm::save_format::ContentDigest, Box<dyn Error>> {
+) -> Result<content::VerifiedResources, Box<dyn Error>> {
     use openchasm::actor_clips::ClipSource;
     use openchasm::save_format::ContentDigest;
     trace.add_metadata("rules", SAVE_RULES_ID)?;
@@ -434,7 +434,8 @@ fn finish_level_fingerprint(
         .map(|s| s.manifest.fingerprint_entries().collect())
         .unwrap_or_default();
     trace.add_metadata("replacement-manifest", &serde_json::to_vec(&replacements)?)?;
-    let digest = trace.finish()?;
+    let verified = trace.finish_verified()?;
+    let digest = verified.digest();
     snapshot.content = digest;
     let restored = session
         .restore_from_baseline(&snapshot, digest)
@@ -446,7 +447,7 @@ fn finish_level_fingerprint(
     {
         return Err("baseline snapshot does not round-trip".into());
     }
-    Ok(digest)
+    Ok(verified)
 }
 
 fn play(
@@ -655,7 +656,7 @@ fn play(
             &script,
             &String::from_utf8_lossy(&script_data),
         ));
-        let content_digest = if tracing {
+        let verified_resources = if tracing {
             match resources
                 .take_trace()
                 .map_err(Box::<dyn Error>::from)
@@ -670,7 +671,7 @@ fn play(
                         &wall_materials,
                     )
                 }) {
-                Ok(digest) => Some(digest),
+                Ok(verified) => Some(verified),
                 Err(error) => {
                     eprintln!("save content fingerprint unavailable: {error}");
                     None
@@ -679,6 +680,9 @@ fn play(
         } else {
             None
         };
+        let content_digest = verified_resources
+            .as_ref()
+            .map(content::VerifiedResources::digest);
         let mut audio = audio::Audio::new(resources, &info);
         audio.play_level_music(resources, &resource);
         audio.load_ambient(resources, &resource);
@@ -699,6 +703,7 @@ fn play(
                 difficulty,
                 teleport_load_error,
                 content_digest,
+                verified_resources,
             },
             &format!("{id}: {name} ({difficulty:?})"),
         )?;
@@ -1006,7 +1011,8 @@ mod wall_graphics_tests {
             &clips,
             &heights,
             &materials,
-        )?;
+        )?
+        .digest();
         if carried {
             let checkpoint = session.snapshot(digest).unwrap();
             let mut fresh = session.clone();

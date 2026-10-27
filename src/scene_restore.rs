@@ -16,6 +16,10 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SceneRestoreError {
+    ContentIdentity,
+    Verification(crate::content::TraceError),
+    ReplacementManifest,
+    MineCapability,
     MissingObject([usize; 2]),
     MissingObjectState([usize; 2]),
     MissingObjectAsset([usize; 2], u8),
@@ -23,6 +27,73 @@ pub enum SceneRestoreError {
     MissingActor(usize),
     InvalidActorPose(usize),
     MissingActorAnimation(usize),
+}
+
+/// Fresh baseline inputs must themselves come from the matching verified
+/// startup; this scope verifies every subsequent resource read before use.
+pub struct SceneBaseline<'a> {
+    pub map: &'a openchasm::map::Map,
+    pub definitions: &'a openchasm::objects::ObjectDefinitions,
+    pub palette: &'a crate::texture::Palette,
+    pub process_bytes: &'a [u8],
+    pub script: &'a openchasm::process::Script,
+    pub instances: &'a [ObjectInstance],
+    pub difficulty: Difficulty,
+    pub mines_enabled: bool,
+}
+
+/// Construct a separate candidate scene with checked reads. No live scene is
+/// mutated, including caches; errors discard the entire candidate.
+#[allow(dead_code)] // The durable save UI is not enabled yet.
+pub fn stage_verified_scene(
+    resources: &mut ResourceSet,
+    ledger: &crate::content::VerifiedResources,
+    expected: openchasm::save_format::ContentDigest,
+    session: &Session,
+    baseline: SceneBaseline<'_>,
+) -> Result<ObjectScene, SceneRestoreError> {
+    if ledger.digest() != expected {
+        return Err(SceneRestoreError::ContentIdentity);
+    }
+    resources
+        .with_verified_reads(ledger, |resources| {
+            let mut scene = ObjectScene::load(
+                resources,
+                baseline.map,
+                baseline.definitions,
+                baseline.palette,
+            );
+            scene.configure_stopped_animations(baseline.process_bytes);
+            scene.add_actors(resources, &session.actors, &session.actor_definitions);
+            if scene.preload_mine(resources, baseline.definitions) != baseline.mines_enabled {
+                return Err(SceneRestoreError::MineCapability);
+            }
+            if let Some(scripted) = &session.scripted_objects {
+                let manifest = crate::replacement_manifest::build_replacement_manifest(
+                    resources,
+                    &mut scene,
+                    baseline.definitions,
+                    baseline.instances,
+                    baseline.script,
+                    baseline.difficulty,
+                );
+                if !manifest
+                    .fingerprint_entries()
+                    .eq(scripted.manifest.fingerprint_entries())
+                {
+                    return Err(SceneRestoreError::ReplacementManifest);
+                }
+            }
+            rebuild_scene(
+                &mut scene,
+                resources,
+                session,
+                baseline.instances,
+                baseline.difficulty,
+            )?;
+            Ok(scene)
+        })
+        .map_err(SceneRestoreError::Verification)?
 }
 
 /// Restore into a scene built from the same verified map and definitions. All
@@ -333,6 +404,113 @@ mod tests {
         )
         .is_ok());
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn verified_staging_rejects_changed_and_unrecorded_asset_bytes() {
+        use openchasm::{objects::ObjectDefinition, save_format::ContentDigest};
+        let path =
+            std::env::temp_dir().join(format!("openchasm-verified-scene-{}", std::process::id()));
+        std::fs::create_dir_all(path.join("model")).unwrap();
+        let mut model = vec![0u8; 0x4806 + 64];
+        for (i, value) in [0u16, 1, 2, 255].iter().enumerate() {
+            model[i * 2..i * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        model[0x4800..0x4802].copy_from_slice(&3u16.to_le_bytes());
+        model[0x4802..0x4804].copy_from_slice(&1u16.to_le_bytes());
+        model[0x4804..0x4806].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(path.join("model/a.3o"), &model).unwrap();
+        let mut bytes = vec![0; 0x27001 + 4];
+        bytes[0x18001 + (64 + 1) * 11] = 163;
+        let map = openchasm::map::Map::parse(&bytes).unwrap();
+        let instances = openchasm::objects::instances(&map);
+        assert_eq!(instances.len(), 1);
+        let definition = ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "a.3o".into(),
+            animation_name: None,
+        };
+        let definitions = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition],
+        };
+        let palette = crate::texture::Palette::parse(&[0; 768]).unwrap();
+        let script = Script::parse("");
+        let (session, _) = fixture(false);
+        let mut startup = ResourceSet::open(&path).unwrap();
+        startup.begin_trace().unwrap();
+        let initial = ObjectScene::load(&mut startup, &map, &definitions, &palette);
+        assert!(initial.has_cell([1, 1]));
+        let ledger = startup.take_trace().unwrap().finish_verified().unwrap();
+        let baseline = || SceneBaseline {
+            map: &map,
+            definitions: &definitions,
+            palette: &palette,
+            process_bytes: b"",
+            script: &script,
+            instances: &instances,
+            difficulty: Difficulty::Normal,
+            mines_enabled: false,
+        };
+        let mut current = ResourceSet::open(&path).unwrap();
+        let candidate =
+            stage_verified_scene(&mut current, &ledger, ledger.digest(), &session, baseline())
+                .unwrap();
+        assert!(candidate.has_cell([1, 1]));
+        assert!(matches!(
+            stage_verified_scene(
+                &mut current,
+                &ledger,
+                ContentDigest([0; 32]),
+                &session,
+                baseline()
+            ),
+            Err(SceneRestoreError::ContentIdentity)
+        ));
+        *model.last_mut().unwrap() = 42;
+        std::fs::write(path.join("model/a.3o"), &model).unwrap();
+        let mut changed = ResourceSet::open(&path).unwrap();
+        assert!(matches!(
+            stage_verified_scene(&mut changed, &ledger, ledger.digest(), &session, baseline()),
+            Err(SceneRestoreError::Verification(
+                crate::content::TraceError::ResourceChanged
+            ))
+        ));
+        std::fs::write(path.join("model/b.3o"), &model).unwrap();
+        let mut other_definitions = definitions.clone();
+        other_definitions.level_objects[0].model_name = "b.3o".into();
+        let mut unrecorded = ResourceSet::open(&path).unwrap();
+        let mut other = baseline();
+        other.definitions = &other_definitions;
+        assert!(matches!(
+            stage_verified_scene(&mut unrecorded, &ledger, ledger.digest(), &session, other),
+            Err(SceneRestoreError::Verification(
+                crate::content::TraceError::UnrecordedResource
+            ))
+        ));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_snapshot_without_object_sight_defaults_to_disabled() {
+        let (session, _) = fixture(false);
+        let capability = session
+            .snapshot(openchasm::save_format::ContentDigest([0; 32]))
+            .unwrap()
+            .capabilities;
+        let mut value = serde_json::to_value(capability).unwrap();
+        value.as_object_mut().unwrap().remove("object_sight");
+        let decoded: openchasm::session::SessionSnapshotCapabilities =
+            serde_json::from_value(value).unwrap();
+        assert!(!decoded.object_sight);
     }
 
     #[test]

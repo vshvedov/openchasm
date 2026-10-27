@@ -8,4 +8,4 @@ Ordinary items use a horizontal pickup distance of 100/256 map tiles; level-obje
 
 Tests cover pickup boundaries, full inventory, unsupported items, difficulty, scripts, moving objects and invalid coordinates. A local check traversed placement positions in all 20 installed maps and produced 351 supported collection events; it is a smoke check, not proof of gameplay fidelity.
 
-The preview consumes pickup events to hide collected objects, play pickup sounds, display inventory values, and provide keys to the process runtime. Script pickup links are still unsupported.
+The preview consumes pickup events to hide collected objects, play pickup sounds, display inventory values, and provide keys to the process runtime. Linked processes at a collected pickup cell are activated in script order; other pickup-related script behaviors remain incomplete.

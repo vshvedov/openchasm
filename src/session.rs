@@ -111,7 +111,13 @@ impl Session {
         self.world.step(input.movement, DT);
         events.pickups = self.game.collect_near(self.world.player.position);
         self.processes.set_keys(self.game.inventory.keys);
-        let attempts = self.processes.tick(&mut self.world, DT, input.interact);
+        let mut attempts = Vec::new();
+        for pickup in &events.pickups {
+            if let (Ok(x), Ok(y)) = (u8::try_from(pickup.cell[0]), u8::try_from(pickup.cell[1])) {
+                attempts.extend(self.processes.activate_links_at([x, y]));
+            }
+        }
+        attempts.extend(self.processes.tick(&mut self.world, DT, input.interact));
         if let Some(mission) = &mut self.mission {
             for attempt in attempts {
                 match attempt.outcome {
@@ -361,6 +367,49 @@ mod tests {
                 .contains(&MissionEvent::LevelComplete));
         }
         assert_eq!(session.mission.as_ref().unwrap().end_remaining(), None);
+    }
+    #[test]
+    fn collecting_a_linked_key_activates_its_process() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        let text = "#mess1\nDelay 1\nTextA: 0 0 \"Key acquired\"\n#end\n#proc1\nOnMessage 1\nEndDelay 1\n#end\n#links\nlink 0 0 1\n#end\n";
+        let mut session = mission_session(text);
+        let definition = ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 142,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "key.3o".into(),
+            animation_name: None,
+        };
+        let placement = ObjectInstance {
+            kind: ObjectKind::Item,
+            definition_index: 0,
+            grid_cell: [0, 0],
+            position: [0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        session.game = GameInventory::new(
+            session.game.weapons.clone(),
+            &[placement],
+            &ObjectDefinitions {
+                items: vec![definition],
+                level_objects: vec![],
+            },
+            Difficulty::Normal,
+        );
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.pickups.len(), 1);
+        assert!(session.game.inventory.keys[1]);
+        assert_eq!(events.mission, vec![MissionEvent::ShowMessage(1)]);
     }
     #[test]
     fn session_fires_damages_enemies_and_consumes_ammunition() {

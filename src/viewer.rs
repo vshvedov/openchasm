@@ -845,11 +845,13 @@ pub fn run(
     let mut console = crate::developer_console::Console::default();
     let mut show_fps = true;
     let mut mouse_sensitivity = MOUSE_SENSITIVITY;
-    let mut frame_limit = if std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1") {
+    let frame_limit = if std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1") {
         None
     } else {
         Some(FRAME_DURATION)
     };
+    let mut frame_pacer = crate::frame_stats::FramePacer::new(frame_limit, Instant::now());
+    let mut pending_simulation_time = Duration::ZERO;
     let mut frame_stats = crate::frame_stats::FrameStats::new(Instant::now());
     let profile = std::env::var("OPENCHASM_PROFILE").as_deref() == Ok("1");
     let mut profile_samples = 0_u32;
@@ -867,7 +869,6 @@ pub fn run(
     ];
     let mut running = true;
     while running {
-        let frame_start = Instant::now();
         let mut restart_requested = false;
         let mut advance_requested = false;
         let mut checkpoint_commands = Vec::new();
@@ -891,6 +892,8 @@ pub fn run(
                 pending_jump = false;
                 pending_weapon = None;
                 advance_requested = false;
+                restart_requested = false;
+                checkpoint_commands.clear();
                 frame_clock.rebase(Instant::now());
                 suppress_gameplay = true;
                 continue;
@@ -912,6 +915,8 @@ pub fn run(
                 pending_jump = false;
                 pending_weapon = None;
                 advance_requested = false;
+                restart_requested = false;
+                checkpoint_commands.clear();
                 frame_clock.rebase(Instant::now());
                 suppress_gameplay = true;
                 continue;
@@ -946,6 +951,19 @@ pub fn run(
                         ..
                     }
                 );
+            if console.is_open()
+                && matches!(
+                    event,
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Grave),
+                        repeat: true,
+                        ..
+                    }
+                )
+            {
+                suppress_toggle_text = true;
+                continue;
+            }
             if look.focused && (console_toggle || console_escape) {
                 if console.is_open() {
                     console.close();
@@ -964,6 +982,9 @@ pub fn run(
                 pending_interact = false;
                 pending_jump = false;
                 pending_weapon = None;
+                advance_requested = false;
+                restart_requested = false;
+                checkpoint_commands.clear();
                 frame_clock.rebase(Instant::now());
                 suppress_gameplay = true;
                 continue;
@@ -990,10 +1011,13 @@ pub fn run(
                         }
                         Command::MaxFps(value) => {
                             if let Some(value) = value {
-                                frame_limit = (value != 0)
-                                    .then(|| Duration::from_secs_f64(1.0 / f64::from(value)));
+                                frame_pacer.set_limit(
+                                    (value != 0)
+                                        .then(|| Duration::from_secs_f64(1.0 / f64::from(value))),
+                                    Instant::now(),
+                                );
                             }
-                            console.push(&match frame_limit {
+                            console.push(&match frame_pacer.limit() {
                                 Some(limit) => format!("maxfps {:.0}", 1.0 / limit.as_secs_f64()),
                                 None => "maxfps 0 (uncapped)".to_owned(),
                             });
@@ -1498,7 +1522,15 @@ pub fn run(
             accumulator -= STEP;
         }
         // Initialize or resynchronize even when no simulation tick ran.
-        let simulation_time = simulation_started.elapsed();
+        pending_simulation_time += simulation_started.elapsed();
+        if !frame_pacer.should_render(Instant::now()) {
+            let delay = frame_pacer.wait_hint(Instant::now());
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            continue;
+        }
+        let simulation_time = std::mem::take(&mut pending_simulation_time);
         let render_started = Instant::now();
         audio.update_ambient(session.ambient_grid(), session.world.player.position, 0.0);
         let quake_power = session
@@ -1689,8 +1721,9 @@ pub fn run(
                 eprintln!("frame profile: {:.1} fps, {:.2} ms/frame; sim {:.2}, render {:.2}, present {:.2}, max {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms);
             }
         }
-        if let Some(delay) = frame_limit.and_then(|limit| limit.checked_sub(frame_start.elapsed()))
-        {
+        frame_pacer.presented(render_started);
+        let delay = frame_pacer.wait_hint(Instant::now());
+        if !delay.is_zero() {
             std::thread::sleep(delay);
         }
     }

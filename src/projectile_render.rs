@@ -316,7 +316,7 @@ fn project(vertex: Vertex, width: usize, height: usize, horizon: f32) -> Project
     let inverse = vertex.depth.recip();
     Projected {
         x: CameraView::project_x(width, height, vertex.side * inverse),
-        y: horizon - height as f32 * 0.5 * vertex.up * inverse,
+        y: horizon - CameraView::focal_length(height) * vertex.up * inverse,
         inverse,
         u_inverse: vertex.uv[0] * inverse,
         v_inverse: vertex.uv[1] * inverse,

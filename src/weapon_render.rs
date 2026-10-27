@@ -4,7 +4,6 @@
 //! weapon ownership belong to the shared simulation. See docs/weapon-rendering.md.
 use crate::content::ResourceSet;
 use crate::model::{Animation, Model, SKIN_WIDTH};
-use crate::object_render::CameraView;
 use crate::texture::Palette;
 use std::io::{self, ErrorKind};
 
@@ -329,11 +328,16 @@ struct Projected {
     u_over_depth: f32,
     v_over_depth: f32,
 }
+// The remaster uses a distinct fixed 1.568-radian weapon FOV.
+fn weapon_focal(height: usize) -> f32 {
+    height as f32 * 0.5 * 1.002_800_2
+}
+
 fn project(v: Vertex, width: usize, height: usize) -> Projected {
     let inv_depth = v.depth.recip();
     Projected {
-        x: CameraView::project_x(width, height, v.side * inv_depth),
-        y: height as f32 * 0.5 * (1.0 - v.up * inv_depth),
+        x: width as f32 * 0.5 + weapon_focal(height) * v.side * inv_depth,
+        y: height as f32 * 0.5 - weapon_focal(height) * v.up * inv_depth,
         inv_depth,
         u_over_depth: v.uv[0] * inv_depth,
         v_over_depth: v.uv[1] * inv_depth,
@@ -481,6 +485,14 @@ mod tests {
         let mut invalid = vec![0; 64 * 64];
         renderer.render_with_light(&mut invalid, 64, 64, 0, WeaponPose::Idle, 0, f32::NAN);
         assert_eq!(first, invalid);
+    }
+
+    #[test]
+    fn weapon_uses_its_own_verified_fixed_field_of_view() {
+        assert!((weapon_focal(400) - 200.560_04).abs() < 1e-4);
+        assert!(
+            (weapon_focal(400) - crate::object_render::CameraView::focal_length(400)).abs() > 50.0
+        );
     }
 
     #[test]

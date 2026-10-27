@@ -289,10 +289,11 @@ impl ExplosionRenderer {
                 [(effect.age_ticks / TICKS_PER_FRAME) as usize % self.sprite.frames.len()];
             let size_factor = if self.half_size { 0.5 } else { 1.0 };
             let scale_x = CameraView::focal_length(height) * size_factor / (distance * 64.0);
-            let scale_y = height as f32 * 0.5 * size_factor / (distance * 64.0);
+            let scale_y = CameraView::focal_length(height) * size_factor / (distance * 64.0);
             let center_x = CameraView::project_x(width, height, side / distance);
             let center_y = camera.horizon(height)
-                - height as f32 * 0.5 * (effect.position[2] - camera.eye_height) / distance;
+                - CameraView::focal_length(height) * (effect.position[2] - camera.eye_height)
+                    / distance;
             let left = center_x - image.center as f32 * scale_x;
             let top = center_y - self.sprite.height as f32 * 0.5 * scale_y;
             let right = left + image.width as f32 * scale_x;

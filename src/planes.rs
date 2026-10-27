@@ -114,7 +114,7 @@ impl PlaneRenderer {
             return;
         }
         let (sin, cos) = angle.sin_cos();
-        let projection = height as f32 / 2.0;
+        let projection = CameraView::focal_length(height);
         let horizon = camera.horizon(height);
         let half_width = CameraView::half_width(width, height);
         let camera_plane = [-sin * half_width, cos * half_width];
@@ -264,10 +264,10 @@ mod tests {
         let mut depth = vec![f32::INFINITY; 64];
         renderer.render_with_depth(&mut image, &mut depth, 8, 8, camera, None);
         assert!(depth[4].is_infinite());
-        // Horizon is 5: at row 7.5, distance = 4 / 2.5 = 1.6 tiles.
-        assert!((depth[7 * 8 + 4] - 1.6).abs() < 1e-6);
+        let expected = CameraView::focal_length(8) / (7.5 - camera.horizon(8));
+        assert!((depth[7 * 8 + 4] - expected).abs() < 1e-6);
         // Opaque models and projectiles use this same depth comparison.
-        assert!(2.0 >= depth[7 * 8 + 4]);
+        assert!(3.0 >= depth[7 * 8 + 4]);
         assert!(1.0 < depth[7 * 8 + 4]);
     }
 
@@ -345,7 +345,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.0,
-                pitch: 0.5_f32.atan(),
+                pitch: (1.0 / CameraView::focal_length(8)).atan(),
             },
         );
         // The center row changes from floor (red) to ceiling (green).

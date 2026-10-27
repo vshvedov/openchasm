@@ -74,12 +74,12 @@ pub struct CameraView {
     pub pitch: f32,
 }
 impl CameraView {
-    /// Provisional 90-degree vertical field of view and square output pixels.
+    /// 75-degree vertical FOV, established from the remaster camera projection.
     pub fn focal_length(height: usize) -> f32 {
-        height as f32 * 0.5
+        height as f32 * 0.5 * 1.303_225_4
     }
     pub fn half_width(width: usize, height: usize) -> f32 {
-        width as f32 / height as f32
+        width as f32 * 0.5 / Self::focal_length(height)
     }
     pub fn project_x(width: usize, height: usize, side_over_depth: f32) -> f32 {
         width as f32 * 0.5 + Self::focal_length(height) * side_over_depth
@@ -91,7 +91,7 @@ impl CameraView {
         } else {
             0.0
         };
-        height as f32 * 0.5 * (1.0 + pitch.tan())
+        height as f32 * 0.5 + Self::focal_length(height) * pitch.tan()
     }
 }
 
@@ -319,7 +319,7 @@ fn project(v: Vertex, width: usize, height: usize, horizon: f32) -> ScreenVertex
     let inv_depth = v.depth.recip();
     ScreenVertex {
         x: CameraView::project_x(width, height, v.side * inv_depth),
-        y: horizon - height as f32 * 0.5 * v.up * inv_depth,
+        y: horizon - CameraView::focal_length(height) * v.up * inv_depth,
         inv_depth,
         u_over_depth: v.uv[0] * inv_depth,
         v_over_depth: v.uv[1] * inv_depth,
@@ -1582,6 +1582,22 @@ impl ObjectScene {
 pub(crate) mod tests {
     use super::*;
     #[test]
+    fn world_fov_matches_original_camera_and_pitch_ray() {
+        let focal = CameraView::focal_length(400);
+        assert!((focal - 260.645_08).abs() < 0.001);
+        assert!((CameraView::half_width(640, 400) - 1.227_723).abs() < 1e-5);
+        let camera = CameraView {
+            player: Player {
+                position: [0.0; 2],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.3,
+        };
+        assert!((camera.horizon(400) - (200.0 + focal * 0.3_f32.tan())).abs() < 1e-4);
+    }
+
+    #[test]
     fn projection_preserves_square_geometry_at_multiple_aspects() {
         for (width, height) in [(400, 400), (640, 400), (800, 400), (400, 800)] {
             let projected = |side, up| {
@@ -1600,7 +1616,7 @@ pub(crate) mod tests {
             let center = projected(0.0, 0.0);
             let right = projected(1.0, 0.0);
             let top = projected(0.0, 1.0);
-            assert!(((right.x - center.x) - (center.y - top.y)).abs() < 1e-5);
+            assert!(((right.x - center.x) - (center.y - top.y)).abs() < 1e-4);
             let left_ray = CameraView::half_width(width, height);
             assert!(CameraView::project_x(width, height, -left_ray).abs() < 1e-4);
         }

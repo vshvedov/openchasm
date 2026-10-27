@@ -536,7 +536,7 @@ fn render(
             if texture == 120 {
                 continue;
             }
-            let half = (HEIGHT as f32 * 0.5 / distance).min((HEIGHT * 4) as f32);
+            let half = (CameraView::focal_length(HEIGHT) / distance).min((HEIGHT * 4) as f32);
             let offset = scene.elevations.get(index).copied().unwrap_or(0.0) / 64.0;
             let origin = camera.horizon(HEIGHT) - (2.0 + offset - camera.eye_height) * half;
             let top = origin.max(0.0).min(HEIGHT as f32) as usize;
@@ -2021,7 +2021,9 @@ mod tests {
             None,
         );
         let up_top = top(&depth);
-        assert_eq!(up_top - level_top, 40);
+        assert!(
+            ((up_top - level_top) as f32 - CameraView::focal_length(HEIGHT) * 0.2).abs() <= 1.0
+        );
         assert_eq!(depth[(up_top + 25) * WIDTH + WIDTH / 2], original_distance);
     }
 

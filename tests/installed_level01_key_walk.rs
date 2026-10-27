@@ -261,6 +261,58 @@ fn spawn_can_reach_first_green_key() {
         session.game.inventory.keys[1],
         "green key should be collected by overlap"
     );
+    // Return to the original gate trigger after its BackWait has elapsed.
+    let mut route = vec![[36.125, 54.375], [36.125, 54.125], [36.375, 54.125]];
+    for y in 1..=10 {
+        route.push([36.375, 54.125 - 0.25 * y as f32]);
+    }
+    for x in 1..=32 {
+        route.push([36.375 - 0.25 * x as f32, 51.625]);
+    }
+    for y in 1..=3 {
+        route.push([28.375, 51.625 + 0.25 * y as f32]);
+    }
+    for x in 1..=10 {
+        route.push([28.375 - 0.25 * x as f32, 52.375]);
+    }
+    for y in 1..=5 {
+        route.push([25.875, 52.375 + 0.25 * y as f32]);
+    }
+    walk(&mut session, &route);
+    for _ in 0..60 {
+        session.step(SessionInput::default());
+    }
+    // Cross the reopened gate, then enter the green-key door's floor trigger.
+    let mut route = vec![[25.875, 53.375], [25.875, 53.125]];
+    for x in 1..=17 {
+        route.push([25.875 - 0.25 * x as f32, 53.125]);
+    }
+    for y in 1..=12 {
+        route.push([21.625, 53.125 + 0.25 * y as f32]);
+    }
+    walk(&mut session, &route);
+    for _ in 0..60 {
+        session.step(SessionInput::default());
+    }
+    let door_index = session
+        .world
+        .walls
+        .iter()
+        .position(|w| w.cell == Some([21, 55]))
+        .unwrap();
+    assert!(
+        session.world.walls[door_index].a[0] < 21.2,
+        "green-key door should slide open"
+    );
+    walk(
+        &mut session,
+        &[
+            [21.625, 56.375],
+            [21.625, 56.625],
+            [21.625, 56.875],
+            [21.625, 57.125],
+        ],
+    );
 }
 
 fn walk(session: &mut Session, checkpoints: &[[f32; 2]]) {

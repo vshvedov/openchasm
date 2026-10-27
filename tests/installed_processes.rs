@@ -209,3 +209,72 @@ fn real_empty_cell_exit_actions_complete_levels_05_and_17() {
         assert_eq!(mission.advance(2.0), vec![MissionEvent::LevelComplete]);
     }
 }
+
+#[test]
+fn level_11_switch_moves_its_authored_object() {
+    use openchasm::objects;
+    use openchasm::process_runtime::ProcessObject;
+    let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+    let path = explicit
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("assets/csm.bin"));
+    if !path.exists() && explicit.is_none() {
+        return;
+    }
+    let mut archive = archive::Archive::open(&path).expect("open game archive");
+    let map = Map::parse(&archive.read("map/map.11").unwrap()).unwrap();
+    let text = String::from_utf8(archive.read("map/process.11").unwrap()).unwrap();
+    let script = Script::parse(&text);
+    let cells = std::array::from_fn(|index| {
+        map.wall(index / MAP_SIDE, index % MAP_SIDE)
+            .unwrap()
+            .texture_id
+    });
+    let instance = objects::instances(&map)
+        .into_iter()
+        .find(|instance| instance.grid_cell == [27, 10])
+        .expect("authored moving object");
+    let initial = instance.position;
+    let mut world = World {
+        walls: vec![],
+        player: Player {
+            position: [-100.0, -100.0],
+            angle: 0.0,
+        },
+    };
+    let mut runtime = ProcessRuntime::with_objects_and_hazards(
+        &script,
+        &world,
+        ProcessCapabilities::default(),
+        &cells,
+        &[ProcessObject {
+            cell: [27, 10],
+            position: initial,
+            angle_radians: instance.angle_radians,
+            elevation_raw: 0.0,
+            blocking_radius: 0.0,
+        }],
+    )
+    .unwrap();
+    accepted(&runtime.activate_at("link", [44, 15]), 7);
+    let mut final_position = initial;
+    let mut updates = 0;
+    for _ in 0..180 {
+        runtime.tick(&mut world, 1.0 / 60.0, false);
+        for effect in runtime.take_effects() {
+            if let ProcessEffect::ObjectPose {
+                cell: [27, 10],
+                position,
+                ..
+            } = effect
+            {
+                final_position = position;
+                updates += 1;
+            }
+        }
+    }
+    assert!(updates > 1, "expected incremental pose updates");
+    assert!((final_position[0] - initial[0]).abs() < 0.001);
+    assert!((final_position[1] - initial[1] - 2.0).abs() < 0.001);
+}

@@ -3924,4 +3924,55 @@ mod tests {
         assert!(session.actors.actors[0].position[0] <= 1.5 - 52.0 / 256.0 - 0.2 + 1e-4);
         assert!(overhead.actors.actors[0].position[0] > 1.6);
     }
+    #[test]
+    fn enemy_sight_uses_raised_wall_height_without_changing_movement_collision() {
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.player.position = [3.0, 0.5];
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 52,
+            actor_radius: 52,
+            speed: 10,
+            rotation_speed: 5,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        let placement = Monster {
+            position: [128, 128],
+            id: 101,
+            angle: 0,
+            flags: 2,
+        };
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement,
+            position: [0.5, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        session.world.walls.push(Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 87,
+            blocks_movement: true,
+            cell: Some([1, 0]),
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(0.0);
+        let mut raised = session.clone();
+        raised.wall_elevations[0] = 64.0;
+        raised.elevation_by_cell[64] = 64.0;
+        session.step(SessionInput::default());
+        raised.step(SessionInput::default());
+        assert_eq!(session.ai.mode(7), Some(Mode::Idle));
+        assert_eq!(raised.ai.mode(7), Some(Mode::Chasing));
+        assert!(raised.world.walls[0].blocks_movement);
+    }
 }

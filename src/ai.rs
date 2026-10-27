@@ -86,26 +86,6 @@ fn cross(a: [f32; 2], b: [f32; 2]) -> f32 {
     a[0] * b[1] - a[1] * b[0]
 }
 
-/// Return false if an opaque level wall intersects the open sight segment.
-/// Transparent walls and invisible barriers do not block visual contact.
-fn line_of_sight(from: [f32; 2], to: [f32; 2], walls: &[Wall]) -> bool {
-    let ray = sub(to, from);
-    !walls.iter().any(|wall| {
-        if !(1..=86).contains(&wall.texture) || !wall.blocks_movement {
-            return false;
-        }
-        let edge = sub(wall.b, wall.a);
-        let divisor = cross(ray, edge);
-        if divisor.abs() < 1e-8 {
-            return false;
-        }
-        let offset = sub(wall.a, from);
-        let t = cross(offset, edge) / divisor;
-        let u = cross(offset, ray) / divisor;
-        (1e-5..(1.0 - 1e-5)).contains(&t) && (0.0..=1.0).contains(&u)
-    })
-}
-
 /// Sight remains independent of the material-specific projectile predicate.
 fn shot_clear(
     from: [f32; 2],
@@ -403,8 +383,10 @@ impl EnemyAi {
             brain.cooldown = brain.cooldown.saturating_sub(1);
             let to_player = sub(target, actor.position);
             let distance = dot(to_player, to_player).sqrt();
-            let sees_player =
-                distance <= SIGHT_RANGE && line_of_sight(actor.position, target, &world.walls);
+            // Visibility follows the material's shot-pass flag, independently
+            // of walk collision and of whether the wall is drawn transparent.
+            let sees_player = distance <= SIGHT_RANGE
+                && shot_clear(actor.position, target, &world.walls, blocks_shots);
             if sees_player {
                 brain.last_seen = Some(target);
             }
@@ -661,8 +643,18 @@ mod tests {
             ai.tick(&mut state, &defs, &w);
         }
         assert!(state.actors[0].position[0] < 0.8);
-        assert!(line_of_sight([0.0, 0.0], [2.0, 0.0], &[wall(87, true)]));
-        assert!(line_of_sight([0.0, 0.0], [2.0, 0.0], &[wall(120, true)]));
+        assert!(shot_clear(
+            [0.0, 0.0],
+            [2.0, 0.0],
+            &[wall(87, true)],
+            &|_| false
+        ));
+        assert!(shot_clear(
+            [0.0, 0.0],
+            [2.0, 0.0],
+            &[wall(120, true)],
+            &|_| false
+        ));
     }
     #[test]
     fn melee_attacks_have_a_fixed_tick_cooldown_and_stop_on_death() {
@@ -1007,5 +999,37 @@ mod tests {
             ai.tick_with_actor_collision(&mut state, &defs, &rockets(), &w, &|_| true, &[object]);
         }
         assert!(state.actors[0].position[0] < 0.8);
+    }
+    #[test]
+    fn visibility_uses_shot_material_independent_of_walk_collision() {
+        let (state, mut defs) = actor(100, 7);
+        defs.entries[1].kick = 0;
+        let rockets = rockets();
+        let cases = [
+            (false, true, false),
+            (false, false, true),
+            (true, false, true),
+            (true, true, false),
+        ];
+        for (walk_blocking, shot_blocking, visible) in cases {
+            let mut actors = state.clone();
+            let mut ai = EnemyAi::new(&actors, Difficulty::Normal);
+            let w = world([2.0, 0.0], vec![wall(87, walk_blocking)]);
+            ai.tick_with_actor_collision(&mut actors, &defs, &rockets, &w, &|_| shot_blocking, &[]);
+            assert_eq!(
+                ai.mode(0) == Some(Mode::Chasing),
+                visible,
+                "walk={walk_blocking} shot={shot_blocking}"
+            );
+            if visible && walk_blocking {
+                for _ in 0..120 {
+                    ai.tick_with_actor_collision(&mut actors, &defs, &rockets, &w, &|_| false, &[]);
+                }
+                assert!(
+                    actors.actors[0].position[0] < 0.8,
+                    "visible barrier must still block walking"
+                );
+            }
+        }
     }
 }

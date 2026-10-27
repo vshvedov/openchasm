@@ -397,6 +397,7 @@ struct RuntimeProcess {
     supported: bool,
     required_keys: [bool; 3],
     mission_effect: bool,
+    ignored_call: bool,
 }
 
 fn property_float(process: &Process, name: &str, default: f32) -> f32 {
@@ -436,6 +437,7 @@ impl RuntimeProcess {
         let mut waitout = Vec::new();
         let mut lock_changes = Vec::new();
         let mut supported = true;
+        let mut ignored_call = false;
         let has_end_delay = process.properties.iter().any(|cmd| {
             cmd.name == "enddelay"
                 && cmd.arguments.len() == 1
@@ -451,6 +453,16 @@ impl RuntimeProcess {
                     .is_ok_and(|value| value != 0)
         });
         for action in &process.actions {
+            // The remaster recognizes `call` but has no runtime effect for it.
+            // Preserve the authored argument in Script and reject malformed forms.
+            if action.name == "call" {
+                if action.arguments.len() != 1 || action.arguments[0].parse::<i16>().is_err() {
+                    supported = false;
+                    break;
+                }
+                ignored_call = true;
+                continue;
+            }
             if action.name == "nonstop" {
                 if (hazards_enabled || wind_enabled) && action.arguments.is_empty() && !nonstop {
                     nonstop = true;
@@ -989,6 +1001,7 @@ impl RuntimeProcess {
             supported,
             required_keys,
             mission_effect: has_end_delay || has_message,
+            ignored_call,
         }
     }
     fn trigger(&mut self, keys: [bool; 3]) -> Result<Activation, ProcessOutcome> {
@@ -1012,7 +1025,8 @@ impl RuntimeProcess {
                 && self.wind_zones.is_empty()
                 && self.sources.is_empty()
                 && self.immediate_actions.is_empty()
-                && !self.mission_effect)
+                && !self.mission_effect
+                && !self.ignored_call)
         {
             return Err(ProcessOutcome::Unsupported);
         }
@@ -2999,6 +3013,35 @@ mod tests {
         target.tick(&mut restored_world, 0.1, false);
         assert_eq!(world.walls[0].a, restored_world.walls[0].a);
         assert_eq!(source.wall_elevation(1), target.wall_elevation(1));
+    }
+
+    #[test]
+    fn call_is_a_validated_remaster_noop() {
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\ncall 2\n#end\n#proc2\n#action\nmove 1 0 0 256\n#end\n#links\nlink 0 0 1\nlink 1 0 2\n#end\n");
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        tick_for(&mut runtime, &mut world, 3.0);
+        assert!((world.walls[0].a[0] - 2.0).abs() < 0.001);
+        assert!(
+            world.walls[0].a[1].abs() < 0.001,
+            "call must not activate process 2"
+        );
+        for action in ["call", "call nope", "call 32768", "call 1 2"] {
+            let invalid = Script::parse(&format!(
+                "#proc1\n#action\nmove 1 0 256 0\n{action}\n#end\n#links\nlink 0 0 1\n#end\n"
+            ));
+            let mut runtime = ProcessRuntime::new(&invalid, &world);
+            assert_eq!(
+                runtime.activate_at("link", [0, 0])[0].outcome,
+                ProcessOutcome::Unsupported,
+                "{action}"
+            );
+        }
     }
 
     #[test]

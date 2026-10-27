@@ -149,6 +149,7 @@ struct Instance {
     mesh: usize,
     position: [f32; 2],
     angle: f32,
+    elevation: f32,
     cell: Option<[usize; 2]>,
     actor_source_index: Option<usize>,
     object_definition_index: Option<usize>,
@@ -310,14 +311,130 @@ fn edge(a: ScreenVertex, b: ScreenVertex, x: f32, y: f32) -> f32 {
     (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x)
 }
 
+// Limit each pixel to its eight nearest translucent fragments. This bounds the
+// temporary buffer even in maps with many intersecting effects. At overflow,
+// more distant transparent layers are discarded; opaque depth remains exact.
+const MAX_TRANSLUCENT_LAYERS: u8 = 8;
+const NO_FRAGMENT: u32 = u32::MAX;
+#[derive(Clone, Copy)]
+struct Fragment {
+    next: u32,
+    depth: f32,
+    rgb: u32,
+    alpha: u8,
+}
+struct Translucency {
+    heads: Vec<u32>,
+    counts: Vec<u8>,
+    fragments: Vec<Fragment>,
+}
+impl Translucency {
+    fn new(pixels: usize) -> Self {
+        Self {
+            heads: vec![NO_FRAGMENT; pixels],
+            counts: vec![0; pixels],
+            fragments: Vec::new(),
+        }
+    }
+    fn push(&mut self, pixel: usize, depth: f32, rgb: u32, alpha: u8) {
+        let mut current = self.heads[pixel];
+        let mut farthest = NO_FRAGMENT;
+        while current != NO_FRAGMENT {
+            let f = self.fragments[current as usize];
+            // Adjacent triangles can cover the same edge sample. Avoid double
+            // blending identical samples on a shared edge.
+            if (f.depth - depth).abs() < 0.00001 && f.rgb == rgb && f.alpha == alpha {
+                return;
+            }
+            if farthest == NO_FRAGMENT || f.depth > self.fragments[farthest as usize].depth {
+                farthest = current;
+            }
+            current = f.next;
+        }
+        if self.counts[pixel] == MAX_TRANSLUCENT_LAYERS {
+            let f = &mut self.fragments[farthest as usize];
+            if depth < f.depth {
+                *f = Fragment {
+                    next: f.next,
+                    depth,
+                    rgb,
+                    alpha,
+                };
+            }
+        } else if let Ok(index) = u32::try_from(self.fragments.len()) {
+            // NO_FRAGMENT is reserved as the list terminator.
+            if index == NO_FRAGMENT {
+                return;
+            }
+            self.fragments.push(Fragment {
+                next: self.heads[pixel],
+                depth,
+                rgb,
+                alpha,
+            });
+            self.heads[pixel] = index;
+            self.counts[pixel] += 1;
+        }
+    }
+    fn composite(&self, frame: &mut [u32], depth: &[f32]) {
+        for (pixel, &head) in self.heads.iter().enumerate() {
+            if head == NO_FRAGMENT {
+                continue;
+            }
+            let mut sorted = [Fragment {
+                next: NO_FRAGMENT,
+                depth: 0.0,
+                rgb: 0,
+                alpha: 0,
+            }; MAX_TRANSLUCENT_LAYERS as usize];
+            let mut count = 0;
+            let mut current = head;
+            while current != NO_FRAGMENT {
+                let f = self.fragments[current as usize];
+                if f.depth < depth[pixel] {
+                    sorted[count] = f;
+                    count += 1;
+                }
+                current = f.next;
+            }
+            sorted[..count].sort_unstable_by(|a, b| b.depth.total_cmp(&a.depth));
+            for f in &sorted[..count] {
+                let dst = frame[pixel];
+                let blend = |shift: u32| {
+                    let src = (f.rgb >> shift) & 255_u32;
+                    let back = (dst >> shift) & 255_u32;
+                    (src * u32::from(f.alpha) + back * (255 - u32::from(f.alpha))) / 255
+                };
+                frame[pixel] = (blend(16) << 16) | (blend(8) << 8) | blend(0);
+            }
+        }
+    }
+}
+
 struct Raster<'a> {
     frame: &'a mut [u32],
     depth: &'a mut [f32],
     width: usize,
     height: usize,
     palette: &'a [u32; 256],
+    translucent: Option<Translucency>,
 }
 impl Raster<'_> {
+    fn put(&mut self, pixel: usize, distance: f32, rgb: u32, alpha: u8) {
+        if alpha == 255 {
+            self.frame[pixel] = rgb;
+            self.depth[pixel] = distance;
+        } else if alpha != 0 {
+            self.translucent
+                .get_or_insert_with(|| Translucency::new(self.frame.len()))
+                .push(pixel, distance, rgb, alpha);
+        }
+    }
+    fn finish(&mut self) {
+        if let Some(translucent) = &self.translucent {
+            translucent.composite(self.frame, self.depth);
+        }
+    }
     fn triangle(&mut self, triangle: [ScreenVertex; 3], model: &Model, flags: u8) {
         let [a, b, c] = triangle;
         let area = edge(a, b, c.x, c.y);
@@ -363,10 +480,16 @@ impl Raster<'_> {
                 let rgb = self.palette[index as usize];
                 let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
                 let channel = |base: u32| (base as f32 * attenuation) as u32;
-                self.frame[offset] = (channel((rgb >> 16) & 255) << 16)
+                let rgb = (channel((rgb >> 16) & 255) << 16)
                     | (channel((rgb >> 8) & 255) << 8)
                     | channel(rgb & 255);
-                self.depth[offset] = distance;
+                // Both legacy translucent flag bits use provisional half alpha.
+                self.put(
+                    offset,
+                    distance,
+                    rgb,
+                    if flags & 0x0c != 0 { 128 } else { 255 },
+                );
             }
         }
     }
@@ -429,15 +552,10 @@ impl Raster<'_> {
                     continue;
                 }
                 let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
-                let background = self.frame[pixel];
-                let blend = |channel: u8, shift: u32| {
-                    let src = (f32::from(channel) * attenuation) as u32;
-                    let dst = (background >> shift) & 255_u32;
-                    (src * u32::from(rgba[3]) + dst * (255 - u32::from(rgba[3]))) / 255
-                };
-                self.frame[pixel] =
-                    (blend(rgba[0], 16) << 16) | (blend(rgba[1], 8) << 8) | blend(rgba[2], 0);
-                self.depth[pixel] = distance;
+                let rgb = ((f32::from(rgba[0]) * attenuation) as u32) << 16
+                    | ((f32::from(rgba[1]) * attenuation) as u32) << 8
+                    | (f32::from(rgba[2]) * attenuation) as u32;
+                self.put(pixel, distance, rgb, rgba[3]);
             }
         }
     }
@@ -493,7 +611,7 @@ fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: 
                 let wy = dy + p[0] * sin + p[1] * cos;
                 vertices.push(Vertex {
                     side: -wx * camera_sin + wy * camera_cos,
-                    up: p[2] - camera.eye_height,
+                    up: p[2] + instance.elevation - camera.eye_height,
                     depth: wx * camera_cos + wy * camera_sin,
                     uv: primitive.uv[i],
                 });
@@ -628,6 +746,7 @@ impl ObjectScene {
                     mesh,
                     position: instance.position,
                     angle: instance.angle_radians,
+                    elevation: 0.0,
                     cell: Some(instance.grid_cell),
                     actor_source_index: None,
                     object_definition_index: if instance.kind == objects::ObjectKind::LevelObject {
@@ -755,6 +874,7 @@ impl ObjectScene {
                     mesh,
                     position: actor.position,
                     angle: actor.angle_radians,
+                    elevation: 0.0,
                     cell: None,
                     actor_source_index: Some(actor.source_index),
                     object_definition_index: None,
@@ -769,6 +889,40 @@ impl ObjectScene {
         }
         for warning in warnings {
             eprintln!("actor preview: {warning}");
+        }
+    }
+
+    /// Whether a rendered object instance has this original map cell.
+    #[allow(dead_code)] // Available for callers that need to detect absent assets.
+    pub fn has_cell(&self, cell: [usize; 2]) -> bool {
+        self.instances.iter().any(|item| item.cell == Some(cell))
+    }
+
+    /// Set an object's absolute pose; vertical process units are 64 per tile.
+    pub fn set_pose(
+        &mut self,
+        cell: [usize; 2],
+        position: [f32; 2],
+        angle: f32,
+        elevation_raw: f32,
+    ) -> bool {
+        if !position.iter().all(|v| v.is_finite())
+            || !angle.is_finite()
+            || !elevation_raw.is_finite()
+        {
+            return false;
+        }
+        if let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.cell == Some(cell))
+        {
+            instance.position = position;
+            instance.angle = angle;
+            instance.elevation = elevation_raw / 64.0;
+            true
+        } else {
+            false
         }
     }
 
@@ -914,6 +1068,7 @@ impl ObjectScene {
             width,
             height,
             palette: &self.palette,
+            translucent: None,
         };
         for instance in &self.instances {
             if !instance.visible {
@@ -959,7 +1114,7 @@ impl ObjectScene {
                     let world_y = dy + x * sin + y * cos;
                     vertices.push(Vertex {
                         side: -world_x * camera_sin + world_y * camera_cos,
-                        up: f32::from(p[2]) * MODEL_SCALE - camera.eye_height,
+                        up: f32::from(p[2]) * MODEL_SCALE + instance.elevation - camera.eye_height,
                         depth: world_x * camera_cos + world_y * camera_sin,
                         uv: texture_uv(polygon, corner, mesh.car_uv),
                     });
@@ -982,6 +1137,7 @@ impl ObjectScene {
                 }
             }
         }
+        raster.finish();
     }
 }
 
@@ -1031,6 +1187,7 @@ mod tests {
             mesh: 0,
             position: [2.0, 0.0],
             angle: 0.0,
+            elevation: 0.0,
             cell: Some([1, 1]),
             actor_source_index: None,
             object_definition_index: Some(0),
@@ -1317,6 +1474,7 @@ mod tests {
             mesh: 0,
             position: [0.0, 0.0],
             angle: 0.0,
+            elevation: 0.0,
             cell: None,
             actor_source_index: Some(id),
             object_definition_index: None,
@@ -1353,6 +1511,7 @@ mod tests {
                     mesh: 0,
                     position: [0.0, 0.0],
                     angle: 0.0,
+                    elevation: 0.0,
                     cell: Some([1, 2]),
                     actor_source_index: None,
                     object_definition_index: None,
@@ -1367,6 +1526,7 @@ mod tests {
                     mesh: 0,
                     position: [1.0, 1.0],
                     angle: 0.0,
+                    elevation: 0.0,
                     cell: Some([3, 4]),
                     actor_source_index: None,
                     object_definition_index: None,
@@ -1551,6 +1711,7 @@ mod tests {
             width: 4,
             height: 4,
             palette: &palette,
+            translucent: None,
         };
         raster.triangle(triangle, &model, 0);
         assert_eq!(raster.frame[0], 0x123456);
@@ -1565,6 +1726,100 @@ mod tests {
         model.skin_indices.fill(1);
         raster.triangle(triangle, &model, 0);
         assert_ne!(raster.frame[0], 0x123456);
+        assert_eq!(raster.depth[0], 1.0);
+    }
+    #[test]
+    fn translucent_fragments_sort_per_pixel_and_respect_final_opaque_depth() {
+        let vertex = |x, y, depth: f32| ScreenVertex {
+            x,
+            y,
+            inv_depth: depth.recip(),
+            u_over_depth: 0.0,
+            v_over_depth: 0.0,
+        };
+        let tri = |a, b, c| {
+            [
+                vertex(0.0, 0.0, a),
+                vertex(4.0, 0.0, b),
+                vertex(0.0, 4.0, c),
+            ]
+        };
+        let red = GltfImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 128],
+        };
+        let blue = GltfImage {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 255, 128],
+        };
+        let white = GltfImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+        };
+        let palette = [0; 256];
+        let render = |reverse: bool, opaque: bool| {
+            let mut frame = vec![0; 16];
+            let mut depth = vec![10.0; 16];
+            let mut raster = Raster {
+                frame: &mut frame,
+                depth: &mut depth,
+                width: 4,
+                height: 4,
+                palette: &palette,
+                translucent: None,
+            };
+            // The two surfaces cross: their order reverses across the triangle.
+            let draws = [(tri(1.0, 4.0, 1.0), &red), (tri(4.0, 1.0, 4.0), &blue)];
+            for i in if reverse { [1, 0] } else { [0, 1] } {
+                raster.gltf_triangle(draws[i].0, Some(draws[i].1));
+            }
+            if opaque {
+                raster.gltf_triangle(tri(1.1, 1.1, 1.1), Some(&white));
+            }
+            raster.finish();
+            (frame, depth)
+        };
+        let (a, depth) = render(false, false);
+        let (b, _) = render(true, false);
+        assert_eq!(a, b);
+        assert_ne!(a[0], a[2]);
+        assert_eq!(depth[0], 10.0);
+        let (a, depth) = render(false, true);
+        let (b, _) = render(true, true);
+        assert_eq!(a, b);
+        assert!((depth[0] - 1.1).abs() < 0.0001);
+        assert_ne!(a[0], 0);
+    }
+
+    #[test]
+    fn translucent_layers_are_bounded_and_keep_nearest() {
+        let mut fragments = Translucency::new(1);
+        for i in (1..=12).rev() {
+            fragments.push(0, i as f32, i as u32, 128);
+        }
+        assert_eq!(fragments.fragments.len(), MAX_TRANSLUCENT_LAYERS as usize);
+        assert!(fragments.fragments.iter().all(|f| f.depth <= 8.0));
+    }
+    #[test]
+    fn translucent_samples_do_not_hide_later_opaque_objects() {
+        let palette = [0; 256];
+        let mut frame = [0];
+        let mut depth = [10.0];
+        let mut raster = Raster {
+            frame: &mut frame,
+            depth: &mut depth,
+            width: 1,
+            height: 1,
+            palette: &palette,
+            translucent: None,
+        };
+        raster.put(0, 3.0, 0xff0000, 128);
+        raster.put(0, 1.0, 0x0000ff, 255);
+        raster.finish();
+        assert_eq!(raster.frame[0], 0x0000ff);
         assert_eq!(raster.depth[0], 1.0);
     }
 }

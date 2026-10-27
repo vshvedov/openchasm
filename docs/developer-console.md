@@ -75,3 +75,18 @@ geometry, with 64 Quake units per tile. Quake BSP stairs, slopes and water
 physics are not represented. Checkpoints include the movement mode and momentum;
 `status` shows the active mode, autorun preference and horizontal velocity.
 See [movement evidence](movement-evidence.md) for source findings and limits.
+
+Console cheats and level selection:
+
+- `god` toggles immunity; `god on` / `god off` set it explicitly. Health and
+  armor do not decrease while enabled. This does not resurrect a dead player.
+- `giveall` grants all eight weapons and fills their authored ammo limits.
+  `allweapons` and `give all` are aliases.
+- `map` lists levels present in the selected content source. `map 01`,
+  `level 01` or `changelevel 01` starts that level with its default inventory.
+  The content source, difficulty, physics mode and god setting are retained;
+  the old level's in-memory checkpoint is discarded.
+
+God mode is included in checkpoints and retained by restart and level changes,
+but starts off in a new game. These are local developer commands; no multiplayer
+permission model is implemented yet.

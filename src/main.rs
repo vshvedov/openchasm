@@ -50,6 +50,15 @@ fn resource_paths(resources: &ResourceSet) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+fn available_level_ids(resources: &ResourceSet) -> Vec<u8> {
+    let names: std::collections::HashSet<_> = resources.names().collect();
+    (1..=99)
+        .filter(|id| {
+            names.contains(format!("map/map.{id:02}").as_str())
+                && names.contains(format!("map/resource.{id:02}").as_str())
+        })
+        .collect()
+}
 fn next_campaign_level(id: &str) -> Option<String> {
     let level = id.parse::<u8>().ok()?;
     (1..19)
@@ -471,6 +480,7 @@ fn play(
 ) -> Result<(), Box<dyn Error>> {
     let mut carry: Option<openchasm::inventory::Inventory> = None;
     let mut carry_physics = None;
+    let mut carry_god = false;
     let info = resources.read("chasm.inf")?;
     loop {
         let tracing = resources.begin_trace().is_ok();
@@ -726,6 +736,8 @@ fn play(
             object_scene,
             viewer::ClientFeedback {
                 movement_override: carry_physics,
+                god_override: carry_god,
+                available_levels: available_level_ids(resources),
                 hud,
                 map,
                 session,
@@ -742,12 +754,27 @@ fn play(
             },
             &format!("{id}: {name} ({difficulty:?})"),
         )?;
-        if let (Some(completed), Some(next)) = (next_level, next_campaign_level(&id)) {
-            carry = Some(completed.inventory);
-            carry_physics = Some(completed.physics);
-            id = next;
-        } else {
-            break;
+        match next_level {
+            Some(viewer::LevelExit::Continue(completed)) => {
+                let Some(next) = next_campaign_level(&id) else {
+                    break;
+                };
+                carry = Some(completed.inventory);
+                carry_physics = Some(completed.physics);
+                carry_god = completed.god_mode;
+                id = next;
+            }
+            Some(viewer::LevelExit::Change {
+                level,
+                physics,
+                god_mode,
+            }) => {
+                carry = None;
+                carry_physics = Some(physics);
+                carry_god = god_mode;
+                id = format!("{level:02}");
+            }
+            None => break,
         }
     }
 

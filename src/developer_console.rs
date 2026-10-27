@@ -33,6 +33,13 @@ const COMMANDS: &[&str] = &[
     "brightness",
     "saturation",
     "bloom",
+    "god",
+    "giveall",
+    "allweapons",
+    "give",
+    "map",
+    "level",
+    "changelevel",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,9 +49,12 @@ pub enum Command {
     /// Frames per second cap; zero means uncapped, None queries.
     MaxFps(Option<u32>),
     Status,
+    God(Option<bool>),
+    GiveAll,
+    Map(Option<u8>),
     Restart,
     Quit,
-    /// Radians per mouse pixel; None requests the current value.
+    /// Radians per relative mouse count; None requests the current value.
     Sensitivity(Option<f32>),
     Autorun(Option<bool>),
     Physics(Option<MovementMode>),
@@ -236,7 +246,7 @@ impl Console {
         let args: Vec<_> = parts.collect();
         match command.as_str() {
             "help" | "cmdlist" if args.is_empty() => self
-                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity autorun physics options graphics renderer tonemap gamma brightness saturation bloom"),
+                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity autorun physics options graphics renderer tonemap gamma brightness saturation bloom god giveall allweapons give map level changelevel"),
             "clear" if args.is_empty() => self.lines.clear(),
             "echo" => self.push(
                 trimmed
@@ -276,9 +286,9 @@ impl Console {
                     Ok(v) if v.is_finite() && (0.0001..=1.0).contains(&v) => {
                         return Some(Command::Sensitivity(Some(v)))
                     }
-                    _ => self.push("usage: sensitivity [0.0001..1.0] (radians/pixel)"),
+                    _ => self.push("usage: sensitivity [0.0001..1.0] (radians/count)"),
                 },
-                _ => self.push("usage: sensitivity [0.0001..1.0] (radians/pixel)"),
+                _ => self.push("usage: sensitivity [0.0001..1.0] (radians/count)"),
             },
             "autorun" => match args.as_slice() {
                 [] => return Some(Command::Autorun(None)),
@@ -292,6 +302,28 @@ impl Console {
                 [v] if v.eq_ignore_ascii_case("quake1") => return Some(Command::Physics(Some(MovementMode::Quake1))),
                 _ => self.push("usage: physics [original|quake1]"),
             },
+            "god" => match args.as_slice() {
+                [] => return Some(Command::God(None)),
+                [v] if v.eq_ignore_ascii_case("on") || *v == "1" => return Some(Command::God(Some(true))),
+                [v] if v.eq_ignore_ascii_case("off") || *v == "0" => return Some(Command::God(Some(false))),
+                _ => self.push("usage: god [on|off|1|0] (no argument toggles)"),
+            },
+            "giveall" | "allweapons" if args.is_empty() => return Some(Command::GiveAll),
+            "give" if args.len() == 1 && args[0].eq_ignore_ascii_case("all") => return Some(Command::GiveAll),
+            "giveall" | "allweapons" | "give" => self.push("usage: giveall (or give all)"),
+            "map" | "level" | "changelevel" => {
+                match args.as_slice() {
+                    [] => return Some(Command::Map(None)),
+                    [id] => {
+                        let id = id.strip_prefix("map").or_else(|| id.strip_prefix("MAP")).unwrap_or(id);
+                        if id.len() <= 2 && id.bytes().all(|b| b.is_ascii_digit()) {
+                            if let Ok(id @ 1..=99) = id.parse::<u8>() { return Some(Command::Map(Some(id))); }
+                        }
+                    }
+                    _ => {}
+                }
+                self.push("usage: map [01..99] (no argument lists available levels)");
+            }
             "options" if args.is_empty() => return Some(Command::Options),
             "graphics" => {
                 use crate::graphics_settings::VisualPreset;
@@ -420,6 +452,36 @@ mod tests {
     fn submit(console: &mut Console, text: &str) -> Option<Command> {
         console.insert(text);
         console.key(Keycode::Return)
+    }
+    #[test]
+    fn cheats_and_level_commands_validate_aliases_and_reject_invalid_requests() {
+        let mut c = Console::default();
+        for (text, expected) in [
+            ("god", Command::God(None)),
+            ("god on", Command::God(Some(true))),
+            ("god 0", Command::God(Some(false))),
+            ("giveall", Command::GiveAll),
+            ("allweapons", Command::GiveAll),
+            ("give all", Command::GiveAll),
+            ("map", Command::Map(None)),
+            ("map 01", Command::Map(Some(1))),
+            ("level 19", Command::Map(Some(19))),
+            ("changelevel MAP02", Command::Map(Some(2))),
+        ] {
+            assert_eq!(submit(&mut c, text), Some(expected));
+        }
+        for text in [
+            "god maybe",
+            "give weapon",
+            "giveall now",
+            "map 00",
+            "map 100",
+            "map ../01",
+            "map 01 extra",
+        ] {
+            assert_eq!(submit(&mut c, text), None);
+            assert!(c.lines.back().unwrap().starts_with("usage:"));
+        }
     }
     #[test]
     fn editing_preserves_utf8_boundaries_and_supports_navigation() {

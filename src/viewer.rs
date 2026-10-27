@@ -1273,10 +1273,22 @@ impl UiFrame<'_> {
 pub struct LevelCarry {
     pub inventory: openchasm::inventory::Inventory,
     pub physics: openchasm::movement::MovementMode,
+    pub god_mode: bool,
+}
+
+pub enum LevelExit {
+    Continue(LevelCarry),
+    Change {
+        level: u8,
+        physics: openchasm::movement::MovementMode,
+        god_mode: bool,
+    },
 }
 
 pub struct ClientFeedback {
     pub movement_override: Option<openchasm::movement::MovementMode>,
+    pub god_override: bool,
+    pub available_levels: Vec<u8>,
     pub hud: Option<crate::hud::Hud>,
     pub map: crate::map::Map,
     pub session: Session,
@@ -1300,9 +1312,11 @@ pub fn run(
     mut objects: ObjectScene,
     feedback: ClientFeedback,
     label: &str,
-) -> Result<Option<LevelCarry>, Box<dyn Error>> {
+) -> Result<Option<LevelExit>, Box<dyn Error>> {
     let ClientFeedback {
         movement_override,
+        god_override,
+        available_levels,
         hud,
         map,
         mut session,
@@ -1394,6 +1408,7 @@ pub fn run(
     session
         .set_movement_mode(graphics.physics)
         .map_err(|error| format!("movement settings: {error:?}"))?;
+    session.set_god_mode(god_override);
     let initial_session = session.clone();
     let mut uncapped_override = std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1");
     let mut color_pipeline = ColorPipeline::new(graphics.color_settings())?;
@@ -1447,6 +1462,7 @@ pub fn run(
         Scancode::Num8,
     ];
     let mut running = true;
+    let mut requested_level = None;
     while running {
         let graphics_before = graphics.clone();
         let override_before = uncapped_override;
@@ -1594,6 +1610,41 @@ pub fn run(
                 if let Some(command) = console.event(&event) {
                     use crate::developer_console::Command;
                     match command {
+                        Command::God(value) => {
+                            session.set_god_mode(value.unwrap_or(!session.god_mode()));
+                            console.push(if session.god_mode() {
+                                "god on"
+                            } else {
+                                "god off"
+                            });
+                        }
+                        Command::GiveAll => {
+                            session.give_all_weapons();
+                            console.push("All weapons and maximum ammunition granted");
+                        }
+                        Command::Map(value) => {
+                            if let Some(level) = value {
+                                if available_levels.contains(&level) {
+                                    requested_level = Some(level);
+                                    running = false;
+                                } else {
+                                    console.push(&format!(
+                                        "Level {level:02} is unavailable in this content source"
+                                    ));
+                                }
+                            } else {
+                                console.push(&format!(
+                                    "Available levels: {}",
+                                    available_levels
+                                        .iter()
+                                        .map(|id| format!("{id:02}"))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                ));
+                                console
+                                    .push("Use map 01 to start a level with its default loadout");
+                            }
+                        }
                         Command::Fps(value) => {
                             if let Some(value) = value {
                                 show_fps = value;
@@ -2003,7 +2054,9 @@ pub fn run(
             audio.stop_one_shots();
             audio.reset_ambient();
             let physics = session.movement_mode();
+            let god_mode = session.god_mode();
             session = initial_session.clone();
+            session.set_god_mode(god_mode);
             session
                 .set_movement_mode(physics)
                 .map_err(|error| format!("restart movement: {error:?}"))?;
@@ -2108,10 +2161,11 @@ pub fn run(
         });
         if completed && advance_requested && !pause.open {
             sdl.mouse().set_relative_mouse_mode(false);
-            return Ok(Some(LevelCarry {
+            return Ok(Some(LevelExit::Continue(LevelCarry {
                 inventory: session.game.inventory.clone(),
                 physics: session.movement_mode(),
-            }));
+                god_mode: session.god_mode(),
+            })));
         }
         let simulation_started = Instant::now();
         let movement = held_movement(&held);
@@ -2535,7 +2589,11 @@ pub fn run(
     }
     sdl.mouse().set_relative_mouse_mode(false);
     video.text_input().stop();
-    Ok(None)
+    Ok(requested_level.map(|level| LevelExit::Change {
+        level,
+        physics: session.movement_mode(),
+        god_mode: session.god_mode(),
+    }))
 }
 
 #[cfg(test)]

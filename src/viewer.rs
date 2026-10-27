@@ -9,7 +9,7 @@ use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSc
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
 use crate::texture::CelImage;
-use crate::weapon_render::{WeaponPose, WeaponRenderer};
+use crate::weapon_render::{WeaponAnimationClock, WeaponPose, WeaponRenderer};
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use openchasm::ai::Mode;
@@ -339,7 +339,7 @@ struct QuickSave {
     session: Session,
     scene: ObjectSceneSnapshot,
     animation_tick: u64,
-    shoot_ticks: usize,
+    weapon_clock: WeaponAnimationClock,
     current_message: Option<(Vec<String>, f32)>,
     completed: bool,
     shot_feedback: Option<(&'static str, f32)>,
@@ -469,7 +469,7 @@ pub fn run(
     let mut pending_interact = false;
     let mut pending_jump = false;
     let mut pending_weapon = None;
-    let mut shoot_ticks = 0usize;
+    let mut weapon_clock = WeaponAnimationClock::default();
     let mut current_message: Option<(Vec<String>, f32)> = None;
     let mut shot_feedback: Option<(&'static str, f32)> = None;
     let mut quicksave: Option<QuickSave> = None;
@@ -615,7 +615,7 @@ pub fn run(
             pending_interact = false;
             pending_jump = false;
             pending_weapon = None;
-            shoot_ticks = 0;
+            weapon_clock = WeaponAnimationClock::default();
             animation_tick = 0;
             current_message = None;
             shot_feedback = None;
@@ -629,7 +629,7 @@ pub fn run(
                         session: session.clone(),
                         scene: objects.snapshot(),
                         animation_tick,
-                        shoot_ticks,
+                        weapon_clock,
                         current_message: current_message.clone(),
                         completed,
                         shot_feedback,
@@ -642,7 +642,7 @@ pub fn run(
                         if objects.restore(&saved.scene) {
                             session = saved.session.clone();
                             animation_tick = saved.animation_tick;
-                            shoot_ticks = saved.shoot_ticks;
+                            weapon_clock = saved.weapon_clock;
                             current_message = saved.current_message.clone();
                             completed = saved.completed;
                             shot_feedback = saved.shot_feedback;
@@ -694,6 +694,12 @@ pub fn run(
             if session.selected_weapon != old_weapon {
                 shot_feedback = None;
             }
+            let fired = matches!(events.shot, Some(FireResult::Fired(_)));
+            weapon_clock.tick(
+                session.selected_weapon != old_weapon,
+                fired,
+                weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Shoot),
+            );
             if let Some((_, remaining)) = &mut checkpoint_notice {
                 *remaining -= STEP;
             }
@@ -819,9 +825,7 @@ pub fn run(
                 };
                 audio.play(sound);
             }
-            shoot_ticks = shoot_ticks.saturating_sub(1);
-            if matches!(events.shot, Some(FireResult::Fired(_))) {
-                shoot_ticks = 12;
+            if fired {
                 audio.play(21 + session.selected_weapon as u8);
             }
             sync_actor_scene(&mut objects, &session, STEP, &mut warned_actor_clips);
@@ -874,20 +878,8 @@ pub fn run(
         if let Some(renderer) = &explosion_renderer {
             renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
         }
-        let pose = if shoot_ticks > 0 {
-            WeaponPose::Shoot
-        } else {
-            WeaponPose::Idle
-        };
-        let count = weapon_overlay
-            .frame_count(session.selected_weapon, pose)
-            .unwrap_or(1)
-            .max(1);
-        let frame_index = if shoot_ticks > 0 {
-            (12 - shoot_ticks) * count / 12
-        } else {
-            (animation_tick as usize / 6) % count
-        };
+        let (pose, frame_index) = weapon_clock
+            .pose(weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Idle));
         weapon_overlay.render(
             &mut frame,
             WIDTH,

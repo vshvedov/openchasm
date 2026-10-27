@@ -18,6 +18,53 @@ pub enum WeaponPose {
     Shoot,
 }
 
+/// Presentation clock at 60 simulation ticks/s. Weapon clips advance at the
+/// remaster manual's 25ms/frame (40 frames/s), independent of fire cooldown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WeaponAnimationClock {
+    idle_ticks: u64,
+    fire_ticks: Option<u64>,
+}
+impl WeaponAnimationClock {
+    fn frame(ticks: u64) -> u64 {
+        ticks.saturating_mul(2) / 3
+    }
+
+    /// Advance one simulation tick; a successful shot starts frame zero, and a
+    /// selection change clears the old clip before a possible new shot.
+    pub fn tick(&mut self, changed: bool, fired: bool, fire_frames: Option<usize>) {
+        if changed {
+            *self = Self::default();
+        } else {
+            self.idle_ticks = self.idle_ticks.saturating_add(1);
+            if let Some(ticks) = &mut self.fire_ticks {
+                *ticks = ticks.saturating_add(1);
+                if fire_frames.is_none_or(|count| Self::frame(*ticks) >= count as u64) {
+                    self.fire_ticks = None;
+                    self.idle_ticks = 0;
+                }
+            }
+        }
+        if fired {
+            self.fire_ticks = fire_frames.filter(|&count| count > 0).map(|_| 0);
+            self.idle_ticks = 0;
+        }
+    }
+
+    /// Return pose and zero-based frame. Missing/empty idle animation uses
+    /// frame zero, which the renderer safely resolves to its base model.
+    pub fn pose(&self, idle_frames: Option<usize>) -> (WeaponPose, usize) {
+        if let Some(ticks) = self.fire_ticks {
+            (WeaponPose::Shoot, Self::frame(ticks) as usize)
+        } else {
+            let frame = idle_frames.filter(|&count| count > 0).map_or(0, |count| {
+                (Self::frame(self.idle_ticks) % count as u64) as usize
+            });
+            (WeaponPose::Idle, frame)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WeaponPaths {
     model: String,
@@ -461,5 +508,80 @@ mod tests {
             raster.triangle([p(0.0, 0.0), p(4.0, 0.0), p(0.0, 4.0)], 0);
         }
         assert_eq!(frame[0], 0xff0000);
+    }
+    #[test]
+    fn weapon_clock_uses_25ms_frames_and_clip_specific_duration() {
+        let mut clock = WeaponAnimationClock::default();
+        clock.tick(false, true, Some(24));
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Shoot, 0));
+        clock.tick(false, false, Some(24));
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Shoot, 0));
+        clock.tick(false, false, Some(24));
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Shoot, 1));
+        for _ in 2..35 {
+            clock.tick(false, false, Some(24));
+        }
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Shoot, 23));
+        clock.tick(false, false, Some(24));
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Idle, 0));
+        clock.tick(false, true, Some(14));
+        for _ in 0..20 {
+            clock.tick(false, false, Some(14));
+        }
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Shoot, 13));
+        clock.tick(false, false, Some(14));
+        assert_eq!(clock.pose(Some(3)), (WeaponPose::Idle, 0));
+    }
+
+    #[test]
+    fn weapon_clock_handles_retrigger_switch_and_checkpoint_clone() {
+        let mut clock = WeaponAnimationClock::default();
+        clock.tick(false, true, Some(4));
+        for _ in 0..4 {
+            clock.tick(false, false, Some(4));
+        }
+        let checkpoint = clock;
+        assert_eq!(clock.pose(Some(2)), (WeaponPose::Shoot, 2));
+        clock.tick(false, true, Some(4));
+        assert_eq!(clock.pose(Some(2)), (WeaponPose::Shoot, 0));
+        clock = checkpoint;
+        assert_eq!(clock.pose(Some(2)), (WeaponPose::Shoot, 2));
+        clock.tick(true, false, Some(7));
+        assert_eq!(clock.pose(Some(2)), (WeaponPose::Idle, 0));
+        clock.tick(true, true, Some(7));
+        assert_eq!(clock.pose(Some(2)), (WeaponPose::Shoot, 0));
+        clock.tick(false, true, None);
+        assert_eq!(clock.pose(None), (WeaponPose::Idle, 0));
+        clock.tick(false, false, None);
+        clock.tick(false, false, None);
+        assert_eq!(clock.pose(Some(2)), (WeaponPose::Idle, 1));
+    }
+    #[test]
+    fn installed_weapon_clips_produce_distinct_firing_durations() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let inf = resources.read("chasm.inf").unwrap();
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let renderer = WeaponRenderer::load(&mut resources, &inf, &palette).unwrap();
+        assert_eq!(renderer.frame_count(5, WeaponPose::Shoot), Some(24));
+        assert_eq!(renderer.frame_count(6, WeaponPose::Shoot), Some(14));
+        for (slot, ticks) in [(5, 36), (6, 21)] {
+            let frames = renderer.frame_count(slot, WeaponPose::Shoot);
+            let mut clock = WeaponAnimationClock::default();
+            clock.tick(false, true, frames);
+            for _ in 0..ticks - 1 {
+                clock.tick(false, false, frames);
+            }
+            assert_eq!(clock.pose(Some(1)).0, WeaponPose::Shoot);
+            clock.tick(false, false, frames);
+            assert_eq!(clock.pose(Some(1)).0, WeaponPose::Idle);
+        }
     }
 }

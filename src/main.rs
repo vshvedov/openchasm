@@ -10,6 +10,7 @@ mod planes;
 mod projectile_render;
 mod replacement_manifest;
 mod scene_restore;
+mod sky;
 mod texture;
 mod viewer;
 mod weapon_render;
@@ -472,7 +473,12 @@ fn play(
         let world = make_world(&map, &graphics)?;
         let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
         let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
-        let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
+        let mut planes = planes::PlaneRenderer::new(&map, &floors, &palette);
+        if let Some(sky) = sky::Sky::load(resources, &resource, &palette) {
+            planes.set_sky(sky);
+        } else {
+            eprintln!("sky unavailable for level {id}; using fallback background");
+        }
         let script_data = resources.read(&format!("map/process.{id}"))?;
         let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
         // Teleport sections live in the level process resource.

@@ -4,21 +4,21 @@
 //! match the current wall preview, not yet validated against the original game.
 use crate::map::{Floors, Map, FLOOR_TEXTURE_COUNT, FLOOR_TEXTURE_SIDE, MAP_SIDE};
 use crate::object_render::CameraView;
+use crate::sky::Sky;
 use crate::texture::Palette;
 
 const FLOOR_BACKGROUND: u32 = 0x38312b;
 const SKY_BACKGROUND: u32 = 0x303847;
-// Tile 63 dominates map space outside rooms and has a uniform texture in the
-// installed data. Tile 62 occurs mainly on ceilings, commonly in sky areas.
-// Their complete original semantics are not yet understood.
+// The reference renderer treats both 62 and 63 as absent plane geometry.
 const EMPTY_TILE: u8 = 63;
-const SKY_CEILING_TILE: u8 = 62;
+const SKY_TILE: u8 = 62;
 
 /// Predecoded data for fast, allocation-free per-frame plane drawing.
 pub struct PlaneRenderer {
     floor_ids: Vec<u8>,
     ceiling_ids: Vec<u8>,
     textures: Vec<u32>,
+    sky: Option<Sky>,
 }
 
 impl PlaneRenderer {
@@ -44,7 +44,12 @@ impl PlaneRenderer {
             floor_ids,
             ceiling_ids,
             textures,
+            sky: None,
         }
+    }
+
+    pub fn set_sky(&mut self, sky: Sky) {
+        self.sky = Some(sky);
     }
 
     /// Paint the floor and ceiling before drawing walls, using the same camera
@@ -83,6 +88,16 @@ impl PlaneRenderer {
                 FLOOR_BACKGROUND
             };
             row.fill(background);
+            if let Some(sky) = &self.sky {
+                for (x, pixel) in row.iter_mut().enumerate() {
+                    let camera_x = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
+                    *pixel = sky.sample([
+                        cos + camera_plane[0] * camera_x,
+                        sin + camera_plane[1] * camera_x,
+                        (horizon - (y as f32 + 0.5)) / horizon,
+                    ]);
+                }
+            }
             // Half the current preview wall's projected height at unit distance.
             let delta = ((y as f32 + 0.5) - horizon).abs();
             if delta < f32::EPSILON {
@@ -122,10 +137,7 @@ impl PlaneRenderer {
                 } else {
                     self.floor_ids[cell]
                 };
-                if id == EMPTY_TILE
-                    || (ceiling && id == SKY_CEILING_TILE)
-                    || usize::from(id) >= FLOOR_TEXTURE_COUNT
-                {
+                if id == EMPTY_TILE || id == SKY_TILE || usize::from(id) >= FLOOR_TEXTURE_COUNT {
                     continue;
                 }
                 let tx = ((world_x - tile_x as f32) * FLOOR_TEXTURE_SIDE as f32) as usize;
@@ -165,6 +177,29 @@ mod tests {
             Floors::parse(&floors).unwrap(),
             Palette::parse(&palette).unwrap(),
         )
+    }
+
+    #[test]
+    fn sky_fills_open_ceiling_but_not_floor_or_solid_ceiling() {
+        let (map, floors, palette) = fixtures(0, SKY_TILE);
+        let mut renderer = PlaneRenderer::new(&map, &floors, &palette);
+        renderer.set_sky(Sky::solid(0x123456));
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [32.5, 32.5],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+        };
+        let mut frame = vec![0; 64];
+        renderer.render(&mut frame, 8, 8, camera);
+        assert_eq!(frame[4], 0x123456);
+        assert_ne!(frame[7 * 8 + 4], 0x123456);
+        let (map, floors, palette) = fixtures(0, 1);
+        let mut renderer = PlaneRenderer::new(&map, &floors, &palette);
+        renderer.set_sky(Sky::solid(0x123456));
+        renderer.render(&mut frame, 8, 8, camera);
+        assert_ne!(frame[4], 0x123456);
     }
 
     #[test]

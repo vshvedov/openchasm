@@ -441,6 +441,9 @@ fn play(
         let mut audio = audio::Audio::new(resources, &info);
         audio.play_level_music(resources, &resource);
         audio.load_ambient(resources, &resource);
+        if let Err(error) = audio.load_object_break_sounds(resources, &info, &resource) {
+            eprintln!("object break audio unavailable: {error}");
+        }
         let weapon_overlay = weapon_render::WeaponRenderer::load(resources, &info, &palette)?;
         let mut game =
             openchasm::game::GameInventory::new(weapons, &instances, &definitions, difficulty);

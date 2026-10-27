@@ -653,7 +653,6 @@ impl Audio {
 
     /// Load global and level-local object break sounds. Failure parsing either
     /// table clears the prior bank; missing or undecodable samples are silent.
-    #[allow(dead_code)] // The committed destruction event integration owns the caller.
     pub fn load_object_break_sounds(
         &mut self,
         resources: &mut ResourceSet,
@@ -667,7 +666,6 @@ impl Audio {
     }
 
     /// Play a committed destruction's BSFX with provisional 24-tile attenuation.
-    #[allow(dead_code)] // Waiting for the authoritative destruction events.
     pub fn play_object_break(&mut self, sound_id: i32, position: [f32; 2], listener: [f32; 2]) {
         let Some(sink) = &self.sink else { return };
         let Some((sample, volume)) = self.break_sounds.select(sound_id, position, listener) else {

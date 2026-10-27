@@ -252,6 +252,17 @@ fn fire_feedback(result: Option<FireResult>) -> Option<&'static str> {
     }
 }
 
+// Preserve committed event order and hit-time sound/position, even when a
+// replacement changes the definition at the same map cell.
+fn dispatch_object_breaks(
+    events: &[openchasm::session::ObjectDestructionEvent],
+    mut play: impl FnMut(i32, [f32; 2]),
+) {
+    for event in events {
+        play(event.sound_id, event.position);
+    }
+}
+
 /// Provisional bounded red damage flash and deterministic pain throttling.
 /// State is presentation-only and cloned with the same-level checkpoint.
 #[derive(Clone, Copy, Default)]
@@ -1149,6 +1160,9 @@ pub fn run(
             for id in crate::audio::gameplay_sound_ids(&events, rocket_type) {
                 audio.play(id);
             }
+            dispatch_object_breaks(&events.object_destructions, |sound, position| {
+                audio.play_object_break(sound, position, session.world.player.position);
+            });
             if let Some((_, remaining)) = &mut current_message {
                 *remaining -= STEP;
             }
@@ -1405,6 +1419,32 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn committed_break_sounds_use_event_order_and_pretransition_metadata() {
+        use openchasm::session::{ObjectDestructionCause, ObjectDestructionEvent};
+        let events = [
+            ObjectDestructionEvent {
+                cell: [3, 4],
+                raw_type: 163,
+                position: [3.5, 4.5],
+                sound_id: 81,
+                cause: ObjectDestructionCause::PlayerHitscan,
+            },
+            ObjectDestructionEvent {
+                cell: [3, 4],
+                raw_type: 164,
+                position: [4.0, 4.5],
+                sound_id: 70,
+                cause: ObjectDestructionCause::Script { process_id: 7 },
+            },
+        ];
+        let mut played = Vec::new();
+        dispatch_object_breaks(&events, |id, position| played.push((id, position)));
+        assert_eq!(played, vec![(81, [3.5, 4.5]), (70, [4.0, 4.5])]);
+        played.clear();
+        dispatch_object_breaks(&[], |id, position| played.push((id, position)));
+        assert!(played.is_empty());
+    }
     #[test]
     fn pause_menu_navigation_confirm_and_checkpoint_shortcuts() {
         let mut menu = PauseMenu::default();

@@ -346,7 +346,7 @@ fn parse_options(
 }
 
 /// Increment whenever simulation rules or startup interpretation changes.
-const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v4";
+const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v5";
 
 fn finish_level_fingerprint(
     mut trace: content::ResourceTrace,

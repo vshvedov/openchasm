@@ -1,19 +1,15 @@
-# Campaign process audit
+# Campaign progression audit
 
-This audit uses the installed full-game levels 01–19, with a freshly initialized process runtime, actual map walls and raw cell types, normal-difficulty object placements, and all key flags enabled. It queries staged process acceptance for one linked trigger per procedure. An accepted procedure has passed runtime compilation and trigger gating; it does **not** prove that the player can reach it, that presentation assets can be preflighted, or that the level is playable from start to finish. Locked procedures and routes requiring earlier state changes need separate checks.
+Installed-data tests exercise individual campaign mechanisms with owned Steam content. An accepted process or passing scenario does not establish a complete playable route: several tests place the player at a trigger, suppress enemies, or provide presentation manifests explicitly.
 
-| Levels | Exit check |
-| --- | --- |
-| 01–11, 13–15, 17–18 | Every directly linked exit procedure accepted in the fresh runtime. |
-| 12 | Exit process 29 is locked initially. Its authored unlocker, process 27 at `floor 35 31`, now passes an installed-data transaction test: the model changes, the wall moves and process 29 unlocks. The test supplies keys and clearance and does not establish a full route. The trailing move value is retained; the remaster movement paths inspected do not use it. |
-| 16 | Exit process 9 is locked initially. Its unlocker, process 7 at `destroy 27 47`, prepares six staged actions with the installed data. The host must still preflight and commit those actions and the boss route remains to be verified. |
-| 19 | Process 30 is the exit but has no ordinary map trigger; it is activated through the addon-boss rule. This audit does not establish that encounter's completion. |
+- Level 01: a no-teleport session walk reaches the green key, passes its door and destroys a window. Other tests activate the power-switch and door logic with controlled positions. A complete route to the power switch and exit remains unverified.
+- Level 02: a no-teleport walk reaches a nearby switch. Separate controlled-position tests collect the green key and activate its exit approach; complete traversal remains unverified.
+- Level 03: real paired door rotations restore from snapshots when they share a pivot. This is a persistence test, not a progression route.
+- Level 08: an installed-data scenario exercises the staged destruction and replacement of linked targets. It does not establish full traversal.
+- Level 09: the real process 20/21 scenario covers the reconstructed `call` handling and door action; `call` is treated as a documented no-op pending stronger evidence.
+- Level 12: real process 27 executes its object replacement and wall motion and unlocks process 29. The test supplies clearance and keys; full route traversal remains unverified. Source-light lifecycle and snapshot restoration are separately tested.
+- Level 16: one controlled-start session follows the two authored boss-area teleports to the heart area, including landing on the real 0.875-tile platform and a snapshot round trip. Another destroys the heart using its authored 300 health and the first weapon's 25 damage, commits replacements, walks into the unlocked exit, displays its message and completes the timer. Both suppress enemies and explicitly preload replacement presentation; they do not establish full-level traversal. The destination platform height comes from installed 3O vertices. Standing, collision clearance and platform pull approximate the independent reconstruction and still need direct comparison with the original executable.
+- Level 18: a real process 2 session scenario changes a wall material and moves it, checking collision and failure rollback. This does not establish a route to the exit.
+- Level 19: an isolated installed-data encounter reflects the boss projectile and reaches mission completion; it does not establish a full playable route.
 
-An earlier initial-state scan found 50 linked procedures rejected as unsupported, including cosmetic or optional ones; subsequent support changes mean that count is no longer current. The scan excluded locked procedures whose action support could not be isolated through a fresh trigger. It is not a count of blocked exits. Notable candidates for further investigation are:
-
-- Level 10 process 8 and level 11 process 18 use extra numeric `move` arguments; support has since been added, but their route importance and complete transaction behavior need a fresh audit.
-- Several linked processes combine wall texture `change` commands with wall motion or other actions, including level 10 process 4, level 11 process 20, level 15 process 5, level 18 processes 2, 4, 5, 9, 13 and 16, and level 19 process 5. Their rejection and route impact require identifying the exact unsupported action and testing the intended traversal.
-- Level 09 process 20 combines door rotation with `call 21`; the call and its effects need investigation before treating this route as functional.
-- Level 01 processes 6 and 9 contain `light` actions; level 14 process 2 and level 16 process 10 contain `source` actions. Their rejection is observed, but this scan does not establish that they block progression.
-
-Procedures may also be rejected because a referenced object or wall has changed since map load, because an action or property is unsupported, or because a linked trigger expects a different runtime phase. The audit deliberately does not classify the earlier rejected procedures by cause without tracing those cases.
+An older initial-state scan reported unsupported actions and exit acceptance, but subsequent runtime changes made its counts stale. These targeted tests supersede those counts. The remaining mandatory paths, full enemy encounters, and dynamic geometry still need end-to-end validation; unsupported process actions and approximated movement may prevent progression elsewhere.

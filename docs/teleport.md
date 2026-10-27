@@ -27,7 +27,7 @@ Trigger radius, clearance, direction and rearm still need original-game tests.
 
 `Session::set_teleports` opts the player in; fresh sessions remain disabled.
 After movement, a successful teleport updates position and yaw, resets vertical
-velocity at the provisional flat floor, then runs destination pickups and floor
+velocity at a known destination platform top or the provisional flat floor, then runs destination pickups and floor
 links in that tick. It emits `SessionEvents::teleport`; blocked destinations
 are reported as `teleport_failure`. The host presents sound and networking.
 AI and other entities do not teleport yet; wind currently applies before the
@@ -38,3 +38,5 @@ The client loads object mesh heights for destination clearance, allowing level
 height data falls back to conservative blocking. The installed-data scenario
 tests this landing without actors; it does not establish whole-map traversal
 or clearance with the level's full enemy population.
+
+A known solid model can support the destination when its loaded base-mesh bounds and authored radius leave full body clearance. Unknown heights remain conservatively blocking. An installed level 16 test now covers both authored teleports from the boss-side source through the raised 0.875-tile platform to the heart area, with a snapshot round trip on the platform; it places the player at the first source and excludes enemies. This follows the independent reconstruction’s floor placement rule and does not establish a full route.

@@ -325,6 +325,51 @@ fn object_blocks_height(
         .overlaps(raw, object.elevation_raw / 64.0, bottom, top)
 }
 
+/// Known solid, ordinary model that may support the player. Unknown metadata,
+/// pickups, switches and geometry without room above remain non-platforms.
+fn object_platform_top(
+    heights: Option<&SessionObjectHeights>,
+    scripted: Option<&ScriptedObjects>,
+    processes: &ProcessRuntime,
+    object: &ProcessObject,
+    body_height: f32,
+) -> Option<f32> {
+    if object.blocking_radius <= 0.0 {
+        return None;
+    }
+    let heights = heights?;
+    let [x, y] = object.cell;
+    if x >= 64 || y >= 64 {
+        return None;
+    }
+    let raw = processes
+        .cell_type(object.cell)
+        .unwrap_or(heights.initial_raw_cells[usize::from(x) * 64 + usize::from(y)]);
+    let definition = scripted?
+        .definitions
+        .level_objects
+        .get(usize::from(raw.checked_sub(163)?))?;
+    if definition.action_code != 0 {
+        return None;
+    }
+    let bounds = heights.catalog.get(raw)?;
+    let bottom = bounds.bottom + object.elevation_raw / 64.0;
+    let top = bounds.top + object.elevation_raw / 64.0;
+    (bottom.is_finite()
+        && top.is_finite()
+        && top > 0.0
+        && bottom < body_height + 0.05
+        && top + body_height + 0.05 <= 2.0)
+        .then_some(top)
+}
+
+fn object_touches_player(object: &ProcessObject, position: [f32; 2], extra: f32) -> bool {
+    let radius = object.blocking_radius + 0.18 + extra;
+    let dx = position[0] - object.position[0];
+    let dy = position[1] - object.position[1];
+    radius.is_finite() && radius > 0.0 && dx * dx + dy * dy <= radius * radius
+}
+
 /// Bounded committed process effects used to validate history-dependent grids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -698,7 +743,10 @@ impl Session {
             .clone_from(&snapshot.elevation_by_cell);
         candidate
             .vertical
-            .restore(snapshot.vertical, candidate.player_bounds())
+            .restore(
+                snapshot.vertical,
+                candidate.player_bounds_at(snapshot.vertical.feet),
+            )
             .map_err(|_| SessionSnapshotError::Component("vertical"))?;
         candidate
             .game
@@ -2210,14 +2258,32 @@ impl Session {
     /// Conservative clearance under nearby elevated solid walls. Flat map
     /// floor/ceiling assumptions remain provisional until plane geometry exists.
     fn player_bounds(&self) -> VerticalBounds {
-        let p = self.world.player.position;
+        self.player_bounds_at(self.vertical.feet())
+    }
+    fn player_bounds_at(&self, feet: f32) -> VerticalBounds {
+        self.player_bounds_at_position(self.world.player.position, feet)
+    }
+    fn player_bounds_at_position(&self, p: [f32; 2], feet: f32) -> VerticalBounds {
         let mut bounds = VerticalBounds::flat_room();
+        for object in self.processes.objects() {
+            if let Some(top) = object_platform_top(
+                self.object_heights.as_ref(),
+                self.scripted_objects.as_ref(),
+                &self.processes,
+                object,
+                self.vertical.config().body_height,
+            ) {
+                if top <= feet + 1e-5 && object_touches_player(object, p, 0.0001) {
+                    bounds.floor = bounds.floor.max(top);
+                }
+            }
+        }
         for (i, wall) in self.world.walls.iter().enumerate() {
             if !self.base_wall_blocking.get(i).copied().unwrap_or(false) {
                 continue;
             }
             let offset = self.wall_elevations.get(i).copied().unwrap_or(0.0) / 64.0;
-            if offset <= self.vertical.feet() || offset >= bounds.ceiling.unwrap_or(f32::INFINITY) {
+            if offset <= feet || offset >= bounds.ceiling.unwrap_or(f32::INFINITY) {
                 continue;
             }
             let d = [wall.b[0] - wall.a[0], wall.b[1] - wall.a[1]];
@@ -2572,6 +2638,88 @@ impl Session {
                 })
             })
             .collect();
+        let displacement = self
+            .wind
+            .displacement(self.world.player.position, DT)
+            .unwrap_or([0.0, 0.0]);
+        // Test the actual attempted move with the candidate platform removed;
+        // walls and all other objects still constrain the probe. Pull only if
+        // the player can reach its side and the complete body fits above it.
+        for object in self.processes.objects() {
+            let Some(top) = object_platform_top(
+                self.object_heights.as_ref(),
+                self.scripted_objects.as_ref(),
+                &self.processes,
+                object,
+                self.vertical.config().body_height,
+            ) else {
+                continue;
+            };
+            if top <= self.vertical.feet()
+                || top - self.vertical.feet() > 0.4
+                || !object_touches_player(object, self.world.player.position, 0.06)
+            {
+                continue;
+            }
+            let mut blockers = circles.clone();
+            for other in self
+                .processes
+                .objects()
+                .filter(|other| other.cell != object.cell)
+            {
+                if object_blocks_height(
+                    self.object_heights.as_ref(),
+                    &self.processes,
+                    other,
+                    self.vertical.feet(),
+                    self.vertical.head(),
+                    self.vertical.head(),
+                ) {
+                    blockers.push(CollisionCircle {
+                        center: other.position,
+                        radius: other.blocking_radius,
+                    });
+                }
+            }
+            let mut probe = self.world.clone();
+            if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
+                probe.step_with_external_static_sides(
+                    input.movement,
+                    DT,
+                    &blockers,
+                    displacement,
+                    self.processes.static_wall_mask(),
+                );
+            } else {
+                probe.step_with_external(input.movement, DT, &blockers, displacement);
+            }
+            let p = self.world.player.position;
+            let old = (p[0] - object.position[0]).hypot(p[1] - object.position[1]);
+            let q = probe.player.position;
+            let new = (q[0] - object.position[0]).hypot(q[1] - object.position[1]);
+            if new >= old || !object_touches_player(object, q, 0.0) {
+                continue;
+            }
+            let blocked_above = self
+                .processes
+                .objects()
+                .filter(|other| other.cell != object.cell)
+                .any(|other| {
+                    object_touches_player(other, q, 0.0)
+                        && object_blocks_height(
+                            self.object_heights.as_ref(),
+                            &self.processes,
+                            other,
+                            top + 1e-5,
+                            top + self.vertical.config().body_height,
+                            top + self.vertical.config().body_height,
+                        )
+                });
+            let candidate_ceiling = self.player_bounds_at_position(q, top).ceiling;
+            if !blocked_above && self.vertical.pull_up(top, candidate_ceiling, DT) {
+                break;
+            }
+        }
         // Only opt-in, live, represented objects have a process-owned pose.
         // Radii are provisional circles; optional mesh heights filter
         // vertically separated objects, with conservative unknown fallback.
@@ -2579,6 +2727,17 @@ impl Session {
             self.processes
                 .objects()
                 .filter(|object| {
+                    if object_platform_top(
+                        self.object_heights.as_ref(),
+                        self.scripted_objects.as_ref(),
+                        &self.processes,
+                        object,
+                        self.vertical.config().body_height,
+                    )
+                    .is_some_and(|top| self.vertical.feet() >= top - 1e-5)
+                    {
+                        return false;
+                    }
                     object_blocks_height(
                         self.object_heights.as_ref(),
                         &self.processes,
@@ -2593,10 +2752,6 @@ impl Session {
                     radius: object.blocking_radius,
                 }),
         );
-        let displacement = self
-            .wind
-            .displacement(self.world.player.position, DT)
-            .unwrap_or([0.0, 0.0]);
         if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
             self.world.step_with_external_static_sides(
                 input.movement,
@@ -2681,9 +2836,10 @@ impl Session {
                 };
         }
         // Teleport after movement and before pickup, floor links and combat.
-        // Destination clearance is conservative and uses provisional flat floors.
+        // Destination clearance uses known platform tops and conservative
+        // fallback for missing geometry; room and actor bounds are provisional.
         if let Some((definitions, state)) = &mut self.teleports {
-            let mut obstacles: Vec<CollisionCircle> = self
+            let actors: Vec<CollisionCircle> = self
                 .actors
                 .actors
                 .iter()
@@ -2704,30 +2860,57 @@ impl Session {
                     })
                 })
                 .collect();
-            let destination_head = self.vertical.config().body_height;
-            obstacles.extend(
-                self.processes
-                    .objects()
-                    .filter(|object| {
-                        object_blocks_height(
-                            self.object_heights.as_ref(),
-                            &self.processes,
-                            object,
-                            0.0,
-                            destination_head,
-                            destination_head,
-                        )
-                    })
-                    .map(|object| CollisionCircle {
-                        center: object.position,
-                        radius: object.blocking_radius,
-                    }),
-            );
+            let body_height = self.vertical.config().body_height;
             let world = &self.world;
             let base = &self.base_wall_blocking;
             let elevations = &self.wall_elevations;
+            let mut destination_floor = 0.0_f32;
             let outcome = state.tick(definitions, world.player.position, |destination| {
                 const RADIUS: f32 = 0.18;
+                for object in self.processes.objects() {
+                    if object_touches_player(object, destination, 0.0) {
+                        if let Some(top) = object_platform_top(
+                            self.object_heights.as_ref(),
+                            self.scripted_objects.as_ref(),
+                            &self.processes,
+                            object,
+                            body_height,
+                        ) {
+                            destination_floor = destination_floor.max(top);
+                        }
+                    }
+                }
+                let destination_head = destination_floor + body_height;
+                let mut obstacles = actors;
+                obstacles.extend(
+                    self.processes
+                        .objects()
+                        .filter(|object| {
+                            if object_platform_top(
+                                self.object_heights.as_ref(),
+                                self.scripted_objects.as_ref(),
+                                &self.processes,
+                                object,
+                                body_height,
+                            )
+                            .is_some_and(|top| top <= destination_floor + 1e-5)
+                            {
+                                return false;
+                            }
+                            object_blocks_height(
+                                self.object_heights.as_ref(),
+                                &self.processes,
+                                object,
+                                destination_floor + 1e-5,
+                                destination_head,
+                                destination_head,
+                            )
+                        })
+                        .map(|object| CollisionCircle {
+                            center: object.position,
+                            radius: object.blocking_radius,
+                        }),
+                );
                 destination
                     .iter()
                     .all(|v| *v >= RADIUS && *v <= 64.0 - RADIUS)
@@ -2742,8 +2925,9 @@ impl Session {
                 Ok(Some(event)) => {
                     self.world.player.position = event.destination;
                     self.world.player.angle = event.angle_radians;
-                    self.vertical = VerticalState::with_config(0.0, self.vertical.config())
-                        .expect("existing vertical configuration is valid");
+                    self.vertical =
+                        VerticalState::with_config(destination_floor, self.vertical.config())
+                            .expect("existing vertical configuration is valid");
                     self.sync_wall_blocking();
                     // A teleport is a new floor entry, even when both positions
                     // happen to be in the same cell. No source floor is fired.
@@ -3713,6 +3897,180 @@ mod tests {
         });
         session.set_mission(MissionPlan::parse(&script, text));
         session
+    }
+
+    fn platform_session(ceiling: bool) -> Session {
+        use crate::object_heights::{HeightBounds, ObjectHeightCatalog};
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let mut session = mission_session("");
+        session.world.player.position = [0.45, 1.0];
+        let definition = |name: &str| ObjectDefinition {
+            collision_radius: 77,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition("platform.3o"), definition("ceiling.3o")],
+        };
+        let instance = |cell, index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index: index,
+            grid_cell: cell,
+            position: [1.0, 1.0],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 7,
+            extra: 0,
+            size: 0,
+        };
+        let mut instances = vec![instance([1, 1], 0)];
+        if ceiling {
+            instances.push(instance([2, 1], 1));
+        }
+        let mut cells = [0u8; 4096];
+        let mut poses = Vec::new();
+        for object in &instances {
+            let cell = [object.grid_cell[0] as u8, object.grid_cell[1] as u8];
+            cells[usize::from(cell[0]) * 64 + usize::from(cell[1])] =
+                163 + object.definition_index as u8;
+            poses.push(ProcessObject {
+                cell,
+                position: object.position,
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 77.0 / 256.0,
+            });
+        }
+        let script = Script::default();
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        session.set_scripted_objects(ScriptedObjects::new(
+            ObjectStates::new(&instances, &defs).unwrap(),
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        let mut heights = ObjectHeightCatalog::new();
+        heights.set(163, HeightBounds::new(0.0, 0.7).unwrap());
+        heights.set(164, HeightBounds::new(1.5, 2.0).unwrap());
+        assert!(session.set_object_heights(heights, cells));
+        session
+    }
+
+    #[test]
+    fn player_pulls_onto_reachable_platform_and_falls_when_leaving() {
+        let mut session = platform_session(false);
+        let mut max_feet = 0.0_f32;
+        for tick in 0..120 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                jump: tick == 0,
+                ..Default::default()
+            });
+            max_feet = max_feet.max(session.vertical.feet());
+        }
+        assert!(
+            (max_feet - 0.7).abs() < 1e-5,
+            "platform not climbed: {max_feet}"
+        );
+        assert!(session.world.player.position[0] > 1.5);
+        assert_eq!(session.vertical.feet(), 0.0);
+    }
+
+    #[test]
+    fn platform_pull_does_not_ignore_overhead_object() {
+        let mut session = platform_session(true);
+        for tick in 0..90 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                jump: tick == 0,
+                ..Default::default()
+            });
+        }
+        assert!(
+            session.world.player.position[0] < 0.55,
+            "no headroom: {:?}",
+            session.world.player.position
+        );
+        assert!(session.vertical.feet() < 0.7);
+    }
+
+    #[test]
+    fn platform_pull_does_not_ignore_raised_wall_at_destination() {
+        let mut session = platform_session(false);
+        session.world.walls.push(crate::world::Wall {
+            a: [0.52, 0.0],
+            b: [0.52, 2.0],
+            texture: 1,
+            blocks_movement: false,
+            cell: Some([0, 1]),
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(96.0);
+        for tick in 0..90 {
+            session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                jump: tick == 0,
+                ..Default::default()
+            });
+        }
+        assert!(session.world.player.position[0] < 0.55);
+        assert!(session.vertical.feet() < 0.7);
+    }
+
+    #[test]
+    fn teleport_platform_requires_complete_body_clearance() {
+        let rows = crate::teleport::parse("#teleports\ntcenter 0 0 256 256 0\n#end\n").unwrap();
+        for blocked in [false, true] {
+            let mut session = platform_session(blocked);
+            session.world.player.position = [0.5, 0.5];
+            session.set_teleports(rows.clone(), RearmPolicy::AfterLeavingSources);
+            let events = session.step(SessionInput::default());
+            if blocked {
+                assert!(matches!(
+                    events.teleport_failure,
+                    Some(TeleportFailure::DestinationBlocked { .. })
+                ));
+                assert_eq!(session.world.player.position, [0.5, 0.5]);
+                assert_eq!(session.vertical.feet(), 0.0);
+            } else {
+                assert!(events.teleport.is_some());
+                assert_eq!(session.world.player.position, [1.0, 1.0]);
+                assert!((session.vertical.feet() - 0.7).abs() < 1e-5);
+            }
+        }
     }
 
     fn push_session(property: &str, action: &str, pin: bool) -> Session {

@@ -1,7 +1,7 @@
 //! Independent player vertical motion, using provisional reconstruction values.
 //!
 //! Units are map tiles and seconds. The session supplies the relevant floor
-//! and ceiling planes; horizontal collision, jumping onto objects, moving-wall
+//! and ceiling planes; horizontal collision, platform selection, moving-wall
 //! crushing, and input bindings are separate responsibilities.
 use std::error::Error;
 use std::fmt;
@@ -9,6 +9,8 @@ use std::fmt;
 const MAX_SUBSTEP: f32 = 1.0 / 120.0;
 const MAX_DELTA: f32 = 1.0;
 const GROUND_EPSILON: f32 = 0.00001;
+const PLATFORM_PULL_DISTANCE: f32 = 0.4;
+const PLATFORM_PULL_SPEED: f32 = 2.5;
 
 /// Values based on the published PanzerChasm reconstruction. They are not
 /// calibrated against this installation; the reference marks jump speed TODO.
@@ -207,6 +209,26 @@ impl VerticalState {
         self.config
     }
 
+    /// Pull the feet toward an accessible nearby platform top. The caller
+    /// must first confirm horizontal contact and supply current headroom.
+    /// Returns false without changes when the top is too high or obstructed.
+    pub fn pull_up(&mut self, top: f32, ceiling: Option<f32>, dt: f32) -> bool {
+        if !top.is_finite()
+            || !dt.is_finite()
+            || !(0.0..=MAX_DELTA).contains(&dt)
+            || dt == 0.0
+            || top <= self.feet
+            || top - self.feet > PLATFORM_PULL_DISTANCE
+            || ceiling.is_some_and(|z| !z.is_finite() || top + self.config.body_height > z)
+        {
+            return false;
+        }
+        self.feet = (self.feet + PLATFORM_PULL_SPEED * dt).min(top);
+        self.velocity = 0.0;
+        self.grounded = false;
+        true
+    }
+
     /// Advance by a simulation delta, subdividing to handle ceiling/floor hits.
     /// `jump_pressed` is a press edge, not a held input. An airborne press is
     /// ignored; no buffering or automatic repeat is applied. Bounds must be
@@ -300,6 +322,21 @@ impl VerticalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn platform_pull_requires_reachable_top_and_clear_headroom() {
+        let mut state = VerticalState::new(0.0).unwrap();
+        assert!(!state.pull_up(0.875, Some(2.0), 1.0 / 60.0));
+        state.step(0.2, true, VerticalBounds::flat_room()).unwrap();
+        assert!(!state.pull_up(0.7, Some(1.5), 1.0 / 60.0));
+        let before = state.feet();
+        assert!(state.pull_up(0.7, Some(2.0), 1.0 / 60.0));
+        assert!((state.feet() - before - 2.5 / 60.0).abs() < 1e-5);
+        for _ in 0..20 {
+            state.pull_up(0.7, Some(2.0), 1.0 / 60.0);
+        }
+        assert_eq!(state.feet(), 0.7);
+        assert_eq!(state.velocity(), 0.0);
+    }
     #[test]
     fn snapshot_restores_jump_and_rejects_impossible_state_atomically() {
         let bounds = VerticalBounds::flat_room();

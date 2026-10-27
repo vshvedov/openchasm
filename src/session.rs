@@ -1,6 +1,6 @@
 //! Fixed-tick game session: simulation state independent of presentation and transport.
 use crate::actors::{ActorDefinitions, ActorMapping, ActorState};
-use crate::ai::{ActorCollisionSides, EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
+use crate::ai::{ActorCollisionSides, EnemyAi, EnemyAttack, EnemyAttackKind, Mode, SightCylinder};
 use crate::ambient::AmbientGrid;
 use crate::combat::{
     self, Combat, EnemyShotContext, EnemyShotHit, EnemyShotTarget, FireResult, RocketDefinitions,
@@ -344,6 +344,8 @@ pub struct Session {
     pub world: World,
     wall_collision_mode: WallCollisionMode,
     prepared_motion: bool,
+    object_sight: bool,
+    difficulty: Difficulty,
     teleports: Option<(Vec<Teleport>, TeleportState)>,
     object_heights: Option<SessionObjectHeights>,
     pub vertical: VerticalState,
@@ -442,6 +444,8 @@ pub struct SessionSnapshotCapabilities {
     pub source_lights: bool,
     #[serde(default)]
     pub prepared_motion: bool,
+    #[serde(default)]
+    pub object_sight: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionSnapshotError {
@@ -457,6 +461,7 @@ impl Session {
         SessionSnapshotCapabilities {
             wall_collision_mode: self.wall_collision_mode,
             prepared_motion: self.prepared_motion,
+            object_sight: self.object_sight,
             wall_materials: self.wall_materials.is_some(),
             teleports: self.teleports.is_some(),
             object_heights: self.object_heights.is_some(),
@@ -989,6 +994,8 @@ impl Session {
             world: setup.world,
             wall_collision_mode: WallCollisionMode::TwoSided,
             prepared_motion: false,
+            object_sight: false,
+            difficulty: setup.difficulty,
             teleports: None,
             object_heights: None,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
@@ -1027,6 +1034,15 @@ impl Session {
     /// Configure before making a restart or durable snapshot.
     pub fn set_prepared_motion(&mut self, enabled: bool) {
         self.prepared_motion = enabled;
+    }
+    /// Opt into provisional reference-style model cylinders for enemy sight.
+    /// Configure before taking restart or durable snapshots.
+    pub fn set_object_sight(&mut self, enabled: bool) -> bool {
+        if enabled && (self.scripted_objects.is_none() || self.objects.is_none()) {
+            return false;
+        }
+        self.object_sight = enabled;
+        true
     }
     /// Opt into model-height collision using original x-major map cells.
     /// Missing heights remain blocking. Call before the restart snapshot.
@@ -3069,7 +3085,79 @@ impl Session {
         let blocks_shots = |wall: &crate::world::Wall| {
             Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0)
         };
-        events.enemy_attacks = if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
+        let sight_models = if self.object_sight {
+            let hidden: BTreeSet<_> = self.game.pickups.hidden_cells().collect();
+            let mask = match self.difficulty {
+                Difficulty::Easy => 1,
+                Difficulty::Normal => 2,
+                Difficulty::Hard => 4,
+            };
+            self.scripted_objects
+                .as_ref()
+                .map(|scripted| {
+                    scripted
+                        .states
+                        .iter()
+                        .filter_map(|state| {
+                            let cell = state.placement.grid_cell;
+                            if state.placement.difficulty_flags & mask == 0
+                                || hidden.contains(&cell)
+                                || self
+                                    .objects
+                                    .as_ref()
+                                    .and_then(|objects| objects.is_active(cell))
+                                    == Some(false)
+                            {
+                                return None;
+                            }
+                            let def = scripted
+                                .definitions
+                                .level_objects
+                                .get(usize::from(state.raw_type.checked_sub(163)?))?;
+                            let radius = def.collision_radius as f32 / 256.0;
+                            if radius <= 0.0 {
+                                return None;
+                            }
+                            let pose = self.processes.object_pose([cell[0] as u8, cell[1] as u8]);
+                            let position =
+                                pose.map_or(state.placement.position, |object| object.position);
+                            let elevation = pose.map_or(0.0, |object| object.elevation_raw / 64.0);
+                            let vertical = self
+                                .object_heights
+                                .as_ref()
+                                .and_then(|heights| heights.catalog.get(state.raw_type))
+                                .map(|bounds| [bounds.bottom + elevation, bounds.top + elevation])
+                                .filter(|bounds| {
+                                    bounds.iter().all(|value| value.is_finite())
+                                        && bounds[0] <= bounds[1]
+                                })
+                                .unwrap_or([-4096.0, 4096.0]);
+                            Some(SightCylinder {
+                                center: position,
+                                radius,
+                                vertical,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        events.enemy_attacks = if self.object_sight {
+            self.ai.tick_with_object_sight(
+                &mut self.actors,
+                &self.actor_definitions,
+                &self.rockets,
+                &self.world,
+                &blocks_shots,
+                &enemy_objects,
+                (self.wall_collision_mode == WallCollisionMode::AuthoredSides)
+                    .then(|| self.processes.static_wall_mask()),
+                &sight_models,
+                self.vertical.feet() + 0.5,
+            )
+        } else if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
             self.ai.tick_with_authored_sides(
                 &mut self.actors,
                 &self.actor_definitions,
@@ -4626,6 +4714,83 @@ mod tests {
     }
 
     #[test]
+    fn object_sight_uses_live_height_and_disabled_state() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        let mut session = height_combat_fixture();
+        assert!(!session.set_object_sight(true));
+        let def = |name: &str| ObjectDefinition {
+            collision_radius: 40,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 1,
+            break_limit: 100,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![def("roof.3o"), def("floor.3o")],
+        };
+        let instance = |x, definition_index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index,
+            grid_cell: [x, 0],
+            position: [x as f32 + 0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 7,
+            extra: 0,
+            size: 0,
+        };
+        let instances = [instance(2, 0), instance(3, 1)];
+        let script = Script::default();
+        session.set_scripted_objects(ScriptedObjects::new(
+            ObjectStates::new(&instances, &defs).unwrap(),
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        session.actor_definitions.entries.push(ActorDefinition {
+            model_name: "a.car".into(),
+            wall_radius: 32,
+            actor_radius: 32,
+            speed: 0,
+            rotation_speed: 0,
+            health: 100,
+            kick: 0,
+            rocket: -1,
+            separation_limit: 0,
+            extra_fields: vec![],
+            raw_line: String::new(),
+        });
+        session.actors.actors.push(Actor {
+            source_index: 7,
+            definition_index: 0,
+            placement: Monster {
+                position: [1152, 128],
+                id: 101,
+                angle: 0,
+                flags: 2,
+            },
+            position: [4.5, 0.5],
+            angle_radians: 0.0,
+            health: 100,
+        });
+        session.ai = EnemyAi::new(&session.actors, Difficulty::Normal);
+        assert!(session.set_object_sight(true));
+        session.step(SessionInput::default());
+        assert_eq!(session.ai.mode(7), Some(Mode::Idle));
+        session.objects.as_mut().unwrap().set_enabled([3, 0], false);
+        session.step(SessionInput::default());
+        assert_eq!(session.ai.mode(7), Some(Mode::Chasing));
+    }
+
+    #[test]
     fn pitched_hitscan_respects_model_heights_and_room_planes() {
         let mut straight = height_combat_fixture();
         let hit = straight.step(SessionInput {
@@ -4644,7 +4809,10 @@ mod tests {
         });
         assert!(matches!(
             miss.shot,
-            Some(FireResult::Fired(ShotImpact::Miss))
+            Some(FireResult::Fired(ShotImpact::Plane {
+                plane: combat::ShotPlane::Ceiling,
+                ..
+            }))
         ));
         assert!((upward.pitch() - 0.3).abs() < 1e-6);
         let mut down = height_combat_fixture();
@@ -4655,7 +4823,10 @@ mod tests {
         });
         assert!(matches!(
             miss.shot,
-            Some(FireResult::Fired(ShotImpact::Miss))
+            Some(FireResult::Fired(ShotImpact::Plane {
+                plane: combat::ShotPlane::Floor,
+                ..
+            }))
         ));
     }
 

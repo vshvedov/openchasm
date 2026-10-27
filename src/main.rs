@@ -346,7 +346,7 @@ fn parse_options(
 }
 
 /// Increment whenever simulation rules or startup interpretation changes.
-const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v2";
+const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v3";
 
 fn finish_level_fingerprint(
     mut trace: content::ResourceTrace,
@@ -647,6 +647,9 @@ fn play(
         ));
         if let Some(scripted) = scripted {
             session.set_scripted_objects(scripted);
+        }
+        if !session.set_object_sight(true) {
+            eprintln!("object sight unavailable: object state was not configured");
         }
         session.set_mission(openchasm::mission::MissionPlan::parse(
             &script,

@@ -80,6 +80,72 @@ pub struct ActorCollisionSides<'a> {
 struct ActorCollision<'a> {
     objects: &'a [CollisionCircle],
     static_walls: Option<&'a [bool]>,
+    sight: Option<&'a [SightCylinder]>,
+    player_sight_height: f32,
+}
+
+/// Level model sight cylinder, in absolute map-tile units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SightCylinder {
+    pub center: [f32; 2],
+    pub radius: f32,
+    pub vertical: [f32; 2],
+}
+
+fn model_sight_clear(
+    from: [f32; 2],
+    to: [f32; 2],
+    target_z: f32,
+    models: &[SightCylinder],
+) -> bool {
+    if !from.iter().chain(&to).all(|value| value.is_finite()) || !target_z.is_finite() {
+        return false;
+    }
+    let d = sub(to, from);
+    let dz = target_z - 0.5;
+    !models.iter().any(|model| {
+        if model.radius <= 0.0 {
+            return false;
+        }
+        if !model.center.iter().all(|v| v.is_finite())
+            || !model.radius.is_finite()
+            || !model.vertical.iter().all(|v| v.is_finite())
+            || model.vertical[0] > model.vertical[1]
+        {
+            return true;
+        }
+        let rel = sub(from, model.center);
+        let a = dot(d, d);
+        let b = dot(rel, d);
+        let c = dot(rel, rel) - model.radius * model.radius;
+        let (near, far) = if a <= 1e-12 {
+            if c > 0.0 {
+                return false;
+            }
+            (0.0, 1.0)
+        } else {
+            let disc = b * b - a * c;
+            if !disc.is_finite() {
+                return true;
+            }
+            if disc < 0.0 {
+                return false;
+            }
+            let root = disc.sqrt();
+            ((-b - root) / a, (-b + root) / a)
+        };
+        let near = near.max(0.0);
+        let far = far.min(1.0);
+        near <= far
+            && crate::combat::clip_aim_interval(
+                near,
+                far,
+                0.5,
+                dz,
+                Some((model.vertical[0], model.vertical[1])),
+            )
+            .is_some()
+    })
 }
 
 /// Per-actor AI state remains separate from map definitions and rendering.
@@ -476,6 +542,8 @@ impl EnemyAi {
             Some(ActorCollision {
                 objects,
                 static_walls: None,
+                sight: None,
+                player_sight_height: 0.5,
             }),
         )
     }
@@ -500,6 +568,37 @@ impl EnemyAi {
             Some(ActorCollision {
                 objects: sides.objects,
                 static_walls: Some(sides.static_walls),
+                sight: None,
+                player_sight_height: 0.5,
+            }),
+        )
+    }
+
+    /// Opt into reference-style level-model sight cylinders independently of movement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_with_object_sight(
+        &mut self,
+        actors: &mut ActorState,
+        definitions: &ActorDefinitions,
+        rockets: &RocketDefinitions,
+        world: &World,
+        blocks_shots: &dyn Fn(&Wall) -> bool,
+        objects: &[CollisionCircle],
+        static_walls: Option<&[bool]>,
+        sight: &[SightCylinder],
+        player_sight_height: f32,
+    ) -> Vec<EnemyAttack> {
+        self.tick_inner(
+            actors,
+            definitions,
+            Some(rockets),
+            world,
+            blocks_shots,
+            Some(ActorCollision {
+                objects,
+                static_walls,
+                sight: Some(sight),
+                player_sight_height,
             }),
         )
     }
@@ -585,7 +684,17 @@ impl EnemyAi {
             // of walk collision and of whether the wall is drawn transparent.
             let sees_player = !(self.player_invisible && brain.mode == Mode::Idle)
                 && distance <= SIGHT_RANGE
-                && shot_clear(actor.position, target, &world.walls, blocks_shots);
+                && shot_clear(actor.position, target, &world.walls, blocks_shots)
+                && collision.is_none_or(|config| {
+                    config.sight.is_none_or(|models| {
+                        model_sight_clear(
+                            actor.position,
+                            target,
+                            config.player_sight_height,
+                            models,
+                        )
+                    })
+                });
             if sees_player {
                 brain.last_seen = Some(target);
             }
@@ -906,6 +1015,83 @@ mod tests {
         assert!(ai.tick(&mut state, &defs, &world).is_empty());
         assert_eq!(ai.mode(0), Some(Mode::Chasing));
         assert!(state.actors[0].position[0] > 0.0);
+    }
+    #[test]
+    fn opt_in_model_sight_uses_height_and_rechecks_attacks() {
+        let (mut state, defs) = actor(100, 7);
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let w = world([0.6, 0.0], vec![]);
+        let mut cover = SightCylinder {
+            center: [0.3, 0.0],
+            radius: 0.08,
+            vertical: [0.0, 1.0],
+        };
+        let attacks = ai.tick_with_object_sight(
+            &mut state,
+            &defs,
+            &rockets(),
+            &w,
+            &|_| true,
+            &[],
+            None,
+            &[cover],
+            0.5,
+        );
+        assert!(attacks.is_empty());
+        assert_eq!(ai.mode(0), Some(Mode::Idle));
+        cover.vertical = [2.0, 3.0];
+        assert_eq!(
+            ai.tick_with_object_sight(
+                &mut state,
+                &defs,
+                &rockets(),
+                &w,
+                &|_| true,
+                &[],
+                None,
+                &[cover],
+                0.5
+            )
+            .len(),
+            1
+        );
+        assert!(model_sight_clear(
+            [0.0, 0.0],
+            [3.0, 0.0],
+            0.5,
+            &[SightCylinder {
+                center: [1.0, 0.0],
+                radius: 0.0,
+                vertical: [0.0, 1.0]
+            }]
+        ));
+        // Beginning inside a cylinder and exact tangencies both occlude.
+        let solid = SightCylinder {
+            center: [0.0, 0.0],
+            radius: 0.5,
+            vertical: [0.0, 1.0],
+        };
+        assert!(!model_sight_clear([0.0, 0.0], [3.0, 0.0], 0.5, &[solid]));
+        assert!(!model_sight_clear(
+            [0.0, 0.5],
+            [3.0, 0.5],
+            0.5,
+            &[SightCylinder {
+                center: [1.0, 0.0],
+                ..solid
+            }]
+        ));
+        assert!(!model_sight_clear([0.0, 0.0], [0.0, 0.0], 0.5, &[solid]));
+        assert!(!model_sight_clear(
+            [0.0, 0.0],
+            [3.0, 0.0],
+            2.5,
+            &[SightCylinder {
+                center: [1.0, 0.0],
+                radius: 0.4,
+                vertical: [1.0, 1.2]
+            }]
+        ));
     }
     #[test]
     fn opaque_walls_block_sight_and_barriers_block_movement() {

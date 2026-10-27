@@ -32,16 +32,11 @@ impl TrailSnapshot {
                 .iter()
                 .filter_map(|projectile| {
                     let z = session.projectile_height(projectile.id)?;
-                    let pitch = session.projectile_pitch(projectile.id)?;
-                    let horizontal = projectile.velocity[0].hypot(projectile.velocity[1]);
+                    let vertical = session.projectile_vertical_velocity(projectile.id)?;
                     let pose = Pose {
                         rocket: projectile.rocket_id,
                         position: [projectile.position[0], projectile.position[1], z],
-                        velocity: [
-                            projectile.velocity[0],
-                            projectile.velocity[1],
-                            horizontal * pitch.tan(),
-                        ],
+                        velocity: [projectile.velocity[0], projectile.velocity[1], vertical],
                         age: projectile.elapsed_seconds(),
                     };
                     Some((projectile.id, pose))
@@ -253,6 +248,22 @@ mod tests {
             vec![Motion::Segment(2, 3, [1., 1., 1.], [1., 2., 1.])]
         );
     }
+    #[test]
+    fn newly_spawned_vertical_trail_uses_vertical_velocity() {
+        for sign in [-1.0, 1.0] {
+            let after = snapshot(&[(2, pose([1., 2., 1.], [0., 0., sign * 10.], 0.01))]);
+            assert_eq!(
+                collect(&TrailSnapshot::default(), &after, &SessionEvents::default()),
+                vec![Motion::Segment(
+                    2,
+                    3,
+                    [1., 2., 1. - sign * 0.1],
+                    [1., 2., 1.]
+                )],
+            );
+        }
+    }
+
     #[test]
     fn new_terminal_without_incoming_pose_does_not_invent_a_path() {
         let mut events = SessionEvents::default();

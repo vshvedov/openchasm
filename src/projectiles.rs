@@ -477,7 +477,19 @@ impl ProjectileSystem {
                 }
             }
             let length = delta[0].hypot(delta[1]);
-            if length > 1e-8 {
+            if length == 0.0 {
+                if let Some(hit) = context.objects.and_then(|objects| {
+                    crate::combat::vertical_object_hit(
+                        objects,
+                        p.position,
+                        p.radius,
+                        1.0,
+                        |cell, raw, near, far| clip(near, far, object_bounds(cell, raw)),
+                    )
+                }) {
+                    consider(hit.distance, ImpactTarget::Object { cell: hit.cell });
+                }
+            } else if length > 1e-8 {
                 if let Some(hit) = context.objects.and_then(|objects| {
                     objects.raycast_intervals(
                         p.position,
@@ -700,7 +712,7 @@ impl ProjectileSystem {
             return false;
         }
         let speed = projectile.velocity[0].hypot(projectile.velocity[1]);
-        if !speed.is_finite() || speed < 1e-6 {
+        if !speed.is_finite() {
             return false;
         }
         let mut outward = [
@@ -710,11 +722,15 @@ impl ProjectileSystem {
         let distance = outward[0].hypot(outward[1]);
         if distance > 1e-6 {
             outward = [outward[0] / distance, outward[1] / distance];
-        } else {
+        } else if speed > 0.0 {
             outward = [
                 -projectile.velocity[0] / speed,
                 -projectile.velocity[1] / speed,
             ];
+        } else {
+            // A vertical shot has no XY direction to reflect. Its host-owned
+            // vertical velocity remains unchanged, as for other reflections.
+            outward = [0.0, 0.0];
         }
         projectile.velocity = [outward[0] * speed, outward[1] * speed];
         projectile.reflected_from = Some(projectile.owner);
@@ -788,9 +804,7 @@ impl ProjectileSystem {
     /// vertical speed for the host's height state. Existing flight is unchanged
     /// if the id/pitch is invalid. The caller retains this value on reflection.
     pub fn apply_launch_pitch(&mut self, id: u64, pitch: f32) -> Option<f32> {
-        if !pitch.is_finite() || pitch.abs() >= std::f32::consts::FRAC_PI_2 {
-            return None;
-        }
+        let [cos, sin] = crate::combat::pitch_components(pitch)?;
         let projectile = self
             .projectiles
             .iter_mut()
@@ -799,7 +813,6 @@ impl ProjectileSystem {
         if !speed.is_finite() || speed <= 0.0 {
             return None;
         }
-        let (sin, cos) = pitch.sin_cos();
         projectile.velocity[0] *= cos;
         projectile.velocity[1] *= cos;
         Some(speed * sin)
@@ -1083,7 +1096,13 @@ mod tests {
         let (mut rockets, ..) = setup();
         rockets.0[0].raw_fields.resize(11, 0);
         rockets.0[0].raw_fields[10] = 1;
-        for pitch in [-1.0_f32, 0.0, 1.0] {
+        for pitch in [
+            -std::f32::consts::FRAC_PI_2,
+            -1.0_f32,
+            0.0,
+            1.0,
+            std::f32::consts::FRAC_PI_2,
+        ] {
             let mut system = ProjectileSystem::new();
             let id = system
                 .spawn(launch(Owner::Player, [0.0, 0.0], [1.0, 0.0]), &rockets)
@@ -1091,13 +1110,57 @@ mod tests {
             let before = system.active()[0].velocity;
             assert!(system.apply_launch_pitch(id, f32::NAN).is_none());
             assert!(system
-                .apply_launch_pitch(id, std::f32::consts::FRAC_PI_2)
+                .apply_launch_pitch(id, std::f32::consts::FRAC_PI_2 + 0.001)
                 .is_none());
             assert_eq!(system.active()[0].velocity, before);
             let vz = system.apply_launch_pitch(id, pitch).unwrap();
             let shot = &system.active()[0];
             assert!((shot.velocity[0].hypot(shot.velocity[1]).hypot(vz) - FAST_SPEED).abs() < 1e-4);
             assert!((vz - FAST_SPEED * pitch.sin()).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn vertical_launch_hits_planes_without_xy_motion_and_roundtrips() {
+        let (rockets, defs, actors, world) = setup();
+        for sign in [-1.0, 1.0] {
+            let mut system = ProjectileSystem::new();
+            let id = system
+                .spawn(launch(Owner::Player, [0.0, 0.0], [0.6, -0.8]), &rockets)
+                .unwrap();
+            let vz = system
+                .apply_launch_pitch(id, sign * std::f32::consts::FRAC_PI_2)
+                .unwrap();
+            assert_eq!(system.active()[0].velocity, [0.0, 0.0]);
+            assert!((vz - sign * DEFAULT_SPEED).abs() < 1e-6);
+            let hit = system
+                .trace_next_3d(
+                    1.0,
+                    TraceContext {
+                        world: &world,
+                        actors: &actors,
+                        definitions: &defs,
+                        objects: None,
+                    },
+                    &BTreeSet::new(),
+                    |_| (1.0, vz),
+                    |_| Some((0.0, 2.0)),
+                    |_, _| None,
+                    (0.0, 1.0),
+                )
+                .unwrap();
+            assert_eq!(hit.target, ImpactTarget::Plane);
+            assert_eq!(hit.position, [0.0, 0.0]);
+            assert!((hit.time - 1.0 / DEFAULT_SPEED).abs() < 1e-6);
+            let shot = system.take(id).unwrap();
+            assert!(system.reflect_from_player(shot, [0.0, 0.0]));
+            let snapshot = system.snapshot().unwrap();
+            let mut restored = ProjectileSystem::new();
+            restored
+                .restore_with_vertical(&snapshot, &rockets, &actors, &[(id, vz)])
+                .unwrap();
+            assert_eq!(restored.snapshot().unwrap(), snapshot);
+            assert!(restored.restore(&snapshot, &rockets, &actors).is_err());
         }
     }
 

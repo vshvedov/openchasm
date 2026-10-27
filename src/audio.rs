@@ -964,6 +964,7 @@ mod tests {
         events.shot = Some(FireResult::Fired(ShotImpact::Wall {
             wall_index: 0,
             distance: 1.0,
+            height: 1.0,
         }));
         let impact = |target, rocket_id| Impact {
             projectile_id: 1,
@@ -989,11 +990,13 @@ mod tests {
         events.shot = Some(FireResult::Fired(ShotImpact::Plane {
             plane: openchasm::combat::ShotPlane::Floor,
             distance: 1.0,
+            height: 1.0,
         }));
         assert_eq!(gameplay_sound_ids(&events, 1), vec![31]);
         events.shot = Some(FireResult::Fired(ShotImpact::Wall {
             wall_index: 0,
             distance: 1.0,
+            height: 1.0,
         }));
         assert!(gameplay_sound_ids(&events, -1).is_empty());
         assert!(gameplay_sound_ids(&events, 21).is_empty());

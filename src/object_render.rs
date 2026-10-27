@@ -85,14 +85,19 @@ impl CameraView {
     pub fn project_x(width: usize, height: usize, side_over_depth: f32) -> f32 {
         width as f32 * 0.5 + Self::focal_length(height) * side_over_depth
     }
+    /// Software projection still shifts the horizon instead of rotating a 3D
+    /// camera. Bound its slope at the poles to keep rasterization finite and
+    /// preserve the up/down sign; this is not perspective-correct vertical look.
     pub fn horizon(self, height: usize) -> f32 {
-        let limit = std::f32::consts::FRAC_PI_2 * 0.65;
+        let limit = std::f32::consts::FRAC_PI_2;
         let pitch = if self.pitch.is_finite() {
             self.pitch.clamp(-limit, limit)
         } else {
             0.0
         };
-        height as f32 * 0.5 + Self::focal_length(height) * pitch.tan()
+        let [horizontal, vertical] = openchasm::combat::pitch_components(pitch).unwrap();
+        let slope = vertical / horizontal.max(1.0 / 64.0);
+        height as f32 * 0.5 + Self::focal_length(height) * slope
     }
 }
 
@@ -2250,6 +2255,32 @@ pub(crate) mod tests {
         };
         assert_eq!(invalid.horizon(400), 200.0);
     }
+    #[test]
+    fn horizon_shift_remains_finite_and_signed_at_vertical_poles() {
+        let mut camera = CameraView {
+            player: Player {
+                position: [0.0; 2],
+                angle: 0.0,
+            },
+            eye_height: 0.75,
+            pitch: 0.0,
+        };
+        for height in [0, 1, 400, 2160] {
+            for sign in [-1.0, 1.0] {
+                let mut previous = 0.0;
+                for angle in [0.0_f32, 1.1, 1.4, std::f32::consts::FRAC_PI_2] {
+                    camera.pitch = sign * angle;
+                    let horizon = camera.horizon(height);
+                    let shift = (horizon - height as f32 * 0.5) * sign;
+                    assert!(horizon.is_finite());
+                    assert!(shift >= previous);
+                    assert!(shift <= CameraView::focal_length(height) * 64.0 + 0.001);
+                    previous = shift;
+                }
+            }
+        }
+    }
+
     pub(crate) type RestoreTestEntry = (Option<[usize; 2]>, Option<usize>, [f32; 2], bool);
     pub(crate) fn restore_test_state(scene: &ObjectScene) -> Vec<RestoreTestEntry> {
         scene

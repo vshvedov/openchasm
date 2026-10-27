@@ -152,14 +152,26 @@ impl ImpactRenderer {
     /// Aim and projectile heights come from the authoritative session.
     pub fn consume(&mut self, events: &SessionEvents, camera: CameraView, rocket_id: usize) {
         if let Some(FireResult::Fired(shot)) = events.shot {
-            let (actor, distance) = match shot {
-                ShotImpact::Actor { distance, .. } => (true, distance),
-                ShotImpact::Wall { distance, .. }
-                | ShotImpact::Object { distance, .. }
-                | ShotImpact::Plane { distance, .. } => (false, distance),
-                _ => (false, f32::NAN),
+            let (actor, distance, height) = match shot {
+                ShotImpact::Actor {
+                    distance, height, ..
+                } => (true, distance, height),
+                ShotImpact::Wall {
+                    distance, height, ..
+                }
+                | ShotImpact::Object {
+                    distance, height, ..
+                }
+                | ShotImpact::Plane {
+                    distance, height, ..
+                } => (false, distance, height),
+                _ => (false, f32::NAN, f32::NAN),
             };
-            if distance.is_finite() && distance >= 0.0 && camera.player.angle.is_finite() {
+            if distance.is_finite()
+                && height.is_finite()
+                && distance >= 0.0
+                && camera.player.angle.is_finite()
+            {
                 if let Some(&(physical, blow)) = self.rockets.get(rocket_id) {
                     if !physical {
                         if let Some(kind) = impact_kind(actor, false, blow) {
@@ -169,7 +181,7 @@ impl ImpactRenderer {
                                 [
                                     camera.player.position[0] + cos * distance,
                                     camera.player.position[1] + sin * distance,
-                                    camera.eye_height + distance * camera.pitch.tan(),
+                                    height,
                                 ],
                             );
                         }
@@ -319,14 +331,17 @@ mod tests {
             raw_fields: vec![1],
         }]);
         let mut renderer = ImpactRenderer::load(&mut resources, &palette, &rockets);
-        for (plane, pitch) in [
-            (ShotPlane::Floor, -std::f32::consts::FRAC_PI_4),
-            (ShotPlane::Ceiling, std::f32::consts::FRAC_PI_4),
+        for (plane, pitch, distance, height) in [
+            (ShotPlane::Floor, -std::f32::consts::FRAC_PI_4, 1.0, 0.0),
+            (ShotPlane::Ceiling, std::f32::consts::FRAC_PI_4, 1.0, 2.0),
+            (ShotPlane::Floor, -std::f32::consts::FRAC_PI_2, 0.0, 0.0),
+            (ShotPlane::Ceiling, std::f32::consts::FRAC_PI_2, 0.0, 2.0),
         ] {
             let events = SessionEvents {
                 shot: Some(FireResult::Fired(ShotImpact::Plane {
                     plane,
-                    distance: 1.0,
+                    distance,
+                    height,
                 })),
                 ..Default::default()
             };
@@ -341,9 +356,11 @@ mod tests {
             renderer.consume(&events, camera, 0);
         }
         let positions = renderer.bullet.as_ref().unwrap().effect_positions();
-        assert_eq!(positions.len(), 2);
+        assert_eq!(positions.len(), 4);
         assert_eq!(positions[0], [2.0, 2.0, 0.0]);
         assert_eq!(positions[1], [2.0, 2.0, 2.0]);
-        assert_eq!(renderer.smoke.as_ref().unwrap().effect_count(), 6);
+        assert_eq!(positions[2], [1.0, 2.0, 0.0]);
+        assert_eq!(positions[3], [1.0, 2.0, 2.0]);
+        assert_eq!(renderer.smoke.as_ref().unwrap().effect_count(), 12);
     }
 }

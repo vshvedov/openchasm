@@ -46,8 +46,8 @@ pub struct LevelSetup {
     pub difficulty: Difficulty,
 }
 
-/// Matches the reconstruction's old-style camera pitch limit.
-pub const MAX_PLAYER_PITCH: f32 = std::f32::consts::FRAC_PI_2 * 0.65;
+/// Verified remaster view pitch includes straight up and straight down.
+pub const MAX_PLAYER_PITCH: f32 = std::f32::consts::FRAC_PI_2;
 
 #[derive(Default)]
 pub struct SessionInput {
@@ -839,17 +839,14 @@ impl Session {
         candidate.projectile_heights = heights;
         let mut speeds = BTreeMap::new();
         for &(id, speed) in &snapshot.projectile_vertical_speeds {
-            let Some(projectile) = candidate.projectiles.active().iter().find(|p| p.id == id)
-            else {
+            if !candidate.projectiles.active().iter().any(|p| p.id == id) {
                 return Err(SessionSnapshotError::Inconsistent(
                     "projectile vertical speeds",
                 ));
-            };
-            let horizontal = projectile.velocity[0].hypot(projectile.velocity[1]);
-            let player_launch =
-                projectile.owner == Owner::Player && projectile.reflected_from.is_none();
-            if (player_launch && speed.abs() > horizontal * MAX_PLAYER_PITCH.tan() + 0.001)
-                || !ids.contains(&id)
+            }
+            // restore_with_vertical above validates authored total 3D speed;
+            // a tangent bound fails for legitimate straight-up/down launches.
+            if !ids.contains(&id)
                 || !speed.is_finite()
                 || speed.abs() > 64.0
                 || speeds.insert(id, speed).is_some()
@@ -1200,6 +1197,10 @@ impl Session {
         }
         self.wall_materials = Some(catalog);
         true
+    }
+    /// Committed Z velocity, independent of horizontal speed even at view poles.
+    pub fn projectile_vertical_velocity(&self, id: u64) -> Option<f32> {
+        self.projectile_vertical_speeds.get(&id).copied()
     }
     /// Authoritative view pitch in radians, positive upward.
     pub fn pitch(&self) -> f32 {
@@ -3213,6 +3214,7 @@ impl Session {
                     damage,
                     destroyed,
                     distance,
+                    height,
                 }) => {
                     self.sync_object_damage(cell, damage);
                     let mut destroyed = destroyed;
@@ -3261,6 +3263,7 @@ impl Session {
                                     damage,
                                     destroyed,
                                     distance,
+                                    height,
                                 });
                             }
                         }
@@ -5400,6 +5403,7 @@ mod tests {
         let Some(FireResult::Fired(ShotImpact::Plane {
             plane: combat::ShotPlane::Floor,
             distance,
+            ..
         })) = event.shot
         else {
             panic!("expected map floor")

@@ -5,10 +5,11 @@
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::inventory::{Inventory, WeaponDefinitions};
 use crate::map::UNITS_PER_TILE;
-use crate::object_combat::ObjectCombat;
+use crate::object_combat::{ObjectCombat, ObjectRayHit};
 use crate::world::{Wall, World};
 use std::io::{self, ErrorKind};
 
+// Pitched shots are bounded by actual 3D travel, including vertical rays.
 const MAX_RANGE: f32 = 64.0;
 const MIN_COOLDOWN: f32 = 1.0 / 60.0;
 const RELOAD_UNITS_PER_SECOND: f32 = 256.0;
@@ -258,22 +259,30 @@ pub enum ShotImpact {
         damage: i32,
         killed: bool,
         distance: f32,
+        /// Committed world-space impact height, including exact vertical shots.
+        height: f32,
     },
     Wall {
         wall_index: usize,
         distance: f32,
+        /// Committed world-space impact height, including exact vertical shots.
+        height: f32,
     },
     Object {
         cell: [usize; 2],
         damage: i32,
         destroyed: bool,
         distance: f32,
+        /// Committed world-space impact height, including exact vertical shots.
+        height: f32,
     },
     /// Contact with the host-supplied provisional room plane. Distance is the
     /// horizontal ray distance, as for wall, object, and actor hits.
     Plane {
         plane: ShotPlane,
         distance: f32,
+        /// Committed world-space impact height, including exact vertical shots.
+        height: f32,
     },
     Miss,
     /// A mine placement was requested; the session validates and plants it.
@@ -305,7 +314,7 @@ pub struct ShotContext<'a> {
     pub objects: Option<&'a mut ObjectCombat>,
 }
 
-/// Camera ray in map tiles; pitch is positive upward. Room planes are the
+/// Camera ray in map tiles; pitch is positive upward and includes ±PI/2. Room planes are the
 /// current provisional flat floor/ceiling used by the session.
 #[derive(Debug, Clone, Copy)]
 pub struct ShotAim {
@@ -313,6 +322,43 @@ pub struct ShotAim {
     pub pitch: f32,
     pub floor: f32,
     pub ceiling: f32,
+}
+
+/// Horizontal and vertical components of a unit aim ray. Exact poles must not
+/// use `tan` or the slightly negative binary32 cosine of PI/2.
+pub fn pitch_components(pitch: f32) -> Option<[f32; 2]> {
+    if !pitch.is_finite() || pitch.abs() > std::f32::consts::FRAC_PI_2 {
+        return None;
+    }
+    if pitch.abs() == std::f32::consts::FRAC_PI_2 {
+        return Some([0.0, pitch.signum()]);
+    }
+    let (vertical, horizontal) = pitch.sin_cos();
+    Some([horizontal.max(0.0), vertical])
+}
+
+/// Query cylinders containing a stationary XY point, comparing contacts along
+/// the vertical ray rather than their identical zero horizontal distances.
+pub(crate) fn vertical_object_hit(
+    objects: &ObjectCombat,
+    origin: [f32; 2],
+    radius: f32,
+    limit: f32,
+    contact: impl Fn([usize; 2], u8, f32, f32) -> Option<f32>,
+) -> Option<ObjectRayHit> {
+    let nearest = std::cell::Cell::new(None::<ObjectRayHit>);
+    objects.raycast_intervals(origin, [1.0, 0.0], 0.0, radius, |cell, raw, _, _| {
+        if let Some(distance) = contact(cell, raw, 0.0, limit) {
+            if distance.is_finite()
+                && (0.0..=limit).contains(&distance)
+                && nearest.get().is_none_or(|hit| distance < hit.distance)
+            {
+                nearest.set(Some(ObjectRayHit { cell, distance }));
+            }
+        }
+        None // Inspect every overlapping cylinder, including equal XY distances.
+    });
+    nearest.get()
 }
 
 /// Clip an XY intersection interval against a vertical cylinder slab.
@@ -504,11 +550,11 @@ impl Combat {
             || !aim.floor.is_finite()
             || !aim.ceiling.is_finite()
             || aim.floor > aim.ceiling
-            || aim.pitch.abs() >= std::f32::consts::FRAC_PI_2
+            || aim.pitch.abs() > std::f32::consts::FRAC_PI_2
         {
             return FireResult::InvalidShooter;
         }
-        let slope = aim.pitch.tan();
+        let [_, vertical] = pitch_components(aim.pitch).expect("validated pitch");
         self.fire_impl(
             weapon,
             context,
@@ -517,7 +563,7 @@ impl Combat {
             Some(aim),
             plane_present,
             |cell, raw, near, far| {
-                clip_aim_interval(near, far, aim.eye, slope, object_bounds(cell, raw))
+                clip_aim_interval(near, far, aim.eye, vertical, object_bounds(cell, raw))
             },
         )
     }
@@ -584,30 +630,36 @@ impl Combat {
         }
         let (sin, cos) = player.angle.sin_cos();
         let direction = [cos, sin];
+        // Trace in unit 3D ray distance; public impact distances remain XY.
+        let [horizontal, vertical] = aim
+            .and_then(|a| pitch_components(a.pitch))
+            .unwrap_or([1.0, 0.0]);
         let mut hits = Vec::new();
-        world.ray_hits(direction, &mut hits);
+        if horizontal > 0.0 {
+            world.ray_hits(direction, &mut hits);
+        }
         let wall_hit = hits
             .into_iter()
-            .filter(|(distance, index, _)| {
-                blocks_shots(
-                    &world.walls[*index],
-                    aim.map_or(1.0, |a| a.eye + distance * a.pitch.tan()),
-                )
+            .map(|(distance, index, _)| (distance / horizontal, index))
+            .filter(|(distance, index)| {
+                (0.0..=MAX_RANGE).contains(distance)
+                    && blocks_shots(
+                        &world.walls[*index],
+                        aim.map_or(1.0, |a| a.eye + distance * vertical),
+                    )
             })
-            .map(|(distance, index, _)| (distance, index))
             .min_by(|a, b| a.0.total_cmp(&b.0));
         let plane_hit = aim.and_then(|a| {
-            let slope = a.pitch.tan();
-            let (plane, distance) = if slope > 1e-7 {
-                (ShotPlane::Ceiling, (a.ceiling - a.eye) / slope)
-            } else if slope < -1e-7 {
-                (ShotPlane::Floor, (a.floor - a.eye) / slope)
+            let (plane, distance) = if vertical > 1e-7 {
+                (ShotPlane::Ceiling, (a.ceiling - a.eye) / vertical)
+            } else if vertical < -1e-7 {
+                (ShotPlane::Floor, (a.floor - a.eye) / vertical)
             } else {
                 return None;
             };
             let point = [
-                player.position[0] + direction[0] * distance,
-                player.position[1] + direction[1] * distance,
+                player.position[0] + direction[0] * distance * horizontal,
+                player.position[1] + direction[1] * distance * horizontal,
             ];
             (distance.is_finite()
                 && (0.0..=MAX_RANGE).contains(&distance)
@@ -618,7 +670,25 @@ impl Combat {
         let mut nearest = wall_hit.map_or(room_limit, |(distance, _)| distance.min(room_limit));
         let mut selected = None;
         let mut object_hit = objects.as_deref().and_then(|objects| {
-            objects.raycast_intervals(player.position, direction, nearest, 0.0, contact_object)
+            if horizontal == 0.0 {
+                vertical_object_hit(objects, player.position, 0.0, nearest, &contact_object)
+            } else {
+                objects
+                    .raycast_intervals(
+                        player.position,
+                        direction,
+                        nearest * horizontal,
+                        0.0,
+                        |cell, raw, near, far| {
+                            contact_object(cell, raw, near / horizontal, far / horizontal)
+                                .map(|distance| distance * horizontal)
+                        },
+                    )
+                    .map(|hit| ObjectRayHit {
+                        distance: hit.distance / horizontal,
+                        ..hit
+                    })
+            }
         });
         if let Some(hit) = object_hit {
             nearest = hit.distance;
@@ -645,8 +715,16 @@ impl Combat {
                 continue;
             }
             let half = (radius_sq - perpendicular_sq).sqrt();
-            let near = projection - half;
-            let far = projection + half;
+            let xy_near = projection - half;
+            let xy_far = projection + half;
+            let (near, far) = if horizontal == 0.0 {
+                if xy_near > 0.0 || xy_far < 0.0 {
+                    continue;
+                }
+                (0.0, nearest)
+            } else {
+                (xy_near / horizontal, xy_far / horizontal)
+            };
             if far < 0.0 {
                 continue;
             }
@@ -655,7 +733,7 @@ impl Combat {
                     near.max(0.0),
                     far.min(nearest),
                     a.eye,
-                    a.pitch.tan(),
+                    vertical,
                     Some((0.0, 2.0)),
                 )
             }) else {
@@ -676,7 +754,8 @@ impl Combat {
                     cell: event.cell,
                     damage,
                     destroyed: event.destroyed,
-                    distance: hit.distance,
+                    distance: hit.distance * horizontal,
+                    height: aim.map_or(1.0, |a| a.eye + hit.distance * vertical),
                 });
             }
         }
@@ -690,19 +769,25 @@ impl Combat {
                 source_index: actor.source_index,
                 damage,
                 killed: actor.health == 0,
-                distance: nearest,
+                distance: nearest * horizontal,
+                height: aim.map_or(1.0, |a| a.eye + nearest * vertical),
             })
         } else if let Some((distance, index)) =
             wall_hit.filter(|(distance, _)| *distance <= nearest)
         {
             FireResult::Fired(ShotImpact::Wall {
                 wall_index: index,
-                distance,
+                distance: distance * horizontal,
+                height: aim.map_or(1.0, |a| a.eye + distance * vertical),
             })
         } else if let Some((plane, distance)) =
             plane_hit.filter(|(_, distance)| *distance <= nearest)
         {
-            FireResult::Fired(ShotImpact::Plane { plane, distance })
+            FireResult::Fired(ShotImpact::Plane {
+                plane,
+                distance: distance * horizontal,
+                height: aim.map_or(1.0, |a| a.eye + distance * vertical),
+            })
         } else {
             FireResult::Fired(ShotImpact::Miss)
         }
@@ -836,7 +921,7 @@ mod tests {
             (std::f32::consts::FRAC_PI_4, ShotPlane::Ceiling),
         ] {
             assert!(
-                matches!(shoot(pitch, &world), FireResult::Fired(ShotImpact::Plane { plane, distance }) if plane == expected && (distance - 1.0).abs() < 1e-5)
+                matches!(shoot(pitch, &world), FireResult::Fired(ShotImpact::Plane { plane, distance, .. }) if plane == expected && (distance - 1.0).abs() < 1e-5)
             );
         }
         assert_eq!(shoot(0.0, &world), FireResult::Fired(ShotImpact::Miss));
@@ -845,6 +930,176 @@ mod tests {
         assert!(
             matches!(shoot(-std::f32::consts::FRAC_PI_4, &world), FireResult::Fired(ShotImpact::Wall { distance, .. }) if (distance - 0.5).abs() < 1e-5)
         );
+    }
+
+    #[test]
+    fn vertical_hitscan_planes_are_finite_and_ignore_distant_xy_targets() {
+        let (mut inventory, weapons, rockets, definitions, mut actors, mut world) = setup();
+        inventory.ammo[0] = 20;
+        world.walls.push(wall(0.5));
+        for sign in [-1.0, 1.0] {
+            for pitch in [
+                sign * std::f32::consts::FRAC_PI_2,
+                sign * (std::f32::consts::FRAC_PI_2 - 0.001),
+            ] {
+                let result = Combat::new().fire_with_aim(
+                    0,
+                    ShotContext {
+                        inventory: &mut inventory,
+                        weapons: &weapons,
+                        rockets: &rockets,
+                        actors: &mut actors,
+                        definitions: &definitions,
+                        world: &world,
+                        objects: None,
+                    },
+                    false,
+                    ShotAim {
+                        eye: 1.0,
+                        pitch,
+                        floor: 0.0,
+                        ceiling: 2.0,
+                    },
+                    |_, z| {
+                        assert!(z.is_finite());
+                        true
+                    },
+                    |_, _| None,
+                );
+                let FireResult::Fired(ShotImpact::Plane {
+                    plane,
+                    distance,
+                    height,
+                }) = result
+                else {
+                    panic!("unexpected vertical impact: {result:?}");
+                };
+                assert_eq!(
+                    plane,
+                    if sign < 0.0 {
+                        ShotPlane::Floor
+                    } else {
+                        ShotPlane::Ceiling
+                    }
+                );
+                assert!(distance.is_finite() && (0.0..0.002).contains(&distance));
+                assert!((height - if sign < 0.0 { 0.0 } else { 2.0 }).abs() < 1e-6);
+                if pitch.abs() == std::f32::consts::FRAC_PI_2 {
+                    assert_eq!(distance, 0.0);
+                }
+            }
+        }
+        assert!(actors.actors.iter().all(|a| a.health > 0));
+        assert_eq!(
+            pitch_components(std::f32::consts::FRAC_PI_2),
+            Some([0.0, 1.0])
+        );
+        assert!(pitch_components(std::f32::consts::FRAC_PI_2 + 0.001).is_none());
+    }
+
+    #[test]
+    fn vertical_hitscan_orders_actor_before_floor_and_limits_actual_ray_length() {
+        let (mut inventory, weapons, rockets, definitions, mut actors, world) = setup();
+        actors.actors[0].position = world.player.position;
+        let result = Combat::new().fire_with_aim(
+            0,
+            ShotContext {
+                inventory: &mut inventory,
+                weapons: &weapons,
+                rockets: &rockets,
+                actors: &mut actors,
+                definitions: &definitions,
+                world: &world,
+                objects: None,
+            },
+            false,
+            ShotAim {
+                eye: 3.0,
+                pitch: -std::f32::consts::FRAC_PI_2,
+                floor: 0.0,
+                ceiling: 4.0,
+            },
+            |_, _| true,
+            |_, _| None,
+        );
+        assert!(matches!(
+            result,
+            FireResult::Fired(ShotImpact::Actor {
+                source_index: 0,
+                distance: 0.0,
+                ..
+            })
+        ));
+        actors.actors.clear();
+        let result = Combat::new().fire_with_aim(
+            0,
+            ShotContext {
+                inventory: &mut inventory,
+                weapons: &weapons,
+                rockets: &rockets,
+                actors: &mut actors,
+                definitions: &definitions,
+                world: &world,
+                objects: None,
+            },
+            false,
+            ShotAim {
+                eye: 1.0,
+                pitch: std::f32::consts::FRAC_PI_2,
+                floor: 0.0,
+                ceiling: 66.0,
+            },
+            |_, _| true,
+            |_, _| None,
+        );
+        assert_eq!(result, FireResult::Fired(ShotImpact::Miss));
+    }
+
+    #[test]
+    fn vertical_object_contacts_choose_height_not_iteration_order() {
+        use crate::objects::{ObjectDefinition, ObjectDefinitions, ObjectInstance, ObjectKind};
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![ObjectDefinition {
+                collision_radius: 64,
+                shadow: 0,
+                bmp_object: -1,
+                bmp_z: 0,
+                action_code: 0,
+                blow_up: 0,
+                break_limit: 100,
+                ambient_sound: 0,
+                break_sound: 0,
+                model_name: "box.3o".into(),
+                animation_name: None,
+            }],
+        };
+        let instances: Vec<_> = (0..3)
+            .map(|i| ObjectInstance {
+                kind: ObjectKind::LevelObject,
+                definition_index: 0,
+                grid_cell: [i, 0],
+                position: if i == 2 { [1.0, 0.0] } else { [0.0, 0.0] },
+                angle_radians: 0.0,
+                flags: 0,
+                difficulty_flags: 7,
+                extra: 0,
+                size: 0,
+            })
+            .collect();
+        let objects = ObjectCombat::new(
+            &instances,
+            &defs,
+            &crate::process::Script::default(),
+            crate::pickups::Difficulty::Normal,
+        );
+        let hit = vertical_object_hit(&objects, [0.0, 0.0], 0.0, 5.0, |cell, _, near, far| {
+            let bottom = if cell[0] == 0 { 3.0 } else { 1.0 };
+            clip_aim_interval(near, far, 0.0, 1.0, Some((bottom, bottom + 0.5)))
+        })
+        .unwrap();
+        assert_eq!(hit.cell, [1, 0]);
+        assert_eq!(hit.distance, 1.0);
     }
 
     #[test]

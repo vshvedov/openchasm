@@ -61,3 +61,15 @@ Wind shares the hazard lifecycle: it starts when the process opens after any sta
 `with_staged_actions` enables parsing immediate `explode`, level-object `change`, and `quake` commands, in addition to the capabilities of `with_wind`. Ordinary trigger methods deliberately reject processes containing these actions. A host can instead call `prepare_at(kind, cell, process_id)`: the returned borrowed transaction exposes `actions()` in script order, and `commit()` publishes a staged runtime copy. Dropping the transaction leaves the runtime and its effects unchanged. The caller must first validate and stage every action in object state, combat, quake state and available presentation resources, then commit all related subsystem changes together. A runtime transaction does not validate external state on its own. Existing constructors remain fail-closed.
 
 The independent reconstruction runs immediate commands after `StartDelay`; consequently processes with these actions and a positive delay are currently rejected rather than applying them early. Unsupported commands still reject the entire process, and the plan does not implicitly send object-destruction links. Quake stores only the validated rectangle and authored power; its physical and presentation effects remain provisional. Staged object changes must also synchronize object motion, map cell types and collision in the host before this interface can safely be used in gameplay.
+
+`xmove` and `ymove` move along the named axis first, then the other axis.
+The halfway split follows the independent reconstruction and remains
+provisional. The bundled 2022 modding manual describes `s:x` as a per-command
+speed override. Motion commands accept one positive finite override; malformed
+suffixes reject the whole process. Commands without overrides retain the
+existing shared-stage timing approximation. A speed override scales the base
+stage duration by process speed divided by command speed. Each motion has its
+own progress, faster commands stop at their endpoint, and reversal moves each
+back from its current position concurrently; the process stays open until the
+slowest command completes. Exact original timing and axis phase proportions
+remain unverified. Bare trailing numeric arguments remain unsupported.

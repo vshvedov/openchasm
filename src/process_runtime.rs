@@ -19,10 +19,17 @@ const MAP_UNITS_PER_TILE: f32 = 256.0;
 struct Motion {
     wall: usize,
     kind: MotionKind,
+    speed_override: Option<f32>,
+    duration: f32,
+    progress: f32,
 }
 #[derive(Clone, Debug)]
 enum MotionKind {
     Translate([f32; 2]),
+    AxisTranslate {
+        displacement: [f32; 2],
+        x_first: bool,
+    },
     Rotate {
         pivot: [f32; 2],
         radians: f32,
@@ -31,8 +38,29 @@ enum MotionKind {
     Vertical(i32),
 }
 impl Motion {
-    fn transform(&self, point: [f32; 2], progress_delta: f32) -> [f32; 2] {
+    fn transform(&self, point: [f32; 2], from: f32, to: f32) -> [f32; 2] {
+        let progress_delta = to - from;
         match self.kind {
+            MotionKind::AxisTranslate {
+                displacement,
+                x_first,
+            } => {
+                let stage = |p: f32| {
+                    let first = (p * 2.0).min(1.0);
+                    let second = (p * 2.0 - 1.0).max(0.0);
+                    if x_first {
+                        [first, second]
+                    } else {
+                        [second, first]
+                    }
+                };
+                let a = stage(from);
+                let b = stage(to);
+                [
+                    point[0] + displacement[0] * (b[0] - a[0]),
+                    point[1] + displacement[1] * (b[1] - a[1]),
+                ]
+            }
             MotionKind::Translate(displacement) => [
                 point[0] + displacement[0] * progress_delta,
                 point[1] + displacement[1] * progress_delta,
@@ -51,6 +79,9 @@ impl Motion {
     fn travel_bound(&self, wall: &crate::world::Wall) -> f32 {
         match self.kind {
             MotionKind::Translate(d) => d[0].hypot(d[1]),
+            MotionKind::AxisTranslate {
+                displacement: d, ..
+            } => d[0].abs() + d[1].abs(),
             MotionKind::Vertical(raw) => raw.unsigned_abs() as f32 / MAP_UNITS_PER_TILE,
             MotionKind::Rotate { pivot, radians } => {
                 let radius = [wall.a, wall.b]
@@ -77,7 +108,7 @@ fn distance_to_segment(point: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 
 /// Check the swept wall against the player's preview collision circle. A short
 /// travel sampling interval bounds tunnelling; excessive deltas fail closed.
-fn obstructed(motions: &[Motion], world: &World, change: f32) -> bool {
+fn obstructed(motions: &[Motion], world: &World, elapsed: f32, direction: f32) -> bool {
     const PLAYER_RADIUS: f32 = 0.18;
     const SAMPLE_STEP: f32 = 0.04;
     const MAX_SAMPLES: usize = 128;
@@ -91,18 +122,26 @@ fn obstructed(motions: &[Motion], world: &World, change: f32) -> bool {
         if !wall.blocks_movement || matches!(motion.kind, MotionKind::Vertical(_)) {
             continue;
         }
-        let travel = motion.travel_bound(wall) * change.abs();
+        let from = motion.progress;
+        let to = (from + direction * elapsed / motion.duration).clamp(0.0, 1.0);
+        let travel = motion.travel_bound(wall)
+            * (to - from).abs()
+            * if matches!(motion.kind, MotionKind::AxisTranslate { .. }) {
+                2.0
+            } else {
+                1.0
+            };
         if !travel.is_finite() || travel > SAMPLE_STEP * MAX_SAMPLES as f32 {
             return true;
         }
         let count = ((travel / SAMPLE_STEP).ceil() as usize).max(1);
         let mut previous = distance_to_segment(world.player.position, wall.a, wall.b);
         for sample in 1..=count {
-            let fraction = change * sample as f32 / count as f32;
+            let progress = from + (to - from) * sample as f32 / count as f32;
             let distance = distance_to_segment(
                 world.player.position,
-                motion.transform(wall.a, fraction),
-                motion.transform(wall.b, fraction),
+                motion.transform(wall.a, from, progress),
+                motion.transform(wall.b, from, progress),
             );
             // Permit a wall already overlapping the player to move away.
             if distance < PLAYER_RADIUS && distance < previous - 1e-5 {
@@ -145,17 +184,26 @@ struct ObjectMotion {
     cell: [u8; 2],
     raw_type: u8,
     kind: MotionKind,
+    speed_override: Option<f32>,
+    duration: f32,
+    progress: f32,
 }
 impl ObjectMotion {
     fn proxy(&self) -> Motion {
         Motion {
             wall: 0,
             kind: self.kind.clone(),
+            speed_override: self.speed_override,
+            duration: self.duration,
+            progress: self.progress,
         }
     }
     fn travel_bound(&self, pose: &ProcessObject) -> f32 {
         match self.kind {
             MotionKind::Translate(d) => d[0].hypot(d[1]),
+            MotionKind::AxisTranslate {
+                displacement: d, ..
+            } => d[0].abs() + d[1].abs(),
             MotionKind::Vertical(raw) => raw.unsigned_abs() as f32 / MAP_UNITS_PER_TILE,
             MotionKind::Rotate { pivot, radians } => {
                 let orbit = (pose.position[0] - pivot[0]).hypot(pose.position[1] - pivot[1]);
@@ -170,7 +218,8 @@ fn objects_obstructed(
     motions: &[ObjectMotion],
     world: &World,
     objects: &BTreeMap<[u8; 2], ProcessObject>,
-    change: f32,
+    elapsed: f32,
+    direction: f32,
 ) -> bool {
     const PLAYER_RADIUS: f32 = 0.18;
     const SAMPLE_STEP: f32 = 0.04;
@@ -182,7 +231,15 @@ fn objects_obstructed(
         if object.blocking_radius <= 0.0 || matches!(motion.kind, MotionKind::Vertical(_)) {
             continue;
         }
-        let travel = motion.travel_bound(object) * change.abs();
+        let from = motion.progress;
+        let to = (from + direction * elapsed / motion.duration).clamp(0.0, 1.0);
+        let travel = motion.travel_bound(object)
+            * (to - from).abs()
+            * if matches!(motion.kind, MotionKind::AxisTranslate { .. }) {
+                2.0
+            } else {
+                1.0
+            };
         if !travel.is_finite() || travel > SAMPLE_STEP * MAX_SAMPLES as f32 {
             return true;
         }
@@ -191,9 +248,11 @@ fn objects_obstructed(
         let mut previous = (object.position[0] - world.player.position[0])
             .hypot(object.position[1] - world.player.position[1]);
         for sample in 1..=count {
-            let pos = motion
-                .proxy()
-                .transform(object.position, change * sample as f32 / count as f32);
+            let pos = motion.proxy().transform(
+                object.position,
+                from,
+                from + (to - from) * sample as f32 / count as f32,
+            );
             let distance =
                 (pos[0] - world.player.position[0]).hypot(pos[1] - world.player.position[1]);
             if distance < radius && distance < previous - 1e-5 {
@@ -342,6 +401,7 @@ impl RuntimeProcess {
         let mut object_motions = Vec::new();
         let mut empty_motion_cells = Vec::new();
         let mut empty_motion_distance = 0.0_f32;
+        let mut empty_speed_overrides = Vec::new();
         let mut cell_changes = Vec::new();
         let mut animations = Vec::new();
         let mut death_zones = Vec::new();
@@ -586,7 +646,7 @@ impl RuntimeProcess {
                 continue;
             }
             let expected_arguments = match action.name.as_str() {
-                "move" => 4,
+                "move" | "xmove" | "ymove" => 4,
                 "rotate" => 5,
                 "up" if capabilities.wall_elevation || objects.is_some() => 3,
                 _ => {
@@ -594,10 +654,22 @@ impl RuntimeProcess {
                     break;
                 }
             };
-            if action.arguments.len() != expected_arguments {
+            let speed_override = if action.arguments.len() == expected_arguments {
+                None
+            } else if action.arguments.len() == expected_arguments + 1 {
+                let value = action.arguments[expected_arguments]
+                    .strip_prefix("s:")
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|value| value.is_finite() && *value > 0.0);
+                if value.is_none() {
+                    supported = false;
+                    break;
+                }
+                value
+            } else {
                 supported = false;
                 break;
-            }
+            };
             let Some(cell) = action
                 .arguments
                 .first()
@@ -641,10 +713,18 @@ impl RuntimeProcess {
                     radians: (angle as f32).to_radians(),
                 }
             } else {
-                MotionKind::Translate([
+                let displacement = [
                     dx as f32 / MAP_UNITS_PER_TILE,
                     dy as f32 / MAP_UNITS_PER_TILE,
-                ])
+                ];
+                if action.name == "move" {
+                    MotionKind::Translate(displacement)
+                } else {
+                    MotionKind::AxisTranslate {
+                        displacement,
+                        x_first: action.name == "xmove",
+                    }
+                }
             };
             let before = motions.len();
             for (index, _) in world
@@ -662,6 +742,9 @@ impl RuntimeProcess {
                 motions.push(Motion {
                     wall: index,
                     kind: kind.clone(),
+                    speed_override,
+                    duration: 0.0,
+                    progress: 0.0,
                 });
             }
             if !supported {
@@ -691,11 +774,18 @@ impl RuntimeProcess {
                         cell: [cell.0, cell.1],
                         raw_type: raw_cells.expect("authored object has raw cells")[index],
                         kind,
+                        speed_override,
+                        duration: 0.0,
+                        progress: 0.0,
                     });
                 } else if raw_cells.is_some_and(|cells| cells[index] == 0) {
                     empty_motion_cells.push([cell.0, cell.1]);
+                    empty_speed_overrides.push(speed_override);
                     let distance = match kind {
                         MotionKind::Translate(d) => d[0].hypot(d[1]),
+                        MotionKind::AxisTranslate {
+                            displacement: d, ..
+                        } => d[0].abs() + d[1].abs(),
                         MotionKind::Vertical(raw) => raw.unsigned_abs() as f32 / MAP_UNITS_PER_TILE,
                         MotionKind::Rotate { .. } => 0.0,
                     };
@@ -752,11 +842,45 @@ impl RuntimeProcess {
         // The independent reconstruction advances procedure stages at
         // Speed/10 per second even for a hazard with no moving geometry.
         // Existing non-hazard movement timing is left unchanged.
-        let duration = if death_zones.is_empty() && wind_zones.is_empty() {
+        let base_duration = if death_zones.is_empty() && wind_zones.is_empty() {
             (max_distance / speed).max(0.001)
         } else {
             10.0 / property_float(process, "speed", 10.0).max(0.01)
         };
+        let base_speed = speed * 8.0;
+        let mut duration = if motions.is_empty()
+            && object_motions.is_empty()
+            && empty_speed_overrides.is_empty()
+        {
+            base_duration
+        } else {
+            0.0_f32
+        };
+        for override_speed in empty_speed_overrides {
+            duration =
+                duration.max(base_duration * base_speed / override_speed.unwrap_or(base_speed));
+        }
+        for motion in &mut motions {
+            motion.duration =
+                base_duration * base_speed / motion.speed_override.unwrap_or(base_speed);
+            duration = duration.max(motion.duration);
+        }
+        for motion in &mut object_motions {
+            motion.duration =
+                base_duration * base_speed / motion.speed_override.unwrap_or(base_speed);
+            duration = duration.max(motion.duration);
+        }
+        if !duration.is_finite()
+            || duration <= 0.0
+            || motions
+                .iter()
+                .any(|m| !m.duration.is_finite() || m.duration <= 0.0)
+            || object_motions
+                .iter()
+                .any(|m| !m.duration.is_finite() || m.duration <= 0.0)
+        {
+            supported = false;
+        }
         let locked = process.properties.iter().any(|cmd| cmd.name == "lock");
         let required_keys = ["redkey", "greenkey", "bluekey"]
             .map(|name| process.properties.iter().any(|cmd| cmd.name == name));
@@ -944,8 +1068,10 @@ impl RuntimeProcess {
         }
         let change = self.progress - previous;
         if change != 0.0 {
-            if obstructed(&self.motions, world, change)
-                || objects_obstructed(&self.object_motions, world, objects, change)
+            let elapsed = change.abs() * self.duration;
+            let direction = change.signum();
+            if obstructed(&self.motions, world, elapsed, direction)
+                || objects_obstructed(&self.object_motions, world, objects, elapsed, direction)
             {
                 self.progress = previous;
                 self.phase = if change > 0.0 {
@@ -955,11 +1081,14 @@ impl RuntimeProcess {
                 };
                 return;
             }
-            for motion in &self.motions {
+            for motion in &mut self.motions {
+                let from = motion.progress;
+                let to = (from + direction * elapsed / motion.duration).clamp(0.0, 1.0);
+                let motion_change = to - from;
                 match motion.kind {
                     MotionKind::Vertical(raw) => {
                         if let Some(offset) = elevations.get_mut(motion.wall) {
-                            *offset += raw as f32 * change;
+                            *offset += raw as f32 * motion_change;
                             effects.push(ProcessEffect::WallElevation {
                                 wall_index: motion.wall,
                                 offset_raw: *offset,
@@ -968,24 +1097,31 @@ impl RuntimeProcess {
                     }
                     _ => {
                         if let Some(wall) = world.walls.get_mut(motion.wall) {
-                            wall.a = motion.transform(wall.a, change);
-                            wall.b = motion.transform(wall.b, change);
+                            wall.a = motion.transform(wall.a, from, to);
+                            wall.b = motion.transform(wall.b, from, to);
                         }
                     }
                 }
+                motion.progress = to;
             }
-            for motion in &self.object_motions {
+            for motion in &mut self.object_motions {
+                let from = motion.progress;
+                let to = (from + direction * elapsed / motion.duration).clamp(0.0, 1.0);
+                let motion_change = to - from;
                 if let Some(object) = objects.get_mut(&motion.cell) {
                     match motion.kind {
-                        MotionKind::Vertical(raw) => object.elevation_raw += raw as f32 * change,
-                        MotionKind::Translate(_) => {
-                            object.position = motion.proxy().transform(object.position, change)
+                        MotionKind::Vertical(raw) => {
+                            object.elevation_raw += raw as f32 * motion_change
+                        }
+                        MotionKind::Translate(_) | MotionKind::AxisTranslate { .. } => {
+                            object.position = motion.proxy().transform(object.position, from, to)
                         }
                         MotionKind::Rotate { radians, .. } => {
-                            object.position = motion.proxy().transform(object.position, change);
-                            object.angle_radians += radians * change;
+                            object.position = motion.proxy().transform(object.position, from, to);
+                            object.angle_radians += radians * motion_change;
                         }
                     }
+                    motion.progress = to;
                     effects.push(ProcessEffect::ObjectPose {
                         cell: object.cell,
                         position: object.position,
@@ -1583,6 +1719,57 @@ mod tests {
             runtime.tick(world, 1.0 / 60.0, false);
         }
     }
+    #[test]
+    fn axis_moves_and_speed_overrides_finish_independently_and_reverse() {
+        let script = Script::parse("#proc1\nSpeed 8\n#action\nxmove 1 0 256 256 s:16\nymove 2 0 256 256\n#end\n#links\nlink 0 0 1\nreturn 3 0 1\n#end\n");
+        let mut world = world();
+        world.player.position = [-10.0, -10.0];
+        world.walls.push(Wall {
+            a: [2.0, 0.0],
+            b: [2.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: Some([2, 0]),
+        });
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        assert_eq!(
+            runtime.activate_at("link", [0, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        tick_for(&mut runtime, &mut world, 0.35);
+        // Axis path bound is 2 seconds, and s:16 halves that duration.
+        assert!(world.walls[0].a[0] > 1.6 && world.walls[0].a[1].abs() < 0.001);
+        assert!(world.walls[1].a[0] == 2.0 && world.walls[1].a[1] > 0.3);
+        tick_for(&mut runtime, &mut world, 0.85);
+        assert!(
+            (world.walls[0].a[0] - 2.0).abs() < 0.001 && (world.walls[0].a[1] - 1.0).abs() < 0.001
+        );
+        assert!(world.walls[1].a[0] < 3.0);
+        runtime.activate_at("return", [3, 0]);
+        tick_for(&mut runtime, &mut world, 3.0);
+        assert!((world.walls[0].a[0] - 1.0).abs() < 0.001 && world.walls[0].a[1].abs() < 0.001);
+        assert!((world.walls[1].a[0] - 2.0).abs() < 0.001 && world.walls[1].a[1].abs() < 0.001);
+    }
+
+    #[test]
+    fn malformed_motion_speed_override_disables_the_whole_process() {
+        for suffix in ["s:0", "s:-1", "s:nan", "s:", "s:8 extra", "8"] {
+            let script = Script::parse(&format!(
+                "#proc1\n#action\nmove 1 0 256 0 {suffix}\n#end\n#links\nlink 0 0 1\n#end\n"
+            ));
+            let mut world = world();
+            let original = world.walls[0].a;
+            let mut runtime = ProcessRuntime::new(&script, &world);
+            assert_eq!(
+                runtime.activate_at("link", [0, 0])[0].outcome,
+                ProcessOutcome::Unsupported,
+                "{suffix}"
+            );
+            tick_for(&mut runtime, &mut world, 1.0);
+            assert_eq!(world.walls[0].a, original);
+        }
+    }
+
     #[test]
     fn reports_accepted_locked_unsupported_and_busy_attempts() {
         let script = Script::parse("#proc1\nEndDelay 1\n#end\n#proc2\nLock\nEndDelay 1\n#end\n#proc3\nEndDelay 1\n#action\nrotate 1 0 1 1\n#end\n#proc4\n#action\nmove 1 0 256 0\n#end\n#links\nlink 0 0 1\nlink 1 0 2\nlink 2 0 3\nlink 3 0 4\n#end\n");

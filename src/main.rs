@@ -126,6 +126,33 @@ fn load_wall_textures(
         })
         .collect()
 }
+
+/// Describe only what this client can actually render after CEL decoding.
+/// Type 120 is invisible geometry and requires no texture.
+fn wall_material_catalog(
+    graphics: &[WallGraphic],
+    textures: &[Option<texture::CelImage>],
+) -> openchasm::wall_transitions::WallMaterialCatalog {
+    use openchasm::wall_transitions::{WallMaterial, WallMaterialCatalog};
+    let mut catalog = WallMaterialCatalog::default();
+    for raw in 1..=127_u8 {
+        let Some(graphic) = graphics.get(usize::from(raw)) else {
+            continue;
+        };
+        let available = raw == 120
+            || (graphic.filename.is_some()
+                && textures.get(usize::from(raw)).is_some_and(Option::is_some));
+        catalog.set(
+            raw,
+            WallMaterial {
+                blocks_movement: !graphic.disable_walk_collision,
+                blocks_shots: !graphic.disable_shoot_collision,
+                presentation_available: available,
+            },
+        );
+    }
+    catalog
+}
 /// Provisional circle for represented level objects. Collectibles remain
 /// nonblocking so their existing pickup overlap rules can collect them.
 fn process_blocking_radius(kind: objects::ObjectKind, action_code: i32, radius: i32) -> f32 {
@@ -421,7 +448,7 @@ fn play(
             initial_cell_types: None,
         };
         let processes = if scripted.is_some() {
-            process_runtime::ProcessRuntime::with_source_lights(
+            process_runtime::ProcessRuntime::with_wall_changes(
                 &script,
                 &world,
                 capabilities,
@@ -474,6 +501,9 @@ fn play(
             shot_blocking,
             difficulty,
         });
+        if !session.set_wall_material_catalog(wall_material_catalog(&graphics, &textures)) {
+            eprintln!("wall material catalog rejected; scripted wall changes disabled");
+        }
         let object_heights = object_height_loader::load_object_heights(resources, &definitions);
         if !session.set_object_heights(object_heights, cells) {
             eprintln!("object height catalog rejected; using conservative collision");
@@ -870,6 +900,61 @@ mod wall_graphics_tests {
         assert!(!graphics[1].disable_walk_collision);
         assert!(!graphics[120].disable_walk_collision);
         assert_eq!(graphics[89].filename, None);
+    }
+    #[test]
+    fn wall_material_catalog_requires_decoded_texture_and_respects_gfx() {
+        let graphics = parse_wall_graphics(b"#GFX\n001: wall.cel\n087: grate.cel gs.\n088: absent.cel .s.\n089: nofile.cel ...\n#end.\n");
+        let mut bytes = vec![0; 32 + 768 + 1];
+        bytes[..2].copy_from_slice(&[0x19, 0x91]);
+        bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        bytes[10..12].copy_from_slice(&8u16.to_le_bytes());
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        let image = texture::CelImage::parse(&bytes).unwrap();
+        let mut textures: Vec<Option<texture::CelImage>> = (0..128).map(|_| None).collect();
+        textures[1] = Some(image.clone());
+        textures[87] = Some(image.clone());
+        // A decoded image without a GFX declaration is not a supported material.
+        textures[90] = Some(image);
+        let catalog = wall_material_catalog(&graphics, &textures);
+        let wall = catalog.get(1).unwrap();
+        assert!(wall.presentation_available && wall.blocks_movement && wall.blocks_shots);
+        let grate = catalog.get(87).unwrap();
+        assert!(grate.presentation_available && !grate.blocks_movement && !grate.blocks_shots);
+        assert!(!catalog.get(88).unwrap().presentation_available);
+        assert!(catalog.get(88).unwrap().blocks_movement);
+        assert!(!catalog.get(88).unwrap().blocks_shots);
+        assert!(!catalog.get(89).unwrap().presentation_available);
+        assert!(!catalog.get(90).unwrap().presentation_available);
+        let invisible = catalog.get(120).unwrap();
+        assert!(
+            invisible.presentation_available && invisible.blocks_movement && invisible.blocks_shots
+        );
+        assert!(catalog.get(0).is_none());
+    }
+    #[test]
+    fn installed_wall_replacement_materials_are_preloaded() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        for (level, raw) in [(10, 109), (19, 112)] {
+            let resource = resources.read(&format!("map/resource.{level:02}")).unwrap();
+            let graphics = parse_wall_graphics(&resource);
+            let textures = load_wall_textures(&mut resources, &graphics);
+            assert!(
+                wall_material_catalog(&graphics, &textures)
+                    .get(raw)
+                    .unwrap()
+                    .presentation_available,
+                "level {level} wall type {raw}"
+            );
+        }
     }
     #[test]
     fn missing_actor_metadata_uses_legacy_fallback() {

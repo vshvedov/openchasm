@@ -237,9 +237,10 @@ impl Session {
         }
     }
     /// Choose the wall policy for player and wind-driven movement. Defaults to
-    /// two-sided. Enemy chase uses authored sides only for walls proven static;
-    /// moving-wall obstruction remains conservative. Snapshot clones retain
-    /// the selected policy.
+    /// two-sided. Authored sides apply only to walls the process runtime proves
+    /// static; moving-wall obstruction remains conservative. Snapshot clones
+    /// retain the selected policy. Replacing or reordering walls externally
+    /// invalidates the runtime's mask and must not be done while opted in.
     pub fn set_wall_collision_mode(&mut self, mode: WallCollisionMode) {
         self.wall_collision_mode = mode;
     }
@@ -953,13 +954,18 @@ impl Session {
             .wind
             .displacement(self.world.player.position, DT)
             .unwrap_or([0.0, 0.0]);
-        self.world.step_with_external_mode(
-            input.movement,
-            DT,
-            &circles,
-            displacement,
-            self.wall_collision_mode,
-        );
+        if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
+            self.world.step_with_external_static_sides(
+                input.movement,
+                DT,
+                &circles,
+                displacement,
+                self.processes.static_wall_mask(),
+            );
+        } else {
+            self.world
+                .step_with_external(input.movement, DT, &circles, displacement);
+        }
         // Move live actors in stable order using the same tick-start field.
         // Rebuild obstacles after each move, so subsequent actors see new positions.
         for index in 0..self.actors.actors.len() {
@@ -1008,13 +1014,19 @@ impl Session {
                         radius: object.blocking_radius,
                     }),
             );
-            self.actors.actors[index].position = self.world.move_circle_with_mode(
-                position,
-                displacement,
-                radius,
-                &obstacles,
-                self.wall_collision_mode,
-            );
+            self.actors.actors[index].position =
+                if self.wall_collision_mode == WallCollisionMode::AuthoredSides {
+                    self.world.move_circle_with_static_sides(
+                        position,
+                        displacement,
+                        radius,
+                        &obstacles,
+                        self.processes.static_wall_mask(),
+                    )
+                } else {
+                    self.world
+                        .move_circle(position, displacement, radius, &obstacles)
+                };
         }
         // First stage only inventory/pickup data. The larger simulation snapshot
         // is needed only on ticks where a collection actually occurs.
@@ -1584,10 +1596,11 @@ mod tests {
             b: [1.0, 1.0],
             texture: 1,
             blocks_movement: true,
-            cell: None,
+            cell: Some([1, 0]),
         });
         session.base_wall_blocking.push(true);
         session.wall_elevations.push(0.0);
+        session.processes = ProcessRuntime::new(&Script::default(), &session.world);
         session
             .wind
             .activate(
@@ -1599,6 +1612,26 @@ mod tests {
                 }],
             )
             .unwrap();
+        let mut dynamic = session.clone();
+        dynamic.processes = ProcessRuntime::new(
+            &Script::parse("#proc1\n#action\nmove 1 0 256 0\n#end\n"),
+            &dynamic.world,
+        );
+        dynamic.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        for _ in 0..3 {
+            dynamic.step(SessionInput::default());
+        }
+        assert!(dynamic.world.player.position[0] > 1.179);
+        let mut unknown = session.clone();
+        unknown.processes = ProcessRuntime::new(
+            &Script::parse("#proc1\n#action\nunknown 1 0\n#end\n"),
+            &unknown.world,
+        );
+        unknown.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        for _ in 0..3 {
+            unknown.step(SessionInput::default());
+        }
+        assert!(unknown.world.player.position[0] > 1.179);
         let mut default_session = session.clone();
         for _ in 0..3 {
             default_session.step(SessionInput::default());
@@ -1810,10 +1843,11 @@ mod tests {
             b: [1.0, 2.0],
             texture: 1,
             blocks_movement: true,
-            cell: None,
+            cell: Some([1, 0]),
         });
         session.base_wall_blocking.push(true);
         session.wall_elevations.push(0.0);
+        session.processes = ProcessRuntime::new(&Script::default(), &session.world);
         session.actor_definitions.entries.push(ActorDefinition {
             model_name: "test.car".into(),
             wall_radius: 64,
@@ -1852,6 +1886,16 @@ mod tests {
                 }],
             )
             .unwrap();
+        let mut dynamic = session.clone();
+        dynamic.processes = ProcessRuntime::new(
+            &Script::parse("#proc1\n#action\nmove 1 0 256 0\n#end\n"),
+            &dynamic.world,
+        );
+        dynamic.set_wall_collision_mode(WallCollisionMode::AuthoredSides);
+        for _ in 0..3 {
+            dynamic.step(SessionInput::default());
+        }
+        assert!(dynamic.actors.actors[0].position[0] > 1.249);
         let mut baseline = session.clone();
         for _ in 0..3 {
             baseline.step(SessionInput::default());

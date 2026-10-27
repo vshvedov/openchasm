@@ -18,6 +18,14 @@ pub enum WallCollisionMode {
     AuthoredSides,
 }
 
+#[derive(Clone, Copy)]
+struct WallSidePolicy<'a> {
+    mode: WallCollisionMode,
+    /// None is the legacy unrestricted authored-side mode. Some restricts
+    /// one-sided behavior to verified wall indices.
+    static_walls: Option<&'a [bool]>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Wall {
     pub a: [f32; 2],
@@ -218,7 +226,10 @@ fn move_and_slide(
         PLAYER_RADIUS,
         walls,
         circles,
-        WallCollisionMode::TwoSided,
+        WallSidePolicy {
+            mode: WallCollisionMode::TwoSided,
+            static_walls: None,
+        },
     )
 }
 
@@ -228,7 +239,7 @@ fn move_circle_and_slide(
     radius: f32,
     walls: &[Wall],
     circles: &[CollisionCircle],
-    mode: WallCollisionMode,
+    policy: WallSidePolicy<'_>,
 ) -> [f32; 2] {
     // Multiple contacts let a disc slide along walls and stop at corners.
     for _ in 0..4 {
@@ -238,13 +249,17 @@ fn move_circle_and_slide(
         }
         let hit = walls
             .iter()
-            .filter(|wall| wall.blocks_movement)
-            .filter(|wall| {
-                mode != WallCollisionMode::AuthoredSides
+            .enumerate()
+            .filter(|(_, wall)| wall.blocks_movement)
+            .filter(|(index, wall)| {
+                policy.mode != WallCollisionMode::AuthoredSides
+                    || policy
+                        .static_walls
+                        .is_some_and(|mask| !mask.get(*index).copied().unwrap_or(false))
                     || !(1..=86).contains(&wall.texture)
                     || cross(sub(position, wall.a), sub(wall.b, wall.a)) <= 0.0
             })
-            .filter_map(|wall| sweep_wall(position, displacement, wall, radius))
+            .filter_map(|(_, wall)| sweep_wall(position, displacement, wall, radius))
             .chain(
                 circles
                     .iter()
@@ -312,6 +327,47 @@ impl World {
         circles: &[CollisionCircle],
         mode: WallCollisionMode,
     ) -> [f32; 2] {
+        self.move_circle_with_policy(
+            position,
+            displacement,
+            radius,
+            circles,
+            WallSidePolicy {
+                mode,
+                static_walls: None,
+            },
+        )
+    }
+
+    /// Use authored sides only on walls proven static in the supplied mask.
+    /// Unmarked and missing entries remain two-sided.
+    pub fn move_circle_with_static_sides(
+        &self,
+        position: [f32; 2],
+        displacement: [f32; 2],
+        radius: f32,
+        circles: &[CollisionCircle],
+        static_wall_mask: &[bool],
+    ) -> [f32; 2] {
+        self.move_circle_with_policy(
+            position,
+            displacement,
+            radius,
+            circles,
+            WallSidePolicy {
+                mode: WallCollisionMode::AuthoredSides,
+                static_walls: Some(static_wall_mask),
+            },
+        )
+    }
+    fn move_circle_with_policy(
+        &self,
+        position: [f32; 2],
+        displacement: [f32; 2],
+        radius: f32,
+        circles: &[CollisionCircle],
+        policy: WallSidePolicy<'_>,
+    ) -> [f32; 2] {
         if !position
             .iter()
             .chain(displacement.iter())
@@ -321,7 +377,7 @@ impl World {
         {
             return position;
         }
-        move_circle_and_slide(position, displacement, radius, &self.walls, circles, mode)
+        move_circle_and_slide(position, displacement, radius, &self.walls, circles, policy)
     }
 
     /// Advance a bounded time step using a swept circular player and wall sliding.
@@ -358,6 +414,46 @@ impl World {
         external: [f32; 2],
         mode: WallCollisionMode,
     ) {
+        self.step_with_external_policy(
+            input,
+            dt,
+            circles,
+            external,
+            WallSidePolicy {
+                mode,
+                static_walls: None,
+            },
+        );
+    }
+    /// Sweep player input and external displacement with sidedness limited to
+    /// explicitly verified static walls. Missing entries are two-sided.
+    pub fn step_with_external_static_sides(
+        &mut self,
+        input: Input,
+        dt: f32,
+        circles: &[CollisionCircle],
+        external: [f32; 2],
+        static_wall_mask: &[bool],
+    ) {
+        self.step_with_external_policy(
+            input,
+            dt,
+            circles,
+            external,
+            WallSidePolicy {
+                mode: WallCollisionMode::AuthoredSides,
+                static_walls: Some(static_wall_mask),
+            },
+        );
+    }
+    fn step_with_external_policy(
+        &mut self,
+        input: Input,
+        dt: f32,
+        circles: &[CollisionCircle],
+        external: [f32; 2],
+        policy: WallSidePolicy<'_>,
+    ) {
         if !external.iter().all(|v| v.is_finite())
             || !self.player.angle.is_finite()
             || !self.player.position.iter().all(|value| value.is_finite())
@@ -383,7 +479,7 @@ impl World {
             (cos * forward - sin * strafe) * 2.5 * dt + external[0],
             (sin * forward + cos * strafe) * 2.5 * dt + external[1],
         ];
-        self.player.position = if mode == WallCollisionMode::TwoSided {
+        self.player.position = if policy.mode == WallCollisionMode::TwoSided {
             move_and_slide(self.player.position, displacement, &self.walls, circles)
         } else {
             move_circle_and_slide(
@@ -392,7 +488,7 @@ impl World {
                 PLAYER_RADIUS,
                 &self.walls,
                 circles,
-                mode,
+                policy,
             )
         };
     }
@@ -671,5 +767,50 @@ mod tests {
         assert_eq!(w.player.position, [0.0, 0.0]);
         w.step(Input::default(), f32::NAN);
         assert_eq!(w.player.angle, 0.0);
+    }
+    #[test]
+    fn static_mask_keeps_dynamic_and_unverified_walls_two_sided() {
+        let mut world = test_world();
+        world.walls.push(Wall {
+            a: [2.0, -1.0],
+            b: [2.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        });
+        let from = [3.0, 0.0];
+        let delta = [-3.0, 0.0];
+        let move_with =
+            |mask: &[bool]| world.move_circle_with_static_sides(from, delta, 0.18, &[], mask)[0];
+        assert!(move_with(&[false, true]) > 1.179 && move_with(&[false, true]) < 1.181);
+        assert!(move_with(&[true, false]) > 2.179 && move_with(&[true, false]) < 2.181);
+        assert!(
+            move_with(&[true]) > 2.179,
+            "missing second mask entry is conservative"
+        );
+        assert!(move_with(&[]) > 2.179, "empty mask is conservative");
+        assert!(
+            world.move_circle(from, delta, 0.18, &[])[0] > 2.179,
+            "default is unchanged"
+        );
+        let mut player = world.clone();
+        player.player.position = from;
+        player.step_with_external_static_sides(
+            Input::default(),
+            1.0 / 60.0,
+            &[],
+            delta,
+            &[false, true],
+        );
+        assert!(player.player.position[0] > 1.179 && player.player.position[0] < 1.181);
+        for texture in [87, 119, 120] {
+            let mut barrier = test_world();
+            barrier.walls[0].texture = texture;
+            assert!(
+                barrier.move_circle_with_static_sides([2.0, 0.0], [-2.0, 0.0], 0.18, &[], &[true])
+                    [0]
+                    > 1.179
+            );
+        }
     }
 }

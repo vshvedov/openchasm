@@ -30,6 +30,7 @@ pub mod pickups;
 pub mod projectiles;
 pub mod quake;
 pub mod save_format;
+pub mod save_store;
 pub mod session;
 pub mod session_codec;
 pub mod sound_definitions;

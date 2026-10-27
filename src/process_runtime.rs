@@ -5,7 +5,9 @@
 //! state-changing actions are disabled in full. Movement timing, use range, and
 //! behavior in the presence of blockers are placeholders, not verified
 //! against the original game.
+use crate::object_states::ObjectAction;
 use crate::process::{Process, Script};
+use crate::quake::QuakeZone;
 use crate::wind::WindZone;
 use crate::world::World;
 use std::collections::BTreeMap;
@@ -279,6 +281,13 @@ struct ProcessFrame<'a> {
 
 type Activation = (Vec<(u16, bool)>, Vec<u16>);
 
+/// Ordered commands that require host validation before process acceptance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImmediateAction {
+    Object(ObjectAction),
+    Quake(QuakeZone),
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeProcess {
     motions: Vec<Motion>,
@@ -298,6 +307,7 @@ struct RuntimeProcess {
     animations: Vec<u16>,
     death_zones: Vec<DeathZone>,
     wind_zones: Vec<WindZone>,
+    immediate_actions: Vec<ImmediateAction>,
     nonstop: bool,
     hazard_active: bool,
     wind_active: bool,
@@ -325,8 +335,9 @@ impl RuntimeProcess {
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
         objects: Option<&BTreeMap<[u8; 2], ProcessObject>>,
-        wind_enabled: bool,
+        modes: (bool, bool),
     ) -> Self {
+        let (wind_enabled, immediate_enabled) = modes;
         let mut motions = Vec::new();
         let mut object_motions = Vec::new();
         let mut empty_motion_cells = Vec::new();
@@ -335,6 +346,7 @@ impl RuntimeProcess {
         let mut animations = Vec::new();
         let mut death_zones = Vec::new();
         let mut wind_zones = Vec::new();
+        let mut immediate_actions = Vec::new();
         let mut nonstop = false;
         let mut waitout = Vec::new();
         let mut lock_changes = Vec::new();
@@ -425,6 +437,77 @@ impl RuntimeProcess {
                 })();
                 if let Some(zone) = parsed {
                     death_zones.push(zone);
+                    continue;
+                }
+                supported = false;
+                break;
+            }
+            if immediate_enabled && action.name == "explode" {
+                let args = &action.arguments;
+                let parsed = (|| {
+                    if args.len() != 2 {
+                        return None;
+                    }
+                    let x = args[0].parse::<usize>().ok()?;
+                    let y = args[1].parse::<usize>().ok()?;
+                    if x >= 64 || y >= 64 {
+                        return None;
+                    }
+                    Some(ObjectAction::Explode { cell: [x, y] })
+                })();
+                if let Some(object) = parsed {
+                    immediate_actions.push(ImmediateAction::Object(object));
+                    continue;
+                }
+                supported = false;
+                break;
+            }
+            if immediate_enabled && action.name == "quake" {
+                let args = &action.arguments;
+                let parsed = (|| {
+                    if args.len() != 5 {
+                        return None;
+                    }
+                    let x1 = args[0].parse::<u8>().ok()?;
+                    let y1 = args[1].parse::<u8>().ok()?;
+                    let x2 = args[2].parse::<u8>().ok()?;
+                    let y2 = args[3].parse::<u8>().ok()?;
+                    let power = args[4].parse::<u32>().ok()?;
+                    if x1 > x2 || y1 > y2 || x2 >= 64 || y2 >= 64 {
+                        return None;
+                    }
+                    Some(QuakeZone {
+                        min_cell: [x1, y1],
+                        max_cell: [x2, y2],
+                        power,
+                    })
+                })();
+                if let Some(zone) = parsed {
+                    immediate_actions.push(ImmediateAction::Quake(zone));
+                    continue;
+                }
+                supported = false;
+                break;
+            }
+            if immediate_enabled && action.name == "change" {
+                let args = &action.arguments;
+                let parsed = (|| {
+                    if args.len() != 3 {
+                        return None;
+                    }
+                    let x = args[0].parse::<usize>().ok()?;
+                    let y = args[1].parse::<usize>().ok()?;
+                    let raw_type = args[2].parse::<u8>().ok()?;
+                    if x >= 64 || y >= 64 || !(163..=226).contains(&raw_type) {
+                        return None;
+                    }
+                    Some(ObjectAction::Change {
+                        cell: [x, y],
+                        raw_type,
+                    })
+                })();
+                if let Some(object) = parsed {
+                    immediate_actions.push(ImmediateAction::Object(object));
                     continue;
                 }
                 supported = false;
@@ -628,6 +711,9 @@ impl RuntimeProcess {
         if nonstop && death_zones.is_empty() && wind_zones.is_empty() {
             supported = false;
         }
+        if !immediate_actions.is_empty() && property_float(process, "startdelay", 0.0) > 0.0 {
+            supported = false;
+        }
         if !object_motions.is_empty()
             && process
                 .properties
@@ -646,6 +732,7 @@ impl RuntimeProcess {
             animations.clear();
             death_zones.clear();
             wind_zones.clear();
+            immediate_actions.clear();
         }
         // The manual labels Speed but does not specify units. At speed 8 we use
         // one tile per second; each process completes when its longest move does.
@@ -690,6 +777,7 @@ impl RuntimeProcess {
             animations,
             death_zones,
             wind_zones,
+            immediate_actions,
             nonstop,
             hazard_active: false,
             wind_active: false,
@@ -717,6 +805,7 @@ impl RuntimeProcess {
                 && self.animations.is_empty()
                 && self.death_zones.is_empty()
                 && self.wind_zones.is_empty()
+                && self.immediate_actions.is_empty()
                 && !self.mission_effect)
         {
             return Err(ProcessOutcome::Unsupported);
@@ -964,6 +1053,26 @@ pub struct ProcessRuntime {
     objects: BTreeMap<[u8; 2], ProcessObject>,
     cell_types: Option<Vec<u8>>,
     effects: Vec<ProcessEffect>,
+    staged_authorized: bool,
+}
+
+/// A process activation staged on a private copy. Dropping it rolls back;
+/// commit publishes the staged runtime and its effects. The exclusive borrow
+/// prevents intervening runtime changes while the host validates the plan.
+pub struct PreparedProcess<'a> {
+    runtime: &'a mut ProcessRuntime,
+    staged: ProcessRuntime,
+    actions: Vec<ImmediateAction>,
+    event: ProcessEvent,
+}
+impl PreparedProcess<'_> {
+    pub fn actions(&self) -> &[ImmediateAction] {
+        &self.actions
+    }
+    pub fn commit(self) -> ProcessEvent {
+        *self.runtime = self.staged;
+        self.event
+    }
 }
 
 impl ProcessRuntime {
@@ -1044,6 +1153,37 @@ impl ProcessRuntime {
         object_poses: &[ProcessObject],
     ) -> Result<Self, ProcessObjectError> {
         Self::with_object_capabilities(script, world, capabilities, raw_cells, object_poses, true)
+    }
+    /// Enable immediate object/quake parsing for explicit prepared transactions.
+    /// Ordinary trigger paths still reject these processes.
+    pub fn with_staged_actions(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+        object_poses: &[ProcessObject],
+    ) -> Result<Self, ProcessObjectError> {
+        let mut runtime = Self::with_wind(script, world, capabilities, raw_cells, object_poses)?;
+        let cells = capabilities.initial_cell_types.or(Some(raw_cells));
+        runtime.processes = script
+            .processes
+            .iter()
+            .map(|(&id, process)| {
+                (
+                    id,
+                    RuntimeProcess::new(
+                        process,
+                        world,
+                        capabilities,
+                        cells,
+                        true,
+                        Some(&runtime.objects),
+                        (true, true),
+                    ),
+                )
+            })
+            .collect();
+        Ok(runtime)
     }
     fn with_object_capabilities(
         script: &Script,
@@ -1129,7 +1269,7 @@ impl ProcessRuntime {
                             raw_cells,
                             hazards_enabled,
                             enabled.then_some(&objects),
-                            wind_enabled,
+                            (wind_enabled, false),
                         ),
                     )
                 })
@@ -1141,6 +1281,7 @@ impl ProcessRuntime {
             objects,
             cell_types: capabilities.initial_cell_types.map(|x| x.to_vec()),
             effects: Vec::new(),
+            staged_authorized: false,
         }
     }
     /// Drain effects accumulated since the last call, including direct activations.
@@ -1193,6 +1334,9 @@ impl ProcessRuntime {
             {
                 Err(ProcessOutcome::Unsupported)
             }
+            Some(process) if !self.staged_authorized && !process.immediate_actions.is_empty() => {
+                Err(ProcessOutcome::Unsupported)
+            }
             Some(process) => process.trigger(self.keys),
             None => Err(ProcessOutcome::Missing),
         };
@@ -1225,6 +1369,49 @@ impl ProcessRuntime {
             outcome,
         }
     }
+    /// Prepare exactly one matching link, leaving this runtime unchanged on
+    /// failure or drop. The caller must validate all actions and the effects
+    /// they induce in every authoritative subsystem before committing.
+    pub fn prepare_at(
+        &mut self,
+        kind: &str,
+        cell: [u8; 2],
+        id: u16,
+    ) -> Result<PreparedProcess<'_>, ProcessOutcome> {
+        if !matches!(kind, "floor" | "link" | "shoot" | "destroy")
+            || !self
+                .links
+                .iter()
+                .any(|link| link.kind == kind && [link.x, link.y] == cell && link.process == id)
+        {
+            return Err(ProcessOutcome::Missing);
+        }
+        let mut staged = self.clone();
+        let actions = staged
+            .processes
+            .get(&id)
+            .filter(|p| matches!(p.phase, Phase::Closed))
+            .map(|p| p.immediate_actions.clone())
+            .unwrap_or_default();
+        if kind == "destroy" {
+            if let Some(process) = staged.processes.get_mut(&id) {
+                process.locked = false;
+            }
+        }
+        staged.staged_authorized = true;
+        let event = staged.trigger(id);
+        staged.staged_authorized = false;
+        if event.outcome != ProcessOutcome::Accepted {
+            return Err(event.outcome);
+        }
+        Ok(PreparedProcess {
+            runtime: self,
+            staged,
+            actions,
+            event,
+        })
+    }
+
     /// Activate links of a given kind for a cell in script order.
     /// Destroy links first unlock the referenced process, as described in the
     /// bundled modding manual.
@@ -2422,6 +2609,87 @@ mod tests {
                 "{action}"
             );
             assert!(runtime.take_effects().is_empty(), "{action}");
+        }
+    }
+    #[test]
+    fn staged_actions_require_preparation_and_commit_atomically() {
+        let script = Script::parse("#proc1\n#action\nnonstop\nexplode 27 46\nchange 29 48 200\nquake 17 40 30 50 10000\nwind 25 47 27 48 12 0\nunlock 2\n#end\n#proc2\nLock\nEndDelay 1\n#end\n#links\ndestroy 27 47 1\nlink 1 0 2\n#end\n");
+        let world = world();
+        let mut runtime = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &[0; 4096],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.activate_at("destroy", [27, 47])[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        assert_eq!(
+            runtime.activate_at("link", [1, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        let expected = vec![
+            ImmediateAction::Object(ObjectAction::Explode { cell: [27, 46] }),
+            ImmediateAction::Object(ObjectAction::Change {
+                cell: [29, 48],
+                raw_type: 200,
+            }),
+            ImmediateAction::Quake(QuakeZone {
+                min_cell: [17, 40],
+                max_cell: [30, 50],
+                power: 10000,
+            }),
+        ];
+        {
+            let prepared = runtime.prepare_at("destroy", [27, 47], 1).unwrap();
+            assert_eq!(prepared.actions(), expected);
+        }
+        assert!(runtime.take_effects().is_empty());
+        assert_eq!(
+            runtime.activate_at("link", [1, 0])[0].outcome,
+            ProcessOutcome::Locked
+        );
+        let prepared = runtime.prepare_at("destroy", [27, 47], 1).unwrap();
+        assert_eq!(prepared.actions(), expected);
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Accepted);
+        assert!(matches!(
+            &runtime.take_effects()[..],
+            [ProcessEffect::WindActivated { process_id: 1, .. }]
+        ));
+        assert_eq!(
+            runtime.activate_at("link", [1, 0])[0].outcome,
+            ProcessOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn staged_actions_reject_delay_malformed_and_unhandled_commands() {
+        for text in [
+            "StartDelay 2\n#action\nquake 1 1 2 2 0",
+            "#action\nexplode 1 1\nquake 1 1 64 2 0",
+            "#action\nexplode 1 1\nchange 1 1 100",
+            "#action\nquake 1 1 2 2 1\nambient 1 1 2 2 1",
+        ] {
+            let script =
+                Script::parse(&format!("#proc1\n{text}\n#end\n#links\nlink 0 0 1\n#end\n"));
+            let world = world();
+            let mut runtime = ProcessRuntime::with_staged_actions(
+                &script,
+                &world,
+                ProcessCapabilities::default(),
+                &[0; 4096],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                runtime.prepare_at("link", [0, 0], 1).err(),
+                Some(ProcessOutcome::Unsupported),
+                "{text}"
+            );
+            assert!(runtime.take_effects().is_empty());
         }
     }
 }

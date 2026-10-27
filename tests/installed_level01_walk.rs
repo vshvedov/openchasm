@@ -209,11 +209,7 @@ fn spawn_can_reach_and_destroy_first_lock() {
             fire: true,
             ..SessionInput::default()
         });
-        if events
-            .object_hits
-            .iter()
-            .any(|hit| *hit == ([22, 55], true))
-        {
+        if events.object_hits.contains(&([22, 55], true)) {
             destroyed = true;
             break;
         }

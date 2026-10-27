@@ -3,6 +3,7 @@ mod audio;
 mod content;
 mod explosion_render;
 mod gltf_model;
+mod launcher;
 mod object_height_loader;
 mod object_render;
 mod planes;
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use world::{Player, Wall, World};
 
 fn usage() {
-    eprintln!("Usage: openchasm [--source full|demo|local|PATH] [--difficulty easy|normal|hard] <sources|info|list [PREFIX]|levels|check|objects [LEVEL]|gltf-info RESOURCE|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
+    eprintln!("Usage: openchasm [--source full|demo|local|PATH] [--difficulty easy|normal|hard] <launcher|sources|info|list [PREFIX]|levels|check|objects [LEVEL]|gltf-info RESOURCE|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
 }
 fn resource_paths(resources: &ResourceSet) -> Vec<String> {
     resources
@@ -314,6 +315,218 @@ fn parse_options(
     Ok((source, difficulty.unwrap_or(Difficulty::Normal), supplied))
 }
 
+fn play(
+    resources: &mut ResourceSet,
+    difficulty: Difficulty,
+    mut id: String,
+) -> Result<(), Box<dyn Error>> {
+    let mut carry: Option<openchasm::inventory::Inventory> = None;
+    let info = resources.read("chasm.inf")?;
+    loop {
+        let map_bytes = resources.read(&format!("map/map.{id}"))?;
+        let map = Map::parse(&map_bytes)?;
+        let resource = resources.read(&format!("map/resource.{id}"))?;
+        let name = level_name(&resource);
+        let graphics = parse_wall_graphics(&resource);
+        let textures = load_wall_textures(resources, &graphics);
+        let world = make_world(&map, &graphics)?;
+        let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
+        let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
+        let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
+        let script_data = resources.read(&format!("map/process.{id}"))?;
+        let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
+        // Teleport sections live in the level process resource.
+        let (teleports, teleport_load_error) = match std::str::from_utf8(&script_data) {
+            Ok(text) => match openchasm::teleport::parse(text) {
+                Ok(rows) => (Some(rows), None),
+                Err(error) => (None, Some(format!("TELEPORT DATA INVALID: {error}"))),
+            },
+            Err(_) => (None, Some("TELEPORT DATA IS NOT UTF-8".to_owned())),
+        };
+        if let Some(error) = &teleport_load_error {
+            eprintln!("{error}");
+        }
+        let cells = raw_cells(&map);
+        let definitions = objects::ObjectDefinitions::parse(&info, &resource)?;
+        let mut object_scene =
+            object_render::ObjectScene::load(resources, &map, &definitions, &palette);
+        let mine_available = object_scene.preload_mine(resources, &definitions);
+        if !mine_available {
+            eprintln!("mine placement disabled: mine model unavailable");
+        }
+        let (actor_definitions, actor_state) = level_actor_state(&map, &map_bytes, &info)?;
+        object_scene.add_actors(resources, &actor_state, &actor_definitions);
+        let actor_clips = load_actor_clips(resources, &actor_state, &actor_definitions);
+        let instances = objects::instances(&map);
+        for instance in &instances {
+            object_scene.set_visible(
+                instance.grid_cell,
+                instance.difficulty_flags & difficulty_mask(difficulty) != 0,
+            );
+        }
+        // Only opt in for visible, difficulty-enabled object placements
+        // with a representable render instance; other targets stay closed.
+        let process_objects: Vec<_> = instances
+            .iter()
+            .filter_map(|instance| {
+                if instance.difficulty_flags & difficulty_mask(difficulty) == 0
+                    || !object_scene.has_cell(instance.grid_cell)
+                {
+                    return None;
+                }
+                let definition = definitions.definition(instance)?;
+                let x = u8::try_from(instance.grid_cell[0]).ok()?;
+                let y = u8::try_from(instance.grid_cell[1]).ok()?;
+                // GoRad shapes are provisionally approximated as circles;
+                // pickups must remain nonblocking so they can be collected.
+                let blocking_radius = process_blocking_radius(
+                    instance.kind,
+                    definition.action_code,
+                    definition.collision_radius,
+                );
+                Some(process_runtime::ProcessObject {
+                    cell: [x, y],
+                    position: instance.position,
+                    angle_radians: instance.angle_radians,
+                    elevation_raw: 0.0,
+                    blocking_radius,
+                })
+            })
+            .collect();
+        let scripted = match openchasm::object_states::ObjectStates::new(&instances, &definitions) {
+            Ok(states) => {
+                let manifest = replacement_manifest::build_replacement_manifest(
+                    resources,
+                    &mut object_scene,
+                    &definitions,
+                    &instances,
+                    &script,
+                    difficulty,
+                );
+                Some(openchasm::session::ScriptedObjects::new(
+                    states,
+                    definitions.clone(),
+                    manifest,
+                    &script,
+                    true,
+                ))
+            }
+            Err(error) => {
+                eprintln!("scripted object transitions disabled: {error}");
+                None
+            }
+        };
+        let capabilities = process_runtime::ProcessCapabilities {
+            wall_elevation: true,
+            initial_cell_types: None,
+        };
+        let processes = if scripted.is_some() {
+            process_runtime::ProcessRuntime::with_staged_actions(
+                &script,
+                &world,
+                capabilities,
+                &cells,
+                &process_objects,
+            )?
+        } else {
+            process_runtime::ProcessRuntime::with_wind(
+                &script,
+                &world,
+                capabilities,
+                &cells,
+                &process_objects,
+            )?
+        };
+        let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
+        let mut audio = audio::Audio::new(resources, &info);
+        audio.play_level_music(resources, &resource);
+        let weapon_overlay = weapon_render::WeaponRenderer::load(resources, &info, &palette)?;
+        let mut game =
+            openchasm::game::GameInventory::new(weapons, &instances, &definitions, difficulty);
+        if let Some(mut inventory) = carry.take() {
+            inventory.keys = [false; 3];
+            inventory.clear_level_effects();
+            game.inventory = inventory;
+        }
+        let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
+        let projectile_renderer =
+            projectile_render::ProjectileRenderer::load(resources, &rockets, &palette);
+        let explosion_renderer =
+            match explosion_render::ExplosionRenderer::load(resources, &palette, &rockets) {
+                Ok(renderer) => Some(renderer),
+                Err(error) => {
+                    eprintln!("explosion visuals unavailable: {error}");
+                    None
+                }
+            };
+        let shot_blocking = std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
+        let mut session = openchasm::session::Session::new(openchasm::session::LevelSetup {
+            world,
+            processes,
+            actors: actor_state,
+            actor_definitions,
+            game,
+            rockets,
+            shot_blocking,
+            difficulty,
+        });
+        let object_heights = object_height_loader::load_object_heights(resources, &definitions);
+        if !session.set_object_heights(object_heights, cells) {
+            eprintln!("object height catalog rejected; using conservative collision");
+        }
+    session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
+        session.ai.set_clip_metadata(actor_clips);
+        session.set_explosions_enabled(true);
+        session.set_mines_enabled(mine_available);
+        session.set_protective_powerups_enabled(true);
+        session.set_addon_boss_rule(actors::ActorMapping::recognize_shipped_addon(
+            &map_bytes, &info,
+        ));
+        if let Some(teleports) = teleports {
+            session.set_teleports(
+                teleports,
+                openchasm::teleport::RearmPolicy::AfterLeavingSources,
+            );
+        }
+        session.set_objects(openchasm::object_combat::ObjectCombat::new(
+            &instances,
+            &definitions,
+            &script,
+            difficulty,
+        ));
+        if let Some(scripted) = scripted {
+            session.set_scripted_objects(scripted);
+        }
+        session.set_mission(openchasm::mission::MissionPlan::parse(
+            &script,
+            &String::from_utf8_lossy(&script_data),
+        ));
+        let next_level = viewer::run(
+            textures,
+            planes,
+            object_scene,
+            viewer::ClientFeedback {
+                session,
+                audio,
+                weapon_overlay,
+                projectile_renderer,
+                explosion_renderer,
+                difficulty,
+                teleport_load_error,
+            },
+            &format!("{id}: {name} ({difficulty:?})"),
+        )?;
+        if let (Some(inventory), Some(next)) = (next_level, next_campaign_level(&id)) {
+            carry = Some(inventory);
+            id = next;
+        } else {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1).peekable();
     let (selection, difficulty, difficulty_supplied) = parse_options(&mut args)?;
@@ -324,6 +537,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if difficulty_supplied && command != "view" {
         return Err("--difficulty applies to view".into());
+    }
+    if command == "launcher" {
+        if selection.is_some() || args.next().is_some() {
+            return Err("launcher takes no options or arguments".into());
+        }
+        let mut message = None;
+        while let Some(choice) = launcher::run(message.take())? {
+            let result = ResourceSet::open(&choice.path)
+                .map_err(|error| format!("{}: {error}", choice.path.display()).into())
+                .and_then(|mut resources| play(&mut resources, choice.difficulty, choice.level));
+            if let Err(error) = result {
+                eprintln!("{error}");
+                message = Some(error.to_string());
+            }
+        }
+        return Ok(());
     }
     if command == "sources" {
         if args.next().is_some() {
@@ -418,226 +647,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("Checked {} maps.", paths.len());
         }
         "view" => {
-            let mut id = args.next().unwrap_or_else(|| "01".to_owned());
+            let id = args.next().unwrap_or_else(|| "01".to_owned());
             if args.next().is_some() || id.len() != 2 || !id.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("view expects a two-digit level ID, for example 01".into());
             }
-            let mut carry: Option<openchasm::inventory::Inventory> = None;
-            let info = resources.read("chasm.inf")?;
-            loop {
-                let map_bytes = resources.read(&format!("map/map.{id}"))?;
-                let map = Map::parse(&map_bytes)?;
-                let resource = resources.read(&format!("map/resource.{id}"))?;
-                let name = level_name(&resource);
-                let graphics = parse_wall_graphics(&resource);
-                let textures = load_wall_textures(&mut resources, &graphics);
-                let world = make_world(&map, &graphics)?;
-                let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
-                let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
-                let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
-                let script_data = resources.read(&format!("map/process.{id}"))?;
-                let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
-                // Teleport sections live in the level process resource.
-                let (teleports, teleport_load_error) = match std::str::from_utf8(&script_data) {
-                    Ok(text) => match openchasm::teleport::parse(text) {
-                        Ok(rows) => (Some(rows), None),
-                        Err(error) => (None, Some(format!("TELEPORT DATA INVALID: {error}"))),
-                    },
-                    Err(_) => (None, Some("TELEPORT DATA IS NOT UTF-8".to_owned())),
-                };
-                if let Some(error) = &teleport_load_error {
-                    eprintln!("{error}");
-                }
-                let cells = raw_cells(&map);
-                let definitions = objects::ObjectDefinitions::parse(&info, &resource)?;
-                let mut object_scene =
-                    object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
-                let mine_available = object_scene.preload_mine(&mut resources, &definitions);
-                if !mine_available {
-                    eprintln!("mine placement disabled: mine model unavailable");
-                }
-                let (actor_definitions, actor_state) = level_actor_state(&map, &map_bytes, &info)?;
-                object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
-                let actor_clips =
-                    load_actor_clips(&mut resources, &actor_state, &actor_definitions);
-                let instances = objects::instances(&map);
-                for instance in &instances {
-                    object_scene.set_visible(
-                        instance.grid_cell,
-                        instance.difficulty_flags & difficulty_mask(difficulty) != 0,
-                    );
-                }
-                // Only opt in for visible, difficulty-enabled object placements
-                // with a representable render instance; other targets stay closed.
-                let process_objects: Vec<_> = instances
-                    .iter()
-                    .filter_map(|instance| {
-                        if instance.difficulty_flags & difficulty_mask(difficulty) == 0
-                            || !object_scene.has_cell(instance.grid_cell)
-                        {
-                            return None;
-                        }
-                        let definition = definitions.definition(instance)?;
-                        let x = u8::try_from(instance.grid_cell[0]).ok()?;
-                        let y = u8::try_from(instance.grid_cell[1]).ok()?;
-                        // GoRad shapes are provisionally approximated as circles;
-                        // pickups must remain nonblocking so they can be collected.
-                        let blocking_radius = process_blocking_radius(
-                            instance.kind,
-                            definition.action_code,
-                            definition.collision_radius,
-                        );
-                        Some(process_runtime::ProcessObject {
-                            cell: [x, y],
-                            position: instance.position,
-                            angle_radians: instance.angle_radians,
-                            elevation_raw: 0.0,
-                            blocking_radius,
-                        })
-                    })
-                    .collect();
-                let scripted =
-                    match openchasm::object_states::ObjectStates::new(&instances, &definitions) {
-                        Ok(states) => {
-                            let manifest = replacement_manifest::build_replacement_manifest(
-                                &mut resources,
-                                &mut object_scene,
-                                &definitions,
-                                &instances,
-                                &script,
-                                difficulty,
-                            );
-                            Some(openchasm::session::ScriptedObjects::new(
-                                states,
-                                definitions.clone(),
-                                manifest,
-                                &script,
-                                true,
-                            ))
-                        }
-                        Err(error) => {
-                            eprintln!("scripted object transitions disabled: {error}");
-                            None
-                        }
-                    };
-                let capabilities = process_runtime::ProcessCapabilities {
-                    wall_elevation: true,
-                    initial_cell_types: None,
-                };
-                let processes = if scripted.is_some() {
-                    process_runtime::ProcessRuntime::with_staged_actions(
-                        &script,
-                        &world,
-                        capabilities,
-                        &cells,
-                        &process_objects,
-                    )?
-                } else {
-                    process_runtime::ProcessRuntime::with_wind(
-                        &script,
-                        &world,
-                        capabilities,
-                        &cells,
-                        &process_objects,
-                    )?
-                };
-                let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
-                let mut audio = audio::Audio::new(&mut resources, &info);
-                audio.play_level_music(&mut resources, &resource);
-                let weapon_overlay =
-                    weapon_render::WeaponRenderer::load(&mut resources, &info, &palette)?;
-                let mut game = openchasm::game::GameInventory::new(
-                    weapons,
-                    &instances,
-                    &definitions,
-                    difficulty,
-                );
-                if let Some(mut inventory) = carry.take() {
-                    inventory.keys = [false; 3];
-                    inventory.clear_level_effects();
-                    game.inventory = inventory;
-                }
-                let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
-                let projectile_renderer =
-                    projectile_render::ProjectileRenderer::load(&mut resources, &rockets, &palette);
-                let explosion_renderer = match explosion_render::ExplosionRenderer::load(
-                    &mut resources,
-                    &palette,
-                    &rockets,
-                ) {
-                    Ok(renderer) => Some(renderer),
-                    Err(error) => {
-                        eprintln!("explosion visuals unavailable: {error}");
-                        None
-                    }
-                };
-                let shot_blocking =
-                    std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
-                let mut session =
-                    openchasm::session::Session::new(openchasm::session::LevelSetup {
-                        world,
-                        processes,
-                        actors: actor_state,
-                        actor_definitions,
-                        game,
-                        rockets,
-                        shot_blocking,
-                        difficulty,
-                    });
-                let object_heights =
-                    object_height_loader::load_object_heights(&mut resources, &definitions);
-                if !session.set_object_heights(object_heights, cells) {
-                    eprintln!("object height catalog rejected; using conservative collision");
-                }
-                session.ai.set_clip_metadata(actor_clips);
-                session.set_explosions_enabled(true);
-                session.set_mines_enabled(mine_available);
-                session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
-                session.set_protective_powerups_enabled(true);
-                session.set_addon_boss_rule(actors::ActorMapping::recognize_shipped_addon(
-                    &map_bytes, &info,
-                ));
-                if let Some(teleports) = teleports {
-                    session.set_teleports(
-                        teleports,
-                        openchasm::teleport::RearmPolicy::AfterLeavingSources,
-                    );
-                }
-                session.set_objects(openchasm::object_combat::ObjectCombat::new(
-                    &instances,
-                    &definitions,
-                    &script,
-                    difficulty,
-                ));
-                if let Some(scripted) = scripted {
-                    session.set_scripted_objects(scripted);
-                }
-                session.set_mission(openchasm::mission::MissionPlan::parse(
-                    &script,
-                    &String::from_utf8_lossy(&script_data),
-                ));
-                let next_level = viewer::run(
-                    textures,
-                    planes,
-                    object_scene,
-                    viewer::ClientFeedback {
-                        session,
-                        audio,
-                        weapon_overlay,
-                        projectile_renderer,
-                        explosion_renderer,
-                        difficulty,
-                        teleport_load_error,
-                    },
-                    &format!("{id}: {name} ({difficulty:?})"),
-                )?;
-                if let (Some(inventory), Some(next)) = (next_level, next_campaign_level(&id)) {
-                    carry = Some(inventory);
-                    id = next;
-                } else {
-                    break;
-                }
-            }
+            play(&mut resources, difficulty, id)?;
         }
         "objects" => {
             let id = args.next().unwrap_or_else(|| "01".to_owned());

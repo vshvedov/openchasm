@@ -300,6 +300,65 @@ impl World {
         hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     }
 
+    /// Test a stationary horizontal disc against caller-selected walls and
+    /// circles. The predicate receives the wall index and decides whether that
+    /// wall blocks this placement (including any height/material policy).
+    /// Touching is allowed; overlapping segments, including endpoints, blocks.
+    /// Invalid input or an invalid selected obstacle fails closed. This query
+    /// does not enforce map bounds or vertical clearance; callers must do so.
+    pub fn disc_is_clear(
+        &self,
+        center: [f32; 2],
+        radius: f32,
+        circles: &[CollisionCircle],
+        blocks_wall: impl Fn(usize, &Wall) -> bool,
+    ) -> bool {
+        if !center.iter().all(|v| v.is_finite()) || !radius.is_finite() || radius <= 0.0 {
+            return false;
+        }
+        let p = center.map(f64::from);
+        let r = f64::from(radius);
+        for (index, wall) in self.walls.iter().enumerate() {
+            if !blocks_wall(index, wall) {
+                continue;
+            }
+            if !wall.a.iter().chain(wall.b.iter()).all(|v| v.is_finite()) {
+                return false;
+            }
+            let a = wall.a.map(f64::from);
+            let b = wall.b.map(f64::from);
+            let dx = b[0] - a[0];
+            let dy = b[1] - a[1];
+            let len_sq = dx * dx + dy * dy;
+            // A malformed zero-length wall is treated as a solid point.
+            let t = if len_sq == 0.0 {
+                0.0
+            } else {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len_sq).clamp(0.0, 1.0)
+            };
+            let sx = p[0] - (a[0] + t * dx);
+            let sy = p[1] - (a[1] + t * dy);
+            if sx * sx + sy * sy < r * r {
+                return false;
+            }
+        }
+        for circle in circles {
+            if !circle.center.iter().all(|v| v.is_finite())
+                || !circle.radius.is_finite()
+                || circle.radius < 0.0
+            {
+                return false;
+            }
+            let dx = p[0] - f64::from(circle.center[0]);
+            let dy = p[1] - f64::from(circle.center[1]);
+            let combined = r + f64::from(circle.radius);
+            if dx * dx + dy * dy < combined * combined {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Move a disc using the same swept wall and circle collision as the player.
     pub fn move_circle(
         &self,
@@ -573,6 +632,59 @@ mod tests {
         let mut hits = Vec::new();
         world.ray_hits([-1.0, 0.0], &mut hits);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn stationary_disc_checks_segments_endpoints_and_circles() {
+        let world = test_world();
+        let solid = |_: usize, w: &Wall| w.blocks_movement;
+        assert!(!world.disc_is_clear([1.1, 0.0], 0.2, &[], solid));
+        assert!(!world.disc_is_clear([1.1, 1.1], 0.2, &[], solid));
+        assert!(world.disc_is_clear([1.3, 0.0], 0.2, &[], solid));
+        assert!(world.disc_is_clear([1.1, 0.0], 0.2, &[], |_, _| false));
+        let circle = CollisionCircle {
+            center: [3.0, 0.0],
+            radius: 0.5,
+        };
+        assert!(!world.disc_is_clear([3.4, 0.0], 0.2, &[circle], solid));
+        assert!(world.disc_is_clear([3.8, 0.0], 0.2, &[circle], solid));
+        let tangent = CollisionCircle {
+            center: [3.0, 0.0],
+            radius: 0.5,
+        };
+        assert!(world.disc_is_clear([4.0, 0.0], 0.5, &[tangent], solid));
+    }
+    #[test]
+    fn stationary_disc_fails_closed_for_invalid_data_and_degenerate_walls() {
+        let mut world = test_world();
+        let solid = |_: usize, _: &Wall| true;
+        assert!(!world.disc_is_clear([f32::NAN, 0.0], 0.2, &[], solid));
+        assert!(!world.disc_is_clear([0.0, 0.0], 0.0, &[], solid));
+        assert!(!world.disc_is_clear([0.0, 0.0], f32::INFINITY, &[], solid));
+        assert!(!world.disc_is_clear(
+            [0.0, 0.0],
+            0.2,
+            &[CollisionCircle {
+                center: [f32::NAN, 0.0],
+                radius: 1.0
+            }],
+            solid
+        ));
+        assert!(!world.disc_is_clear(
+            [0.0, 0.0],
+            0.2,
+            &[CollisionCircle {
+                center: [0.0, 0.0],
+                radius: -1.0
+            }],
+            solid
+        ));
+        world.walls[0].a = [0.0, 0.0];
+        world.walls[0].b = [0.0, 0.0];
+        assert!(!world.disc_is_clear([0.1, 0.0], 0.2, &[], solid));
+        world.walls[0].a = [f32::NAN, 0.0];
+        assert!(!world.disc_is_clear([0.0, 0.0], 0.2, &[], solid));
+        assert!(world.disc_is_clear([0.0, 0.0], 0.2, &[], |_, _| false));
     }
 
     #[test]

@@ -55,14 +55,41 @@ impl PlaneRenderer {
     /// Paint the floor and ceiling before drawing walls, using the same camera
     /// plane and projected wall height as the geometry preview. Invalid or
     /// off-map intersections retain a plain background.
+    #[cfg(test)]
     pub fn render(&self, frame: &mut [u32], width: usize, height: usize, camera: CameraView) {
         self.render_lit(frame, width, height, camera, None);
     }
 
     /// Dynamic light adds a provisional boost at each world intersection.
+    #[cfg(test)]
     pub fn render_lit(
         &self,
         frame: &mut [u32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+    ) {
+        self.render_inner(frame, None, width, height, camera, lights);
+    }
+
+    /// Paint planes and write perpendicular depths for actual geometry only.
+    pub fn render_with_depth(
+        &self,
+        frame: &mut [u32],
+        depth: &mut [f32],
+        width: usize,
+        height: usize,
+        camera: CameraView,
+        lights: Option<&openchasm::dynamic_light::DynamicLightSampler>,
+    ) {
+        self.render_inner(frame, Some(depth), width, height, camera, lights);
+    }
+
+    fn render_inner(
+        &self,
+        frame: &mut [u32],
+        mut depth: Option<&mut [f32]>,
         width: usize,
         height: usize,
         camera: CameraView,
@@ -74,6 +101,9 @@ impl PlaneRenderer {
             || width == 0
             || height == 0
             || width.checked_mul(height) != Some(frame.len())
+            || depth
+                .as_ref()
+                .is_some_and(|buffer| buffer.len() != frame.len())
         {
             return;
         }
@@ -150,6 +180,9 @@ impl PlaneRenderer {
                 let light = lights.map_or(0.0, |lights| lights.sample([world_x, world_y]));
                 let shade =
                     |channel| ((channel as f32 * attenuation * (1.0 + light)) as u32).min(255);
+                if let Some(buffer) = depth.as_deref_mut() {
+                    buffer[y * width + x] = distance;
+                }
                 *pixel = (shade((texel >> 16) & 255) << 16)
                     | (shade((texel >> 8) & 255) << 8)
                     | shade(texel & 255);
@@ -178,6 +211,29 @@ mod tests {
             Floors::parse(&floors).unwrap(),
             Palette::parse(&palette).unwrap(),
         )
+    }
+
+    #[test]
+    fn solid_planes_write_perpendicular_depth_but_sky_does_not() {
+        let (map, floors, palette) = fixtures(0, SKY_TILE);
+        let renderer = PlaneRenderer::new(&map, &floors, &palette);
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [16.5, 16.5],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.25_f32.atan(),
+        };
+        let mut image = vec![0; 64];
+        let mut depth = vec![f32::INFINITY; 64];
+        renderer.render_with_depth(&mut image, &mut depth, 8, 8, camera, None);
+        assert!(depth[4].is_infinite());
+        // Horizon is 5: at row 7.5, distance = 4 / 2.5 = 1.6 tiles.
+        assert!((depth[7 * 8 + 4] - 1.6).abs() < 1e-6);
+        // Opaque models and projectiles use this same depth comparison.
+        assert!(2.0 >= depth[7 * 8 + 4]);
+        assert!(1.0 < depth[7 * 8 + 4]);
     }
 
     #[test]

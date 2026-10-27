@@ -511,12 +511,9 @@ fn render(
         eye_height: scene.eye_height,
         pitch: scene.pitch,
     };
+    depth.fill(f32::INFINITY);
     if let Some(planes) = planes {
-        if scene.lights.is_some() {
-            planes.render_lit(frame, WIDTH, HEIGHT, camera, scene.lights);
-        } else {
-            planes.render(frame, WIDTH, HEIGHT, camera);
-        }
+        planes.render_with_depth(frame, depth, WIDTH, HEIGHT, camera, scene.lights);
     } else {
         for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
             row.fill(if (y as f32 + 0.5) < camera.horizon(HEIGHT) {
@@ -526,7 +523,6 @@ fn render(
             });
         }
     }
-    depth.fill(f32::INFINITY);
     let (sin, cos) = camera.player.angle.sin_cos();
     let mut hits = Vec::new();
     for x in 0..WIDTH {
@@ -558,6 +554,9 @@ fn render(
                 | channel(65 + texture * 13 % 90);
             let image = textures.get(texture as usize).and_then(Option::as_ref);
             for y in top..bottom {
+                if distance >= depth[y * WIDTH + x] {
+                    continue;
+                }
                 let pixel = if let Some(image) = image {
                     let tx = ((along * image.width as f32) as usize).min(image.width - 1);
                     let ty = (((y as f32 - origin) / (half * 2.0).max(1.0) * image.height as f32)
@@ -1899,6 +1898,65 @@ mod tests {
         );
         assert!(top(&depth) > lower_camera_top + 10);
     }
+    #[test]
+    fn pitched_ceiling_occludes_the_top_of_an_elevated_wall() {
+        let mut bytes = vec![0; 0x27001 + 4];
+        bytes[0x23001..0x25001].fill(0);
+        let map = crate::map::Map::parse(&bytes).unwrap();
+        let mut floor_bytes = vec![0; 64 + 64 * 64 * 86];
+        floor_bytes[64..64 + 4096].fill(1);
+        let floors = crate::map::Floors::parse(&floor_bytes).unwrap();
+        let mut palette_bytes = vec![0; 768];
+        palette_bytes[4] = 63;
+        let palette = crate::texture::Palette::parse(&palette_bytes).unwrap();
+        let planes = PlaneRenderer::new(&map, &floors, &palette);
+        let world = World {
+            walls: vec![Wall {
+                a: [20.5, 15.5],
+                b: [20.5, 17.5],
+                texture: 1,
+                blocks_movement: true,
+                cell: None,
+            }],
+            player: Player {
+                position: [16.5, 16.5],
+                angle: 0.0,
+            },
+        };
+        let textures = vec![
+            None,
+            Some(ViewerTexture {
+                width: 1,
+                height: 1,
+                pixels: vec![0xff0000],
+            }),
+        ];
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[64.0],
+                eye_height: 1.0,
+                yaw_offset: 0.0,
+                pitch: 0.2_f32.atan(),
+                mines: &[],
+                lights: None,
+            },
+            &textures,
+            Some(&planes),
+            None,
+        );
+        let upper = 150 * WIDTH + WIDTH / 2;
+        let middle = 225 * WIDTH + WIDTH / 2;
+        assert!(depth[upper] < 4.0);
+        assert_eq!(frame[upper] & 0xff0000, 0);
+        assert_eq!(depth[middle], 4.0);
+        assert!(frame[middle] & 0xff0000 > 0);
+    }
+
     #[test]
     fn raised_wall_exposes_space_below_it() {
         let world = World {

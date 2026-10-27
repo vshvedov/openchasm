@@ -13,6 +13,7 @@ pub mod world;
 pub mod actors;
 pub mod ai;
 pub mod combat;
+pub mod explosives;
 pub mod game;
 pub mod hazards;
 pub mod mission;

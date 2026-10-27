@@ -7,7 +7,7 @@ use crate::actor_clips::ActorClipSet;
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::combat::RocketDefinitions;
 use crate::pickups::Difficulty;
-use crate::world::{CollisionCircle, Wall, World};
+use crate::world::{CollisionCircle, Wall, WallCollisionMode, World};
 use std::collections::BTreeMap;
 
 const DT: f32 = 1.0 / 60.0;
@@ -67,6 +67,18 @@ struct Brain {
     cooldown: u16,
     run_units: u64,
     attack_phase: Option<AttackPhase>,
+}
+
+/// Sided actor collision is allowed only for walls marked definitely static.
+/// Missing/false entries stay two-sided, including process-driven geometry.
+pub struct ActorCollisionSides<'a> {
+    pub objects: &'a [CollisionCircle],
+    pub static_walls: &'a [bool],
+}
+#[derive(Clone, Copy)]
+struct ActorCollision<'a> {
+    objects: &'a [CollisionCircle],
+    static_walls: Option<&'a [bool]>,
 }
 
 /// Per-actor AI state remains separate from map definitions and rendering.
@@ -317,7 +329,34 @@ impl EnemyAi {
             Some(rockets),
             world,
             blocks_shots,
-            Some(objects),
+            Some(ActorCollision {
+                objects,
+                static_walls: None,
+            }),
+        )
+    }
+    /// Sweep against authored wall sides only for explicitly verified static
+    /// walls. Every unmarked wall remains conservatively two-sided. Shot and
+    /// sight tests always use the original material and are unchanged.
+    pub fn tick_with_authored_sides(
+        &mut self,
+        actors: &mut ActorState,
+        definitions: &ActorDefinitions,
+        rockets: &RocketDefinitions,
+        world: &World,
+        blocks_shots: &dyn Fn(&Wall) -> bool,
+        sides: ActorCollisionSides<'_>,
+    ) -> Vec<EnemyAttack> {
+        self.tick_inner(
+            actors,
+            definitions,
+            Some(rockets),
+            world,
+            blocks_shots,
+            Some(ActorCollision {
+                objects: sides.objects,
+                static_walls: Some(sides.static_walls),
+            }),
         )
     }
 
@@ -328,14 +367,29 @@ impl EnemyAi {
         rockets: Option<&RocketDefinitions>,
         world: &World,
         blocks_shots: &dyn Fn(&Wall) -> bool,
-        objects: Option<&[CollisionCircle]>,
+        collision: Option<ActorCollision<'_>>,
     ) -> Vec<EnemyAttack> {
         let mut attacks = Vec::new();
         let target = world.player.position;
         if !target.iter().all(|v| v.is_finite()) {
             return attacks;
         }
-        let mut circles = objects.map(|_| {
+        // The sweep uses a private world copy so conservative wall-side
+        // overrides do not affect visibility, shots, or the owning world.
+        let movement_world = collision.and_then(|config| {
+            config.static_walls.map(|mask| {
+                let mut view = world.clone();
+                for (index, wall) in view.walls.iter_mut().enumerate() {
+                    if !mask.get(index).copied().unwrap_or(false)
+                        && (1..=86).contains(&wall.texture)
+                    {
+                        wall.texture = 120;
+                    }
+                }
+                view
+            })
+        });
+        let mut circles = collision.map(|_| {
             actors
                 .actors
                 .iter()
@@ -560,7 +614,8 @@ impl EnemyAi {
                 to_goal[0] / goal_distance * travel,
                 to_goal[1] / goal_distance * travel,
             ];
-            if let (Some(circles), Some(objects)) = (&mut circles, objects) {
+            if let (Some(circles), Some(config)) = (&mut circles, collision) {
+                let objects = config.objects;
                 let radius = (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0);
                 let mut obstacles = Vec::with_capacity(circles.len() + objects.len() + 1);
                 obstacles.push(CollisionCircle {
@@ -573,7 +628,17 @@ impl EnemyAi {
                     }),
                 );
                 obstacles.extend(objects.iter().copied());
-                actor.position = world.move_circle(actor.position, delta, radius, &obstacles);
+                actor.position = if let Some(view) = &movement_world {
+                    view.move_circle_with_mode(
+                        actor.position,
+                        delta,
+                        radius,
+                        &obstacles,
+                        WallCollisionMode::AuthoredSides,
+                    )
+                } else {
+                    world.move_circle(actor.position, delta, radius, &obstacles)
+                };
                 circles[index] = Some(CollisionCircle {
                     center: actor.position,
                     radius,
@@ -1031,5 +1096,78 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn authored_actor_sides_require_explicit_static_proof() {
+        fn run(from: f32, target: f32, texture: u8, static_wall: &[bool], legacy: bool) -> f32 {
+            let (mut state, mut defs) = actor(100, 7);
+            defs.entries[1].kick = 0;
+            state.actors[0].position = [from, 0.0];
+            let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+            let w = world([target, 0.0], vec![wall(texture, true)]);
+            for _ in 0..150 {
+                if legacy {
+                    ai.tick_with_actor_collision(
+                        &mut state,
+                        &defs,
+                        &rockets(),
+                        &w,
+                        &|_| false,
+                        &[],
+                    );
+                } else {
+                    ai.tick_with_authored_sides(
+                        &mut state,
+                        &defs,
+                        &rockets(),
+                        &w,
+                        &|_| false,
+                        ActorCollisionSides {
+                            objects: &[],
+                            static_walls: static_wall,
+                        },
+                    );
+                }
+            }
+            state.actors[0].position[0]
+        }
+        let front = run(0.0, 2.0, 1, &[true], false);
+        assert!(front < 0.8, "opaque front blocks: {front}");
+        let back = run(2.0, 0.0, 1, &[true], false);
+        assert!(back < 1.0, "verified static back passes: {back}");
+        for (texture, mask, legacy) in [
+            (1, &[][..], false),
+            (1, &[false][..], false),
+            (87, &[true][..], false),
+            (120, &[true][..], false),
+            (1, &[true][..], true),
+        ] {
+            let position = run(2.0, 0.0, texture, mask, legacy);
+            assert!(
+                position > 1.2,
+                "unverified, transparent or default wall blocks both sides: {position}"
+            );
+        }
+    }
+    #[test]
+    fn authored_movement_does_not_change_wall_material_for_sight() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].kick = 0;
+        state.actors[0].position = [2.0, 0.0];
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let w = world([0.0, 0.0], vec![wall(1, true)]);
+        ai.tick_with_authored_sides(
+            &mut state,
+            &defs,
+            &rockets(),
+            &w,
+            &|wall| wall.texture == 1,
+            ActorCollisionSides {
+                objects: &[],
+                static_walls: &[],
+            },
+        );
+        assert_eq!(ai.mode(0), Some(Mode::Idle));
+        assert_eq!(w.walls[0].texture, 1);
     }
 }

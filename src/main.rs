@@ -297,7 +297,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let script_data = resources.read(&format!("map/process.{id}"))?;
                 let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
                 let cells = raw_cells(&map);
-                let processes = process_runtime::ProcessRuntime::with_cell_data(
+                let processes = process_runtime::ProcessRuntime::with_hazards(
                     &script,
                     &world,
                     process_runtime::ProcessCapabilities {

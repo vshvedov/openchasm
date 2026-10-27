@@ -3,6 +3,7 @@ use crate::actors::{ActorDefinitions, ActorState};
 use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpact};
 use crate::game::GameInventory;
+use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
 use crate::object_combat::ObjectCombat;
 use crate::pickups::{Difficulty, PickupEvent};
@@ -46,6 +47,7 @@ pub struct SessionEvents {
     /// Mission presentation/completion events produced during this step.
     pub mission: Vec<MissionEvent>,
     pub process_effects: Vec<ProcessEffect>,
+    pub hazard_damage: Vec<HazardDamage>,
     pub vertical: VerticalEvents,
 }
 
@@ -62,6 +64,7 @@ pub struct Session {
     pub projectiles: ProjectileSystem,
     pub objects: Option<ObjectCombat>,
     pub mission: Option<MissionState>,
+    pub hazards: Hazards,
     /// Absolute offsets in original script units, indexed by wall index.
     pub wall_elevations: Vec<f32>,
     base_wall_blocking: Vec<bool>,
@@ -101,6 +104,7 @@ impl Session {
             projectiles: ProjectileSystem::new(),
             objects: None,
             mission: None,
+            hazards: Hazards::default(),
             combat: Combat::new(),
             rockets: setup.rockets,
             shot_blocking: setup.shot_blocking,
@@ -172,6 +176,7 @@ impl Session {
     fn apply_process_effects(&mut self) -> Vec<ProcessEffect> {
         let effects = self.processes.take_effects();
         for effect in &effects {
+            self.hazards.apply_effect(effect);
             if let ProcessEffect::WallElevation {
                 wall_index,
                 offset_raw,
@@ -427,6 +432,34 @@ impl Session {
             }
         }
         events.process_effects.extend(self.apply_process_effects());
+        events.hazard_damage = self.hazards.tick(
+            self.world.player.position,
+            self.vertical.feet(),
+            self.vertical.head(),
+            &self.actors,
+        );
+        for hazard in &events.hazard_damage {
+            match hazard.target {
+                HazardTarget::Player => {
+                    events.damage = events.damage.saturating_add(
+                        self.apply_player_damage(hazard.damage.min(u16::MAX as u32) as u16),
+                    )
+                }
+                HazardTarget::Actor { source_index } => {
+                    if let Some(actor) = self
+                        .actors
+                        .actors
+                        .iter_mut()
+                        .find(|actor| actor.source_index == source_index)
+                    {
+                        actor.health = actor
+                            .health
+                            .saturating_sub(hazard.damage.min(i32::MAX as u32) as i32)
+                            .max(0);
+                    }
+                }
+            }
+        }
         events
     }
 }
@@ -812,6 +845,24 @@ mod tests {
             &session.elevation_by_cell,
             1.3
         ));
+    }
+    #[test]
+    fn script_hazard_applies_periodic_damage_to_player() {
+        use crate::process_runtime::ProcessCapabilities;
+        let text =
+            "#proc1\n#action\nnonstop\ndeath 0 0 0 0 0 128 30\n#end\n#links\nfloor 0 0 1\n#end\n";
+        let mut session = mission_session(text);
+        let cells = [0u8; 4096];
+        session.processes = ProcessRuntime::with_hazards(
+            &Script::parse(text),
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+        );
+        for _ in 0..20 {
+            session.step(SessionInput::default());
+        }
+        assert_eq!(session.game.inventory.health, 70);
     }
     #[test]
     fn session_fires_damages_enemies_and_consumes_ammunition() {

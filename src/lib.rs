@@ -7,6 +7,7 @@ pub mod monster;
 pub mod objects;
 pub mod process;
 pub mod process_runtime;
+pub mod process_transaction;
 pub mod world;
 
 pub mod actors;

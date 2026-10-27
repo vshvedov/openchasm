@@ -126,8 +126,8 @@ impl PlaneRenderer {
                 FLOOR_BACKGROUND
             };
             row.fill(background);
-            if let Some(sky) = &self.sky {
-                for (x, pixel) in row.iter_mut().enumerate() {
+            let paint_sky = |x: usize, pixel: &mut u32| {
+                if let Some(sky) = &self.sky {
                     let camera_x = 2.0 * (x as f32 + 0.5) / width as f32 - 1.0;
                     *pixel = sky.sample([
                         cos + camera_plane[0] * camera_x,
@@ -135,10 +135,13 @@ impl PlaneRenderer {
                         (horizon - (y as f32 + 0.5)) / projection,
                     ]);
                 }
-            }
+            };
             // Half the current preview wall's projected height at unit distance.
             let delta = ((y as f32 + 0.5) - horizon).abs();
             if delta < f32::EPSILON {
+                for (x, pixel) in row.iter_mut().enumerate() {
+                    paint_sky(x, pixel);
+                }
                 continue;
             }
             let plane_height = if ceiling {
@@ -147,6 +150,9 @@ impl PlaneRenderer {
                 camera.eye_height
             };
             if plane_height <= 0.0 {
+                for (x, pixel) in row.iter_mut().enumerate() {
+                    paint_sky(x, pixel);
+                }
                 continue;
             }
             let distance = projection * plane_height / delta;
@@ -164,6 +170,7 @@ impl PlaneRenderer {
                 if !(0.0..MAP_SIDE as f32).contains(&world_x)
                     || !(0.0..MAP_SIDE as f32).contains(&world_y)
                 {
+                    paint_sky(x, pixel);
                     continue;
                 }
                 let tile_x = world_x.floor() as usize;
@@ -175,6 +182,7 @@ impl PlaneRenderer {
                     self.floor_ids[cell]
                 };
                 if id == EMPTY_TILE || id == SKY_TILE || usize::from(id) >= FLOOR_TEXTURE_COUNT {
+                    paint_sky(x, pixel);
                     continue;
                 }
                 let tx = ((world_x - tile_x as f32) * FLOOR_TEXTURE_SIDE as f32) as usize;
@@ -293,6 +301,34 @@ mod tests {
         renderer.set_sky(Sky::solid(0x123456));
         renderer.render(&mut frame, 8, 8, camera);
         assert_ne!(frame[4], 0x123456);
+    }
+
+    #[test]
+    fn sky_covers_horizon_off_map_and_invalid_tiles_without_depth() {
+        let (map, floors, palette) = fixtures(255, 255);
+        let mut renderer = PlaneRenderer::new(&map, &floors, &palette);
+        renderer.set_sky(Sky::solid(0x123456));
+        let mut frame = vec![0; 25];
+        let mut depth = vec![42.0; 25];
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [0.01, 0.01],
+                angle: 0.7,
+            },
+            eye_height: 1.0,
+            pitch: 0.0,
+        };
+        renderer.render_with_depth(&mut frame, &mut depth, 5, 5, camera, None);
+        assert!(frame.iter().all(|pixel| *pixel == 0x123456));
+        assert!(depth.iter().all(|value| *value == 42.0));
+        let camera = CameraView {
+            eye_height: 2.1,
+            pitch: 0.2,
+            ..camera
+        };
+        renderer.render_with_depth(&mut frame, &mut depth, 5, 5, camera, None);
+        assert!(frame.iter().all(|pixel| *pixel == 0x123456));
+        assert!(depth.iter().all(|value| *value == 42.0));
     }
 
     #[test]

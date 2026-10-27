@@ -38,6 +38,7 @@ struct Target {
     health: Option<i32>,
     /// Raw BlowUp value is preserved for a future destruction/effect system.
     blow_up: i32,
+    break_sound: i32,
     blastable: bool,
     difficulty_enabled: bool,
     enabled: bool,
@@ -60,6 +61,15 @@ pub struct ObjectHitEvent {
     pub remaining_health: Option<i32>,
     pub destroyed: bool,
     pub blow_up: i32,
+}
+
+/// Model identity and sound at the moment of a hit, before replacements.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectDestructionInfo {
+    pub cell: [usize; 2],
+    pub raw_type: u8,
+    pub position: [f32; 2],
+    pub sound_id: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,6 +170,7 @@ impl ObjectCombat {
             target.radius = target_radius(def);
             target.shootable = is_shootable(def, target.linked);
             target.blow_up = def.blow_up;
+            target.break_sound = def.break_sound;
             target.blastable = def.collision_radius > 0 && def.blow_up != 0 && def.break_limit > 0;
         }
         self.targets = staged;
@@ -214,6 +225,7 @@ impl ObjectCombat {
                 radius,
                 health: (def.break_limit > 0).then_some(def.break_limit),
                 blow_up: def.blow_up,
+                break_sound: def.break_sound,
                 blastable: def.collision_radius > 0 && def.blow_up != 0 && def.break_limit > 0,
                 difficulty_enabled: instance.difficulty_flags & mask != 0,
                 enabled: true,
@@ -261,6 +273,7 @@ impl ObjectCombat {
         target.radius = target_radius(def);
         target.health = (def.break_limit > 0).then_some(transition.new_health);
         target.blow_up = def.blow_up;
+        target.break_sound = def.break_sound;
         target.blastable = def.collision_radius > 0 && def.blow_up != 0 && def.break_limit > 0;
         target.destroyed = false;
         true
@@ -391,6 +404,18 @@ impl ObjectCombat {
             destroyed: target.destroyed,
             blow_up: target.blow_up,
         })
+    }
+
+    pub fn destruction_info(&self, cell: [usize; 2]) -> Option<ObjectDestructionInfo> {
+        self.targets
+            .iter()
+            .find(|target| target.cell == cell)
+            .map(|target| ObjectDestructionInfo {
+                cell,
+                raw_type: target.raw_type,
+                position: target.position,
+                sound_id: target.break_sound,
+            })
     }
 
     /// Active destructible blast targets; height is supplied by the host.

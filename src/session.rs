@@ -14,9 +14,9 @@ use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::light_sources::{LightSourceError, LightSources};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
-use crate::object_combat::ObjectCombat;
+use crate::object_combat::{ObjectCombat, ObjectDestructionInfo};
 use crate::object_heights::ObjectHeightCatalog;
-use crate::object_states::{ObjectStates, ObjectTransition};
+use crate::object_states::{ObjectAction, ObjectStates, ObjectTransition, TransitionKind};
 use crate::objects::ObjectDefinitions;
 use crate::pickups::{Difficulty, PickupEvent};
 use crate::process::Script;
@@ -85,6 +85,60 @@ pub enum ExplosionOrigin {
     },
 }
 
+/// The authoritative cause of a committed object destruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectDestructionCause {
+    PlayerHitscan,
+    EnemyHitscan {
+        source_index: usize,
+    },
+    Projectile {
+        projectile_id: u64,
+        owner: Owner,
+    },
+    Explosion {
+        origin: ExplosionOrigin,
+        owner: Owner,
+    },
+    Script {
+        process_id: u16,
+    },
+}
+
+/// Identity, sound and position before the destruction or replacement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectDestructionEvent {
+    pub cell: [usize; 2],
+    pub raw_type: u8,
+    pub position: [f32; 2],
+    pub sound_id: i32,
+    pub cause: ObjectDestructionCause,
+}
+impl ObjectDestructionEvent {
+    fn new(info: ObjectDestructionInfo, cause: ObjectDestructionCause) -> Self {
+        Self {
+            cell: info.cell,
+            raw_type: info.raw_type,
+            position: info.position,
+            sound_id: info.sound_id,
+            cause,
+        }
+    }
+}
+
+// An explode transition for the just-destroyed model represents the same
+// destruction; other transitions, including later replacements, remain distinct.
+fn deduplicate_script_destruction(events: &mut Vec<ObjectDestructionEvent>, direct: usize) {
+    let first = events[direct];
+    if let Some(offset) = events[direct + 1..].iter().position(|event| {
+        event.cell == first.cell
+            && event.raw_type == first.raw_type
+            && matches!(event.cause, ObjectDestructionCause::Script { .. })
+    }) {
+        events.remove(direct + 1 + offset);
+    }
+}
+
 #[derive(Default)]
 pub struct SessionEvents {
     pub pickups: Vec<PickupEvent>,
@@ -103,6 +157,8 @@ pub struct SessionEvents {
     pub mine_events: Vec<MineEvent>,
     /// Object cell and whether it was destroyed by this hit.
     pub object_hits: Vec<([usize; 2], bool)>,
+    /// Committed destructions in simulation order, including scripted explosions.
+    pub object_destructions: Vec<ObjectDestructionEvent>,
     /// Ordered committed model replacements; the host must apply before next tick.
     pub object_transitions: Vec<ObjectTransition>,
     /// Authored quake commands for an explicitly opted-in consumer.
@@ -1000,6 +1056,19 @@ impl Session {
             })
             .collect();
         let scripted = self.scripted_objects.as_mut().expect("opted-in state");
+        let positions: BTreeMap<_, _> = prepared
+            .actions()
+            .iter()
+            .filter_map(|action| {
+                let ImmediateAction::Object(ObjectAction::Explode { cell }) = action else {
+                    return None;
+                };
+                scripted
+                    .states
+                    .get(*cell)
+                    .map(|state| (*cell, state.placement.position))
+            })
+            .collect();
         if !quakes.is_empty() && !scripted.quake_enabled {
             return Err((ProcessOutcome::Unsupported, true));
         }
@@ -1052,6 +1121,20 @@ impl Session {
         let event = transaction
             .commit()
             .map_err(|_| (ProcessOutcome::Unsupported, true))?;
+        for transition in &transitions {
+            if transition.kind == TransitionKind::Explode {
+                let position = positions[&transition.cell];
+                let definition = &scripted.definitions.level_objects
+                    [usize::from(transition.previous_type - 163)];
+                events.object_destructions.push(ObjectDestructionEvent {
+                    cell: transition.cell,
+                    raw_type: transition.previous_type,
+                    position,
+                    sound_id: definition.break_sound,
+                    cause: ObjectDestructionCause::Script { process_id: id },
+                });
+            }
+        }
         events.object_transitions.extend(transitions);
         events.quake_changes.extend(quakes);
         Ok(event)
@@ -1076,6 +1159,7 @@ impl Session {
         let saved_objects = self.objects.clone();
         let saved_ambient = self.ambient.clone();
         let replacement_start = events.object_transitions.len();
+        let destruction_start = events.object_destructions.len();
         let quake_start = events.quake_changes.len();
         let mut attempts = Vec::new();
         for id in ids {
@@ -1095,6 +1179,7 @@ impl Session {
                     self.objects = saved_objects;
                     self.ambient = saved_ambient;
                     events.object_transitions.truncate(replacement_start);
+                    events.object_destructions.truncate(destruction_start);
                     events.quake_changes.truncate(quake_start);
                     return (Vec::new(), false);
                 }
@@ -1176,6 +1261,7 @@ impl Session {
         let attempt_count = attempts.len();
         let hit_count = events.object_hits.len();
         let transition_count = events.object_transitions.len();
+        let destruction_count = events.object_destructions.len();
         let quake_count = events.quake_changes.len();
         let mut accepted = true;
         if let Some(hit) = hit {
@@ -1218,9 +1304,26 @@ impl Session {
                         {
                             self.sync_object_damage(cell, i32::from(attack.damage));
                             if object_hit.destroyed {
+                                let direct = events.object_destructions.len();
+                                if let Some(info) =
+                                    self.objects.as_ref().and_then(|o| o.destruction_info(cell))
+                                {
+                                    events.object_destructions.push(ObjectDestructionEvent::new(
+                                        info,
+                                        ObjectDestructionCause::EnemyHitscan {
+                                            source_index: attack.source_index,
+                                        },
+                                    ));
+                                }
                                 let (destroy_attempts, committed) =
                                     self.activate_destroy([cell[0] as u8, cell[1] as u8], events);
                                 if committed {
+                                    if direct < events.object_destructions.len() {
+                                        deduplicate_script_destruction(
+                                            &mut events.object_destructions,
+                                            direct,
+                                        );
+                                    }
                                     attempts.extend(destroy_attempts);
                                     if !events.object_transitions[transition_count..]
                                         .iter()
@@ -1248,6 +1351,7 @@ impl Session {
             attempts.truncate(attempt_count);
             events.object_hits.truncate(hit_count);
             events.object_transitions.truncate(transition_count);
+            events.object_destructions.truncate(destruction_count);
             events.quake_changes.truncate(quake_count);
             return;
         }
@@ -1327,6 +1431,7 @@ impl Session {
         let attempt_count = attempts.len();
         let hit_count = events.object_hits.len();
         let transition_count = events.object_transitions.len();
+        let destruction_count = events.object_destructions.len();
         let quake_count = events.quake_changes.len();
         let previous_damage = events.damage;
         // Contact still dispatches shoot links, independently of blast targets.
@@ -1343,6 +1448,7 @@ impl Session {
                 attempts.truncate(attempt_count);
                 events.object_hits.truncate(hit_count);
                 events.object_transitions.truncate(transition_count);
+                events.object_destructions.truncate(destruction_count);
                 events.quake_changes.truncate(quake_count);
                 events.damage = previous_damage;
                 return false;
@@ -1391,6 +1497,18 @@ impl Session {
                     applied.push(*item);
                     self.sync_object_damage(cell, item.damage);
                     if hit.destroyed {
+                        let direct = events.object_destructions.len();
+                        if let Some(info) =
+                            self.objects.as_ref().and_then(|o| o.destruction_info(cell))
+                        {
+                            events.object_destructions.push(ObjectDestructionEvent::new(
+                                info,
+                                ObjectDestructionCause::Explosion {
+                                    origin,
+                                    owner: explosion.owner,
+                                },
+                            ));
+                        }
                         let (destroy_attempts, accepted) =
                             self.activate_destroy([cell[0] as u8, cell[1] as u8], events);
                         if !accepted {
@@ -1398,9 +1516,13 @@ impl Session {
                             attempts.truncate(attempt_count);
                             events.object_hits.truncate(hit_count);
                             events.object_transitions.truncate(transition_count);
+                            events.object_destructions.truncate(destruction_count);
                             events.quake_changes.truncate(quake_count);
                             events.damage = previous_damage;
                             return false;
+                        }
+                        if direct < events.object_destructions.len() {
+                            deduplicate_script_destruction(&mut events.object_destructions, direct);
                         }
                         attempts.extend(destroy_attempts);
                         if !events.object_transitions[transition_count..]
@@ -1457,6 +1579,7 @@ impl Session {
             let attempt_count = attempts.len();
             let hit_count = events.object_hits.len();
             let transition_count = events.object_transitions.len();
+            let destruction_count = events.object_destructions.len();
             let quake_count = events.quake_changes.len();
             let explosions_count = events.explosions.len();
             let damage_count = events.explosion_damage.len();
@@ -1474,6 +1597,7 @@ impl Session {
                         attempts.truncate(attempt_count);
                         events.object_hits.truncate(hit_count);
                         events.object_transitions.truncate(transition_count);
+                        events.object_destructions.truncate(destruction_count);
                         events.quake_changes.truncate(quake_count);
                         events.explosions.truncate(explosions_count);
                         events.explosion_origins.truncate(explosions_count);
@@ -1941,6 +2065,7 @@ impl Session {
             }
             events.pickups.clear();
             events.object_transitions.clear();
+            events.object_destructions.clear();
             events.quake_changes.clear();
             attempts.clear();
         }
@@ -2057,14 +2182,32 @@ impl Session {
                 }) => {
                     self.sync_object_damage(cell, damage);
                     let mut destroyed = destroyed;
+                    let direct = events.object_destructions.len();
+                    if destroyed {
+                        if let Some(info) =
+                            self.objects.as_ref().and_then(|o| o.destruction_info(cell))
+                        {
+                            events.object_destructions.push(ObjectDestructionEvent::new(
+                                info,
+                                ObjectDestructionCause::PlayerHitscan,
+                            ));
+                        }
+                    }
                     if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
                         attempts.extend(self.processes.activate_at("shoot", [x, y]));
                         if destroyed {
                             let (destroy_attempts, accepted) =
                                 self.activate_destroy([x, y], &mut events);
                             if accepted {
+                                if direct < events.object_destructions.len() {
+                                    deduplicate_script_destruction(
+                                        &mut events.object_destructions,
+                                        direct,
+                                    );
+                                }
                                 attempts.extend(destroy_attempts);
                             } else {
+                                events.object_destructions.truncate(direct);
                                 self.objects = object_before_hit;
                                 self.scripted_objects = scripted_before_hit;
                                 self.ambient = ambient_before_hit;
@@ -2403,6 +2546,20 @@ impl Session {
                     {
                         self.sync_object_damage(cell, impact.damage);
                         let mut destroyed = hit.destroyed;
+                        let direct = events.object_destructions.len();
+                        if destroyed {
+                            if let Some(info) =
+                                self.objects.as_ref().and_then(|o| o.destruction_info(cell))
+                            {
+                                events.object_destructions.push(ObjectDestructionEvent::new(
+                                    info,
+                                    ObjectDestructionCause::Projectile {
+                                        projectile_id: impact.projectile_id,
+                                        owner: impact.owner,
+                                    },
+                                ));
+                            }
+                        }
                         if impact.owner == Owner::Player {
                             if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
                                 attempts.extend(self.processes.activate_at("shoot", [x, y]));
@@ -2410,8 +2567,15 @@ impl Session {
                                     let (destroy_attempts, accepted) =
                                         self.activate_destroy([x, y], &mut events);
                                     if accepted {
+                                        if direct < events.object_destructions.len() {
+                                            deduplicate_script_destruction(
+                                                &mut events.object_destructions,
+                                                direct,
+                                            );
+                                        }
                                         attempts.extend(destroy_attempts);
                                     } else {
+                                        events.object_destructions.truncate(direct);
                                         self.objects = object_before_hit;
                                         self.scripted_objects = scripted_before_hit;
                                         self.ambient = ambient_before_hit;
@@ -4616,6 +4780,27 @@ mod tests {
         assert_eq!(projectile_session.actors.actors[0].health, 18);
     }
     #[test]
+    fn destruction_deduplicates_only_first_matching_script_transition() {
+        let base = ObjectDestructionEvent {
+            cell: [1, 2],
+            raw_type: 163,
+            position: [1.5, 2.5],
+            sound_id: 5,
+            cause: ObjectDestructionCause::PlayerHitscan,
+        };
+        let script = ObjectDestructionEvent {
+            cause: ObjectDestructionCause::Script { process_id: 1 },
+            ..base
+        };
+        let replacement = ObjectDestructionEvent {
+            raw_type: 164,
+            ..script
+        };
+        let mut events = vec![base, script, replacement, script];
+        deduplicate_script_destruction(&mut events, 0);
+        assert_eq!(events, vec![base, replacement, script]);
+    }
+    #[test]
     fn staged_destroy_replaces_object_and_failed_preflight_restores_hit() {
         use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
         use crate::process_runtime::{ProcessCapabilities, ProcessObject};
@@ -4636,7 +4821,7 @@ mod tests {
             blow_up: 0,
             break_limit: health,
             ambient_sound: 0,
-            break_sound: 0,
+            break_sound: if name == "heart.3o" { 23 } else { 41 },
             model_name: name.into(),
             animation_name: None,
         };
@@ -4710,6 +4895,7 @@ mod tests {
             let events = projectile_retry.step(SessionInput::default());
             if events.object_hits.contains(&([1, 0], false)) {
                 projectile_hit = true;
+                assert!(events.object_destructions.is_empty());
                 assert!(!events
                     .process_effects
                     .iter()
@@ -4732,6 +4918,7 @@ mod tests {
         });
         assert_eq!(blocked.object_hits, vec![([1, 0], false)]);
         assert!(blocked.object_transitions.is_empty());
+        assert!(blocked.object_destructions.is_empty());
         assert!(!blocked
             .process_effects
             .iter()
@@ -4766,11 +4953,67 @@ mod tests {
             .unwrap()
             .manifest
             .allow([3, 0], 165);
+        let mut projectile_success = session.clone();
+        projectile_success.game.inventory.weapons[3] = true;
+        projectile_success.game.inventory.ammo[3] = 1;
+        projectile_success.game.weapons.0[3].rocket_type = 1;
+        projectile_success.rockets.0.push(RocketDefinition {
+            model_name: "disk.3o".into(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 20, 10],
+        });
+        projectile_success.step(SessionInput {
+            fire: true,
+            select_weapon: Some(3),
+            ..Default::default()
+        });
+        let mut committed = Vec::new();
+        for _ in 0..30 {
+            committed.extend(
+                projectile_success
+                    .step(SessionInput::default())
+                    .object_destructions,
+            );
+        }
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[0].cell, [1, 0]);
+        assert_eq!(committed[0].raw_type, 163);
+        assert_eq!(committed[0].sound_id, 23);
+        assert!(matches!(
+            committed[0].cause,
+            ObjectDestructionCause::Projectile {
+                owner: Owner::Player,
+                ..
+            }
+        ));
+        assert_eq!(
+            committed[1].cause,
+            ObjectDestructionCause::Script { process_id: 1 }
+        );
         let result = session.step(SessionInput {
             fire: true,
             ..Default::default()
         });
         assert_eq!(result.object_hits, vec![([1, 0], true)]);
+        assert_eq!(
+            result.object_destructions,
+            vec![
+                ObjectDestructionEvent {
+                    cell: [1, 0],
+                    raw_type: 163,
+                    position: [1.5, 0.5],
+                    sound_id: 23,
+                    cause: ObjectDestructionCause::PlayerHitscan
+                },
+                ObjectDestructionEvent {
+                    cell: [3, 0],
+                    raw_type: 164,
+                    position: [3.5, 0.5],
+                    sound_id: 41,
+                    cause: ObjectDestructionCause::Script { process_id: 1 }
+                },
+            ]
+        );
         assert_eq!(result.object_transitions.len(), 1);
         assert_eq!(result.object_transitions[0].new_type, 165);
         assert_eq!(result.quake_changes.len(), 1);
@@ -5256,7 +5499,7 @@ mod tests {
             blow_up,
             break_limit: health,
             ambient_sound: 0,
-            break_sound: 0,
+            break_sound: 47,
             model_name: name.into(),
             animation_name: None,
         };
@@ -5357,6 +5600,7 @@ mod tests {
         assert_eq!(mined.actors.actors[0].health, 100);
         assert_eq!(mined.mines().len(), 2);
         assert!(mine_events.mine_events.is_empty());
+        assert!(mine_events.object_destructions.is_empty());
         assert!(mine_events.explosions.is_empty());
         assert!(mine_events.explosion_origins.is_empty());
         assert_eq!(
@@ -5380,6 +5624,19 @@ mod tests {
             ]
         );
         assert_eq!(mine_events.object_hits, vec![([1, 0], true)]);
+        assert_eq!(
+            mine_events.object_destructions,
+            vec![ObjectDestructionEvent {
+                cell: [1, 0],
+                raw_type: 163,
+                position: [1.5, 0.5],
+                sound_id: 47,
+                cause: ObjectDestructionCause::Explosion {
+                    origin: ExplosionOrigin::Mine { mine_id: 1 },
+                    owner: Owner::Player
+                }
+            }]
+        );
         assert!(!mined
             .processes
             .take_effects()
@@ -5419,6 +5676,7 @@ mod tests {
         );
         assert_eq!(session.processes.cell_type([3, 0]), Some(164));
         assert!(events.explosions.is_empty());
+        assert!(events.object_destructions.is_empty());
         assert!(events.explosion_damage.is_empty());
         assert!(session.processes.take_effects().is_empty());
         assert!(attempts.is_empty());
@@ -5446,6 +5704,22 @@ mod tests {
         assert_eq!(session.processes.cell_type([3, 0]), Some(165));
         assert_eq!(events.explosions.len(), 1);
         assert_eq!(events.object_hits, vec![([1, 0], true)]);
+        assert_eq!(
+            events.object_destructions,
+            vec![ObjectDestructionEvent {
+                cell: [1, 0],
+                raw_type: 163,
+                position: [1.5, 0.5],
+                sound_id: 47,
+                cause: ObjectDestructionCause::Explosion {
+                    origin: ExplosionOrigin::Projectile {
+                        projectile_id: 0,
+                        rocket_id: 0
+                    },
+                    owner: Owner::Player
+                }
+            }]
+        );
         assert!(session
             .processes
             .take_effects()
@@ -6014,7 +6288,7 @@ mod tests {
             blow_up: 0,
             break_limit: health,
             ambient_sound: 0,
-            break_sound: 0,
+            break_sound: 19,
             model_name: name.into(),
             animation_name: None,
         };
@@ -6093,6 +6367,7 @@ mod tests {
             &mut attempts,
         );
         assert!(events.enemy_hits.is_empty());
+        assert!(events.object_destructions.is_empty());
         assert!(attempts.is_empty());
         assert_eq!(session.game.inventory.health, 100);
         assert_eq!(
@@ -6119,6 +6394,16 @@ mod tests {
             EnemyShotTarget::Object { cell: [2, 0] }
         );
         assert_eq!(events.object_hits, vec![([2, 0], true)]);
+        assert_eq!(
+            events.object_destructions,
+            vec![ObjectDestructionEvent {
+                cell: [2, 0],
+                raw_type: 163,
+                position: [2.5, 0.5],
+                sound_id: 19,
+                cause: ObjectDestructionCause::EnemyHitscan { source_index: 7 }
+            }]
+        );
         assert_eq!(
             attempts.iter().map(|a| a.process_id).collect::<Vec<_>>(),
             vec![1, 2]

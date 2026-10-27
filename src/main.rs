@@ -474,7 +474,7 @@ fn play(
         if !session.set_object_heights(object_heights, cells) {
             eprintln!("object height catalog rejected; using conservative collision");
         }
-    session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
+        session.set_ambient_grid(openchasm::ambient::AmbientGrid::from_map(&map));
         session.ai.set_clip_metadata(actor_clips);
         session.set_explosions_enabled(true);
         session.set_mines_enabled(mine_available);

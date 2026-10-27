@@ -12,8 +12,8 @@ pub mod world;
 
 pub mod actor_clips;
 pub mod actors;
-pub mod ambient;
 pub mod ai;
+pub mod ambient;
 pub mod combat;
 pub mod explosives;
 pub mod game;

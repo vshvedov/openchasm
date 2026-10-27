@@ -9,6 +9,7 @@ mod object_render;
 mod planes;
 mod projectile_render;
 mod replacement_manifest;
+mod scene_restore;
 mod texture;
 mod viewer;
 mod weapon_render;

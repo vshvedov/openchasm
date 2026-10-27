@@ -1,0 +1,7 @@
+# Rebuilding client scene presentation
+
+The client-only `scene_restore::rebuild_scene` helper rebuilds a fresh scene from an already validated, restored session and its matching map placements. It resolves visible scripted object types against the level definitions, preloads required meshes, applies process-driven object poses and difficulty/pickup/combat visibility, and restores actor positions, AI modes and authoritative attack phases. A missing required visible mesh or actor, unsupported attack phase, or invalid pose fails the rebuild and restores the original scene instances. Asset caches may retain successfully preloaded immutable meshes on failure.
+
+The caller must first validate content identity and restore the session against the correct fresh baseline. This helper does not verify fingerprints, load or write files, or enable a save UI. The caller must separately render session-owned walls, mines, projectiles, lighting and other effects.
+
+Object animation play state and clocks, actor idle/run/death clocks, minimap exploration, weapon animation, temporary notices and transient explosion sprites are not part of the session snapshot. Object animation is reset to its original default and actor modes without authoritative attack phases begin at frame zero. This is not exact visual restoration; persistent saves must either preserve and validate those states separately or explicitly accept the resulting visual resets before they are exposed to players.

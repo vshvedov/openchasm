@@ -1440,7 +1440,7 @@ impl ObjectScene {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn instance_light_brightens_translucent_mesh_without_changing_depth() {
@@ -1489,7 +1489,7 @@ mod tests {
         scene.render_with_mines_and_lights(&mut unlit, &mut unlit_depth, 64, 64, camera, &[], None);
         assert_eq!(base, unlit);
     }
-    fn gltf_scene(alpha: u8) -> ObjectScene {
+    pub(crate) fn gltf_scene(alpha: u8) -> ObjectScene {
         let image = GltfImage {
             width: 1,
             height: 1,

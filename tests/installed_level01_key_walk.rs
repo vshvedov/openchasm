@@ -343,11 +343,7 @@ fn spawn_can_reach_first_green_key() {
             fire: true,
             ..Default::default()
         });
-        if events
-            .object_hits
-            .iter()
-            .any(|hit| *hit == ([23, 51], true))
-        {
+        if events.object_hits.contains(&([23, 51], true)) {
             destroyed = true;
             break;
         }

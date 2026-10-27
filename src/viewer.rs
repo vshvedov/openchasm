@@ -919,6 +919,15 @@ pub fn run(
                 if inventory.keys[2] { "B" } else { "-" }
             ),
         );
+        if inventory.invisibility_ticks_remaining > 0 {
+            let seconds = inventory.invisibility_ticks_remaining.div_ceil(60);
+            text(
+                &mut frame,
+                8,
+                HEIGHT - 30,
+                &format!("INVISIBILITY {seconds}S"),
+            );
+        }
         if let Some((lines, _)) = &current_message {
             for (row, line) in lines.iter().enumerate().take(6) {
                 text(&mut frame, 8, 52 + row * 10, line);
@@ -949,7 +958,7 @@ pub fn run(
         if !look.focused {
             text(&mut frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
         } else if !look.captured {
-            text(&mut frame, 8, HEIGHT - 30, "CLICK TO CAPTURE MOUSE");
+            text(&mut frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
         }
         texture.with_lock(None, |bytes, pitch| {
             for (row, pixels) in bytes.chunks_mut(pitch).zip(frame.chunks(WIDTH)) {
@@ -1219,6 +1228,7 @@ mod tests {
             weapons: [true, true, false, true, false, false, false, true],
             ammo: [3, 0, 9, 2, 0, 0, 0, 1],
             keys: [false; 3],
+            invisibility_ticks_remaining: 0,
         };
         assert_eq!(cycle_weapon(&inventory, 0, 1), Some(3));
         assert_eq!(cycle_weapon(&inventory, 0, -1), Some(7));

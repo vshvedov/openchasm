@@ -531,6 +531,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
                 if let Some(mut inventory) = carry.take() {
                     inventory.keys = [false; 3];
+                    inventory.clear_level_effects();
                     game.inventory = inventory;
                 }
                 let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;

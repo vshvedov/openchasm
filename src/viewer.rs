@@ -36,7 +36,9 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 const WIDTH: usize = 640;
+#[cfg(test)]
 const HEIGHT: usize = 400;
 const STEP: f32 = 1.0 / 60.0;
 const MOUSE_SENSITIVITY: f32 = crate::graphics_settings::DEFAULT_MOUSE_SENSITIVITY;
@@ -274,22 +276,36 @@ fn simulation_active(focused: bool, menu_open: bool, suppress_gameplay: bool) ->
     focused && !menu_open && !suppress_gameplay
 }
 
-fn draw_pause_menu<C: UiPixel>(frame: &mut [C], menu: &PauseMenu) {
-    for y in 85..315 {
-        for x in 125..515 {
-            frame[y * WIDTH + x] = C::from_rgb(0x101820);
+fn draw_pause_menu<C: UiPixel>(frame: &mut [C], width: usize, height: usize, menu: &PauseMenu) {
+    let left = width.saturating_sub(390) / 2;
+    let top = height.saturating_sub(230) / 2;
+    for y in top..(top + 230).min(height) {
+        for x in left..(left + 390).min(width) {
+            frame[y * width + x] = C::from_rgb(0x101820);
         }
     }
-    text(frame, 155, 100, "PAUSED");
+    text(frame, width, left + 30, top + 15, "PAUSED");
     if let Some(action) = menu.confirm {
         let question = if action == PauseAction::Restart {
             "RESTART LEVEL?"
         } else {
             "EXIT LEVEL?"
         };
-        text(frame, 155, 145, question);
-        text(frame, 155, 165, "UNSAVED PROGRESS MAY BE LOST");
-        text(frame, 155, 185, "ENTER CONFIRMS   ESC CANCELS");
+        text(frame, width, left + 30, top + 60, question);
+        text(
+            frame,
+            width,
+            left + 30,
+            top + 80,
+            "UNSAVED PROGRESS MAY BE LOST",
+        );
+        text(
+            frame,
+            width,
+            left + 30,
+            top + 100,
+            "ENTER CONFIRMS   ESC CANCELS",
+        );
     } else {
         for (index, label) in [
             "RESUME",
@@ -304,14 +320,27 @@ fn draw_pause_menu<C: UiPixel>(frame: &mut [C], menu: &PauseMenu) {
         {
             text(
                 frame,
-                155,
-                130 + index * 25,
+                width,
+                left + 30,
+                top + 45 + index * 25,
                 if menu.selected == index { ">" } else { " " },
             );
-            text(frame, 175, 130 + index * 25, label);
+            text(frame, width, left + 50, top + 45 + index * 25, label);
         }
-        text(frame, 155, 280, "CHECKPOINT IS MEMORY ONLY");
-        text(frame, 155, 295, "UP/DOWN  ENTER  ESC TO RESUME");
+        text(
+            frame,
+            width,
+            left + 30,
+            top + 195,
+            "CHECKPOINT IS MEMORY ONLY",
+        );
+        text(
+            frame,
+            width,
+            left + 30,
+            top + 210,
+            "UP/DOWN  ENTER  ESC TO RESUME",
+        );
     }
 }
 
@@ -481,15 +510,16 @@ impl From<CelImage> for ViewerTexture {
     }
 }
 
-fn text<C: UiPixel>(frame: &mut [C], x: usize, y: usize, message: &str) {
+fn text<C: UiPixel>(frame: &mut [C], width: usize, x: usize, y: usize, message: &str) {
+    let height = frame.len() / width;
     for (i, ch) in message.chars().enumerate() {
         if let Some(glyph) = BASIC_FONTS.get(ch) {
             for (dy, row) in glyph.iter().enumerate() {
                 for dx in 0..8 {
                     let px = x + i * 8 + dx;
                     let py = y + dy;
-                    if px < WIDTH && py < HEIGHT && row & (1 << dx) != 0 {
-                        frame[py * WIDTH + px] = C::from_rgb(0xffffff);
+                    if px < width && py < height && row & (1 << dx) != 0 {
+                        frame[py * width + px] = C::from_rgb(0xffffff);
                     }
                 }
             }
@@ -579,6 +609,7 @@ fn render(
     let mut transparency = Translucency::new(frame.len());
     let _ = render_profiled::<true, u32>(
         SceneTarget {
+            dimensions: [WIDTH, HEIGHT],
             frame,
             depth,
             transparency: &mut transparency,
@@ -593,6 +624,7 @@ fn render(
 }
 
 struct SceneTarget<'a, C: RenderPixel> {
+    dimensions: [usize; 2],
     frame: &'a mut [C],
     depth: &'a mut [f32],
     transparency: &'a mut Translucency<C>,
@@ -607,6 +639,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
     profile: bool,
 ) -> RenderTimings {
     let SceneTarget {
+        dimensions: [width, height],
         frame,
         depth,
         transparency,
@@ -626,16 +659,16 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
         planes.render_with_remaster(
             frame,
             depth,
-            WIDTH,
-            HEIGHT,
+            width,
+            height,
             camera,
             scene.lights,
             scene.remaster,
         );
     } else {
-        for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
+        for (y, row) in frame.chunks_mut(width).enumerate() {
             row.fill(C::from_srgb8(
-                if (y as f32 + 0.5) < camera.horizon(HEIGHT) {
+                if (y as f32 + 0.5) < camera.horizon(height) {
                     0x303847
                 } else {
                     0x38312b
@@ -648,10 +681,10 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
     let [cos, sin] = camera.player.forward();
     let [right_x, right_y] = camera.player.right();
     let mut hits = Vec::new();
-    for x in 0..WIDTH {
+    for x in 0..width {
         // Direction is unnormalized, so hit distance is perpendicular to camera plane.
         let camera_x =
-            (2.0 * (x as f32 + 0.5) / WIDTH as f32 - 1.0) * CameraView::half_width(WIDTH, HEIGHT);
+            (2.0 * (x as f32 + 0.5) / width as f32 - 1.0) * CameraView::half_width(width, height);
         let direction = [cos + right_x * camera_x, sin + right_y * camera_x];
         world.ray_hits(direction, &mut hits);
         if NEAR_FIRST {
@@ -673,11 +706,11 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
             if texture == 120 {
                 continue;
             }
-            let half = (CameraView::focal_length(HEIGHT) / distance).min((HEIGHT * 4) as f32);
+            let half = (CameraView::focal_length(height) / distance).min((height * 4) as f32);
             let offset = scene.elevations.get(index).copied().unwrap_or(0.0) / 64.0;
-            let origin = camera.horizon(HEIGHT) - (2.0 + offset - camera.eye_height) * half;
-            let top = origin.max(0.0).min(HEIGHT as f32) as usize;
-            let bottom = (origin + half * 2.0).max(0.0).min(HEIGHT as f32) as usize;
+            let origin = camera.horizon(height) - (2.0 + offset - camera.eye_height) * half;
+            let top = origin.max(0.0).min(height as f32) as usize;
+            let bottom = (origin + half * 2.0).max(0.0).min(height as f32) as usize;
             let point = [
                 camera.player.position[0] + direction[0] * distance,
                 camera.player.position[1] + direction[1] * distance,
@@ -713,7 +746,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
             );
             let image = textures.get(texture as usize).and_then(Option::as_ref);
             for y in top..bottom {
-                if distance >= depth[y * WIDTH + x] {
+                if distance >= depth[y * width + x] {
                     continue;
                 }
                 let pixel = if let Some(image) = image {
@@ -726,8 +759,8 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
                         continue;
                     }
                     let lighting = remaster.map_or(lighting, |(static_light, fade)| {
-                        let slope = (camera.horizon(HEIGHT) - (y as f32 + 0.5))
-                            / CameraView::focal_length(HEIGHT);
+                        let slope = (camera.horizon(height) - (y as f32 + 0.5))
+                            / CameraView::focal_length(height);
                         let camera_distance = distance
                             * (direction[0] * direction[0]
                                 + direction[1] * direction[1]
@@ -741,8 +774,8 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
                 } else {
                     color
                 };
-                frame[y * WIDTH + x] = pixel;
-                depth[y * WIDTH + x] = distance;
+                frame[y * width + x] = pixel;
+                depth[y * width + x] = distance;
             }
         }
     }
@@ -752,8 +785,8 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
         objects.render_deferred_with_remaster(
             frame,
             depth,
-            WIDTH,
-            HEIGHT,
+            width,
+            height,
             camera,
             scene.mines,
             scene.lights,
@@ -767,6 +800,7 @@ fn render_profiled<const NEAR_FIRST: bool, C: RenderPixel>(
 }
 
 struct FrameScene<'a> {
+    dimensions: [usize; 2],
     world: RenderWorld<'a>,
     textures: &'a [Option<ViewerTexture>],
     planes: &'a PlaneRenderer,
@@ -790,9 +824,11 @@ impl FrameScene<'_> {
         transparency: &mut Translucency<C>,
         profile: bool,
     ) -> RenderTimings {
+        let [width, height] = self.dimensions;
         transparency.clear();
         let mut timings = render_profiled::<true, C>(
             SceneTarget {
+                dimensions: [width, height],
                 frame,
                 depth,
                 transparency,
@@ -807,29 +843,29 @@ impl FrameScene<'_> {
         self.projectiles.render_deferred(
             frame,
             depth,
-            WIDTH,
-            HEIGHT,
+            width,
+            height,
             self.camera,
             self.projectile_visuals,
             Some(self.planes.static_light()),
             transparency,
         );
         if let Some(renderer) = self.explosions {
-            renderer.render_deferred(frame, depth, WIDTH, HEIGHT, self.camera, transparency);
+            renderer.render_deferred(frame, depth, width, height, self.camera, transparency);
         }
         if let Some(renderer) = self.impacts {
-            renderer.render_deferred(frame, depth, WIDTH, HEIGHT, self.camera, transparency);
+            renderer.render_deferred(frame, depth, width, height, self.camera, transparency);
         }
         if let Some(renderer) = self.trails {
-            renderer.render_deferred(frame, depth, WIDTH, HEIGHT, self.camera, transparency);
+            renderer.render_deferred(frame, depth, width, height, self.camera, transparency);
         }
         transparency.composite(frame, depth);
         timings.effects = profile_elapsed(started);
         let started = profile_start(profile);
         self.weapon.render_to(
             frame,
-            WIDTH,
-            HEIGHT,
+            width,
+            height,
             self.weapon_id,
             self.weapon_pose,
             self.weapon_frame,
@@ -848,16 +884,18 @@ impl FrameScene<'_> {
     }
 }
 
-fn draw_header<C: UiPixel>(frame: &mut [C], label: &str) {
-    text(frame, 8, 8, label);
+fn draw_header<C: UiPixel>(frame: &mut [C], width: usize, label: &str) {
+    text(frame, width, 8, 8, label);
     text(
         frame,
+        width,
         8,
         20,
         "WASD MOVE  MOUSE TURN/FIRE  WHEEL/1-8 WEAPON  SPACE JUMP  E USE",
     );
     text(
         frame,
+        width,
         8,
         32,
         "TAB MAP  F5 QUICKSAVE  F9 QUICKLOAD  R RESTART  ESC PAUSE",
@@ -1104,6 +1142,7 @@ impl LightingCache {
 }
 
 struct UiFrame<'a> {
+    dimensions: [usize; 2],
     hud: Option<&'a crate::hud::Hud>,
     session: &'a Session,
     damage_flash: u8,
@@ -1127,6 +1166,7 @@ struct UiFrame<'a> {
 impl UiFrame<'_> {
     fn draw<C: UiPixel>(&self, frame: &mut [C]) {
         let Self {
+            dimensions: [width, height],
             hud,
             session,
             damage_flash,
@@ -1148,22 +1188,22 @@ impl UiFrame<'_> {
             metrics,
         } = *self;
         apply_damage_tint(frame, damage_flash);
-        minimap.draw(frame, WIDTH, HEIGHT, &session.world);
+        minimap.draw(frame, width, height, &session.world);
         if show_help {
-            draw_header(frame, label);
+            draw_header(frame, width, label);
         }
-        let cx = WIDTH / 2;
-        let cy = HEIGHT / 2;
+        let cx = width / 2;
+        let cy = height / 2;
         for offset in -3isize..=3 {
-            frame[cy * WIDTH + (cx as isize + offset) as usize] = C::from_rgb(0xffffff);
-            frame[(cy as isize + offset) as usize * WIDTH + cx] = C::from_rgb(0xffffff);
+            frame[cy * width + (cx as isize + offset) as usize] = C::from_rgb(0xffffff);
+            frame[(cy as isize + offset) as usize * width + cx] = C::from_rgb(0xffffff);
         }
         let inventory = &session.game.inventory;
         let hud_top = if let Some(hud) = &hud {
             hud.render(
                 frame,
-                WIDTH,
-                HEIGHT,
+                width,
+                height,
                 crate::hud::HudState {
                     health: u32::from(inventory.health),
                     armor: u32::from(inventory.armor),
@@ -1174,8 +1214,9 @@ impl UiFrame<'_> {
             if inventory.keys.iter().any(|key| *key) {
                 text(
                     frame,
-                    WIDTH - 96,
-                    HEIGHT - 76,
+                    width,
+                    width - 96,
+                    height - 76,
                     &format!(
                         "KEYS {}{}{}",
                         if inventory.keys[0] { "R" } else { "-" },
@@ -1184,12 +1225,13 @@ impl UiFrame<'_> {
                     ),
                 );
             }
-            HEIGHT - 64
+            height - 64
         } else {
             text(
                 frame,
+                width,
                 8,
-                HEIGHT - 18,
+                height - 18,
                 &format!(
                     "HEALTH {}  ARMOR {}  WEAPON {}  AMMO {}  KEYS {}{}{}",
                     inventory.health,
@@ -1201,7 +1243,7 @@ impl UiFrame<'_> {
                     if inventory.keys[2] { "B" } else { "-" }
                 ),
             );
-            HEIGHT
+            height
         };
         let effects = &session.game.protective_powerups;
         let status = powerup_status(
@@ -1210,63 +1252,67 @@ impl UiFrame<'_> {
             effects.chojin_ticks_remaining,
         );
         if !status.is_empty() {
-            text(frame, 8, hud_top.saturating_sub(12), &status);
+            text(frame, width, 8, hud_top.saturating_sub(12), &status);
         }
         if reflection_ticks > 0 {
             text(
                 frame,
-                WIDTH / 2,
+                width,
+                width / 2,
                 hud_top.saturating_sub(24),
                 "PROJECTILE REFLECTED",
             );
         }
         if let Some(lines) = current_message {
             for (row, line) in lines.iter().enumerate().take(6) {
-                text(frame, 8, 52 + row * 10, line);
+                text(frame, width, 8, 52 + row * 10, line);
             }
         }
         if let Some(message) = teleport_notice {
-            text(frame, 8, hud_top.saturating_sub(48), message);
+            text(frame, width, 8, hud_top.saturating_sub(48), message);
         }
         if let Some(message) = checkpoint_notice {
-            text(frame, 8, hud_top.saturating_sub(36), message);
+            text(frame, width, 8, hud_top.saturating_sub(36), message);
         }
         if let Some(message) = shot_feedback {
-            text(frame, 8, hud_top.saturating_sub(24), message);
+            text(frame, width, 8, hud_top.saturating_sub(24), message);
         }
         if completed {
             text(
                 frame,
-                WIDTH / 2 - 112,
-                HEIGHT / 2 + 35,
+                width,
+                width / 2 - 112,
+                height / 2 + 35,
                 "LEVEL COMPLETE - ENTER TO CONTINUE",
             );
         }
         if inventory.health == 0 {
             text(
                 frame,
-                WIDTH / 2 - 80,
-                HEIGHT / 2 + 35,
+                width,
+                width / 2 - 80,
+                height / 2 + 35,
                 "YOU DIED - R TO RESTART",
             );
         }
         if pause.open {
-            draw_pause_menu(frame, pause);
+            draw_pause_menu(frame, width, height, pause);
         } else if !look.focused {
-            text(frame, WIDTH / 2 - 28, HEIGHT / 2 + 50, "PAUSED");
+            text(frame, width, width / 2 - 28, height / 2 + 50, "PAUSED");
         } else if !look.captured && !console.is_open() && !graphics_menu.is_open() {
-            text(frame, 8, HEIGHT - 66, "CLICK TO CAPTURE MOUSE");
+            text(frame, width, 8, height - 66, "CLICK TO CAPTURE MOUSE");
         }
         if show_fps {
             text(
                 frame,
-                WIDTH - 184,
+                width,
+                width - 184,
                 8,
                 &format!("FPS {:5.1}  {:5.1} MS", metrics.fps, metrics.frame_ms),
             );
         }
-        graphics_menu.render(frame, WIDTH, HEIGHT, graphics);
-        console.render(frame, WIDTH, HEIGHT);
+        graphics_menu.render(frame, width, height, graphics);
+        console.render(frame, width, height);
     }
 }
 
@@ -1351,42 +1397,6 @@ pub fn run(
         .collect();
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
-    let mut window_builder = video.window(
-        "OpenChasm - early gameplay preview",
-        WIDTH as u32,
-        HEIGHT as u32,
-    );
-    window_builder
-        .resizable()
-        .position_centered()
-        .allow_highdpi();
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
-    window_builder.metal_view();
-    let window = window_builder.build()?;
-    let mut presentation =
-        Presentation::new(&window, WIDTH, HEIGHT, BackendChoice::from_environment()?)?;
-    let mut event_pump = sdl.event_pump()?;
-    video.text_input().stop();
-    let mut look = RelativeLook {
-        focused: window.has_input_focus(),
-        ..RelativeLook::default()
-    };
-    if look.focused && !capture_mouse(&mut look, &sdl.mouse(), &event_pump) {
-        eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
-    }
-    let mut held = HashSet::new();
-    let mut mouse_fire = false;
-    let mut frame = vec![0u32; WIDTH * HEIGHT];
-    let mut ui_overlay = Vec::<OverlayPixel>::new();
-    let mut hdr_frame = vec![LinearRgb::default(); WIDTH * HEIGHT];
-    let mut rgb_transparency = Translucency::new(WIDTH * HEIGHT);
-    let mut hdr_transparency = Translucency::new(WIDTH * HEIGHT);
-    let mut remaster_lighting = LightingCache::with_worker(Arc::clone(&map), &textures)
-        .unwrap_or_else(|error| {
-            eprintln!("background lighting unavailable; rebuilding synchronously: {error}");
-            LightingCache::default()
-        });
-    let mut bloom = crate::bloom::Bloom::new(WIDTH, HEIGHT)?;
     let settings_store = match SettingsStore::for_sdl() {
         Ok(store) => Some(store),
         Err(error) => {
@@ -1410,10 +1420,74 @@ pub fn run(
         .map_err(|error| format!("movement settings: {error:?}"))?;
     session.set_god_mode(god_override);
     let initial_session = session.clone();
+    let (mut width, mut height) = graphics.display.render_dimensions()?;
+    let backend_choice = BackendChoice::from_environment()?;
+    let mut window_builder = video.window(
+        "OpenChasm - early gameplay preview",
+        width as u32,
+        height as u32,
+    );
+    window_builder
+        .resizable()
+        .position_centered()
+        .allow_highdpi();
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    window_builder.metal_view();
+    // SDL otherwise creates an EGL surface implicitly on Wayland. External
+    // Vulkan presentation must own that surface, including across resizes.
+    #[cfg(all(feature = "gpu", target_os = "linux"))]
+    if video.current_video_driver() == "wayland" && backend_choice != BackendChoice::Software {
+        window_builder.vulkan();
+    }
+    let window = match window_builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            #[cfg(all(feature = "gpu", target_os = "linux"))]
+            if video.current_video_driver() == "wayland" {
+                eprintln!("Vulkan window unavailable; using SDL: {error}");
+                let flags = window_builder.window_flags()
+                    & !(sdl2::sys::SDL_WindowFlags::SDL_WINDOW_VULKAN as u32);
+                window_builder.set_window_flags(flags);
+                window_builder.build()?
+            } else {
+                return Err(error.into());
+            }
+            #[cfg(not(all(feature = "gpu", target_os = "linux")))]
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = graphics.display.apply(&window) {
+        eprintln!("display settings unavailable: {error}; starting windowed");
+        graphics.display.fullscreen = false;
+        graphics.display.apply(&window)?;
+    }
+    let mut presentation = Presentation::new(&window, width, height, backend_choice)?;
+    let mut event_pump = sdl.event_pump()?;
+    video.text_input().stop();
+    let mut look = RelativeLook {
+        focused: window.has_input_focus(),
+        ..RelativeLook::default()
+    };
+    if look.focused && !capture_mouse(&mut look, &sdl.mouse(), &event_pump) {
+        eprintln!("relative mouse capture unavailable; click to retry or use arrow keys to turn");
+    }
+    let mut held = HashSet::new();
+    let mut mouse_fire = false;
+    let mut frame = vec![0u32; width * height];
+    let mut ui_overlay = Vec::<OverlayPixel>::new();
+    let mut hdr_frame = vec![LinearRgb::default(); width * height];
+    let mut rgb_transparency = Translucency::new(width * height);
+    let mut hdr_transparency = Translucency::new(width * height);
+    let mut remaster_lighting = LightingCache::with_worker(Arc::clone(&map), &textures)
+        .unwrap_or_else(|error| {
+            eprintln!("background lighting unavailable; rebuilding synchronously: {error}");
+            LightingCache::default()
+        });
+    let mut bloom = crate::bloom::Bloom::new(width, height)?;
     let mut uncapped_override = std::env::var("OPENCHASM_UNCAPPED").as_deref() == Ok("1");
     let mut color_pipeline = ColorPipeline::new(graphics.color_settings())?;
     let mut graphics_menu = GraphicsMenu::default();
-    let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+    let mut depth = vec![f32::INFINITY; width * height];
     let mut frame_clock = FrameClock {
         last: Instant::now(),
     };
@@ -1541,6 +1615,23 @@ pub fn run(
                 }
                 continue;
             }
+            let fullscreen_shortcut = matches!(
+                event,
+                Event::KeyDown {
+                    scancode: Some(Scancode::F11),
+                    repeat: false,
+                    ..
+                }
+            ) || matches!(event, Event::KeyDown {
+                scancode: Some(Scancode::Return), keymod, repeat: false, ..
+            } if keymod.intersects(sdl2::keyboard::Mod::LALTMOD | sdl2::keyboard::Mod::RALTMOD));
+            if fullscreen_shortcut && look.focused {
+                graphics.display.fullscreen = !graphics.display.fullscreen;
+                graphics_changed = true;
+                suppress_gameplay = true;
+                clear_held_controls(&mut held, &mut mouse_fire, &mut look, &mut accumulator);
+                continue;
+            }
             let console_toggle = matches!(
                 event,
                 Event::KeyDown {
@@ -1644,6 +1735,21 @@ pub fn run(
                                 console
                                     .push("Use map 01 to start a level with its default loadout");
                             }
+                        }
+                        Command::Fullscreen(value) => {
+                            graphics.display.fullscreen =
+                                value.unwrap_or(!graphics.display.fullscreen);
+                            graphics_changed = true;
+                        }
+                        Command::Resolution(value) => {
+                            if let Some(value) = value {
+                                if let Err(error) = graphics.display.set_resolution(value) {
+                                    console.push(error);
+                                } else {
+                                    graphics_changed = true;
+                                }
+                            }
+                            console.push(&format!("resolution {}", graphics.display.resolution()));
                         }
                         Command::Fps(value) => {
                             if let Some(value) = value {
@@ -1787,6 +1893,23 @@ pub fn run(
                                 session.vertical.feet(),
                                 p.angle,
                                 session.pitch()
+                            ));
+                            console.push(&format!(
+                                "display {} {}; renderer {}; god {}; mouse {} {}",
+                                graphics.display.resolution(),
+                                if graphics.display.fullscreen {
+                                    "fullscreen"
+                                } else {
+                                    "windowed"
+                                },
+                                presentation.backend_name(),
+                                if session.god_mode() { "on" } else { "off" },
+                                if look.focused { "focused" } else { "unfocused" },
+                                if look.captured {
+                                    "captured"
+                                } else {
+                                    "released"
+                                }
                             ));
                             let velocity = session.movement_velocity();
                             console.push(&format!(
@@ -2006,6 +2129,62 @@ pub fn run(
                 .and_then(|_| ColorPipeline::new(graphics.color_settings()))
             {
                 Ok(pipeline) => {
+                    if graphics.display != graphics_before.display {
+                        let (new_width, new_height) = graphics.display.render_dimensions()?;
+                        let result = graphics
+                            .display
+                            .apply(&window)
+                            .and_then(|_| presentation.resize(new_width, new_height));
+                        match result {
+                            Ok(()) => {
+                                if (new_width, new_height) != (width, height) {
+                                    width = new_width;
+                                    height = new_height;
+                                    frame = vec![0; width * height];
+                                    hdr_frame = vec![LinearRgb::default(); width * height];
+                                    depth = vec![f32::INFINITY; width * height];
+                                    ui_overlay.clear();
+                                    rgb_transparency = Translucency::new(width * height);
+                                    hdr_transparency = Translucency::new(width * height);
+                                    bloom = crate::bloom::Bloom::new(width, height)?;
+                                }
+                                console.push(&format!(
+                                    "display {} {}; {}",
+                                    graphics.display.resolution(),
+                                    if graphics.display.fullscreen {
+                                        "fullscreen"
+                                    } else {
+                                        "windowed"
+                                    },
+                                    presentation.backend_name()
+                                ));
+                            }
+                            Err(error) => {
+                                graphics.display = graphics_before.display;
+                                if let Err(restore) = graphics.display.apply(&window) {
+                                    console.push(&format!("Could not restore window: {restore}"));
+                                }
+                                console.push(&format!("Display change rejected: {error}"));
+                            }
+                        }
+                        sdl.mouse().set_relative_mouse_mode(false);
+                        look.release();
+                        clear_held_controls(
+                            &mut held,
+                            &mut mouse_fire,
+                            &mut look,
+                            &mut accumulator,
+                        );
+                        if !pause.open && !console.is_open() && !graphics_menu.is_open() {
+                            capture_mouse(&mut look, &sdl.mouse(), &event_pump);
+                        }
+                        pending_interact = false;
+                        pending_jump = false;
+                        pending_weapon = None;
+                        frame_clock.rebase(Instant::now());
+                        pending_simulation_time = Duration::ZERO;
+                        suppress_gameplay = true;
+                    }
                     if let Err(error) = session.set_movement_mode(graphics.physics) {
                         graphics.physics = session.movement_mode();
                         console.push(&format!("Movement change rejected: {error:?}"));
@@ -2197,7 +2376,7 @@ pub fn run(
                 renderer.tick();
                 crate::trail_motion::emit(renderer, &before, &session, &events);
             }
-            minimap.observe(&session.world);
+            minimap.observe(&session.world, width, height);
             audio.update_ambient(session.ambient_grid(), session.world.player.position, STEP);
             pending_interact = false;
             pending_jump = false;
@@ -2436,6 +2615,7 @@ pub fn run(
         let (pose, frame_index) = weapon_clock
             .pose(weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Idle));
         let scene = FrameScene {
+            dimensions: [width, height],
             world: RenderWorld {
                 world: &session.world,
                 elevations: &session.wall_elevations,
@@ -2487,6 +2667,7 @@ pub fn run(
             stage_frames = stage_frames.saturating_add(1);
         }
         let ui = UiFrame {
+            dimensions: [width, height],
             hud: hud.as_ref(),
             session: &session,
             damage_flash: damage_feedback.flash,
@@ -2510,7 +2691,7 @@ pub fn run(
             metrics: frame_stats.metrics,
         };
         if use_gpu {
-            ui_overlay.resize(WIDTH * HEIGHT, OverlayPixel::default());
+            ui_overlay.resize(width * height, OverlayPixel::default());
             ui_overlay.fill(OverlayPixel::default());
             ui.draw(&mut ui_overlay);
         } else {
@@ -2599,6 +2780,64 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_resolutions_keep_wall_depth_and_ui_within_their_own_stride() {
+        let world = World {
+            walls: vec![crate::world::Wall {
+                a: [2.0, -10.0],
+                b: [2.0, 10.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: None,
+            }],
+            player: crate::world::Player {
+                position: [0.0; 2],
+                angle: 0.0,
+            },
+        };
+        for [width, height] in [[320, 200], [640, 360], [800, 600]] {
+            let mut frame = vec![0u32; width * height];
+            let mut depth = vec![f32::INFINITY; width * height];
+            let mut transparency = Translucency::new(width * height);
+            render_profiled::<true, u32>(
+                SceneTarget {
+                    dimensions: [width, height],
+                    frame: &mut frame,
+                    depth: &mut depth,
+                    transparency: &mut transparency,
+                },
+                RenderWorld {
+                    world: &world,
+                    elevations: &[0.0],
+                    eye_height: 1.0,
+                    yaw_offset: 0.0,
+                    pitch: 0.0,
+                    mines: &[],
+                    lights: None,
+                    remaster: None,
+                },
+                &[],
+                None,
+                None,
+                false,
+            );
+            for x in [0, width / 2, width - 1] {
+                assert!((depth[(height / 2) * width + x] - 2.0).abs() < 1e-5);
+            }
+            assert!(frame.iter().all(|&pixel| pixel != 0));
+            draw_pause_menu(
+                &mut frame,
+                width,
+                height,
+                &PauseMenu {
+                    open: true,
+                    ..Default::default()
+                },
+            );
+            assert!(frame.contains(&0xffffff));
+        }
+    }
+
     #[test]
     fn suppressed_transition_batch_does_not_discard_first_real_mouse_motion() {
         let mut look = RelativeLook {
@@ -2907,6 +3146,7 @@ mod tests {
             let mut new_depth = old_depth.clone();
             render_profiled::<false, u32>(
                 SceneTarget {
+                    dimensions: [WIDTH, HEIGHT],
                     frame: &mut old_frame,
                     depth: &mut old_depth,
                     transparency: &mut Translucency::new(WIDTH * HEIGHT),
@@ -2919,6 +3159,7 @@ mod tests {
             );
             render_profiled::<true, u32>(
                 SceneTarget {
+                    dimensions: [WIDTH, HEIGHT],
                     frame: &mut new_frame,
                     depth: &mut new_depth,
                     transparency: &mut Translucency::new(WIDTH * HEIGHT),

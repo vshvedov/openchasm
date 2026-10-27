@@ -121,3 +121,9 @@ counts (changing SDL relative mode only flushes queued motion events), and consu
 the transition batch even if gameplay is suppressed or the batch is empty. Focus
 messages belonging to another SDL window are ignored. Counts are consumed once
 by the fixed simulation input, without frame-time or viewport scaling.
+
+After the accumulator change, native Wayland tests delivered all counts on both
+backends: consecutive 20-count bursts yielded yaw/pitch (4.651,.061),
+(4.590,.123), then (4.528,.184), including console recapture and a burst while
+holding forward. These are compositor-injected counts, not physical-device
+calibration. Test applications exited cleanly and preferences were isolated.

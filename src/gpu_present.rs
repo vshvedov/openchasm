@@ -36,6 +36,13 @@ pub struct GpuPresenter<'w> {
 impl<'w> GpuPresenter<'w> {
     pub fn new(window: &'w Window, width: usize, height: usize) -> Result<Self, String> {
         checked_extent(width, height)?;
+        if window.subsystem().current_video_driver() == "wayland"
+            && window.window_flags() & sdl2::sys::SDL_WindowFlags::SDL_WINDOW_OPENGL as u32 != 0
+        {
+            return Err(
+                "SDL Wayland window already owns an EGL surface; GPU needs a Vulkan window".into(),
+            );
+        }
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
         let instance = wgpu::Instance::new(descriptor);
@@ -90,6 +97,12 @@ impl<'w> GpuPresenter<'w> {
 
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    /// Replace only scene-sized storage, retaining the device and native surface.
+    /// A failed resize leaves the previous scene available for presentation.
+    pub fn resize_scene(&mut self, width: usize, height: usize) -> Result<(), String> {
+        self.core.resize_scene(width, height)
     }
 
     /// Empty overlay means identity; otherwise exactly one [add RGB, opacity]
@@ -401,9 +414,14 @@ impl PostProcessor {
             return Err("GPU frame exceeds adapter buffer limits".into());
         }
         let mut required = wgpu::Limits::default();
+        // Scene resolution can change without requesting another device. Ask
+        // for the bounded capacity now; this does not allocate those buffers.
+        let scene_capacity = (MAX_PIXELS as u64 * 16)
+            .min(limits.max_storage_buffer_binding_size)
+            .min(limits.max_buffer_size);
         required.max_storage_buffer_binding_size =
-            required.max_storage_buffer_binding_size.max(largest);
-        required.max_buffer_size = required.max_buffer_size.max(largest);
+            required.max_storage_buffer_binding_size.max(scene_capacity);
+        required.max_buffer_size = required.max_buffer_size.max(scene_capacity);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("OpenChasm post device"),
             required_limits: required,
@@ -582,6 +600,90 @@ impl PostProcessor {
         };
         result.check_error()?;
         Ok(result)
+    }
+
+    fn resize_scene(&mut self, width: usize, height: usize) -> Result<(), String> {
+        let count = checked_extent(width, height)?;
+        self.check_error()?;
+        if (width, height) == (self.width as usize, self.height as usize) {
+            return Ok(());
+        }
+        let largest = count as u64 * 16;
+        let limits = self.device.limits();
+        if largest > limits.max_storage_buffer_binding_size || largest > limits.max_buffer_size {
+            return Err("GPU frame exceeds device buffer limits".into());
+        }
+        let mut packed = Vec::new();
+        packed
+            .try_reserve_exact(count * 3)
+            .map_err(|_| "unable to allocate GPU packing buffer")?;
+        packed.resize(count * 3, 0.0);
+        let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let buffer = |label, size, usage| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let input = buffer(
+            "HDR RGB input",
+            count as u64 * 12,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let overlay = buffer(
+            "display-space UI",
+            largest,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let half_bytes = (width.div_ceil(2) * height.div_ceil(2) * 16) as u64;
+        let bright = buffer("bloom bright", half_bytes, wgpu::BufferUsages::STORAGE);
+        let scratch = buffer("bloom scratch", half_bytes, wgpu::BufferUsages::STORAGE);
+        let bind = |label, layout, buffers: [&wgpu::Buffer; 4]| {
+            let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: buffers[i].as_entire_binding(),
+            });
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &entries,
+            })
+        };
+        let bloom_layout = self.extract.get_bind_group_layout(0);
+        let post_layout = self.post.get_bind_group_layout(0);
+        let bloom_bind = bind(
+            "bloom buffers",
+            &bloom_layout,
+            [&self.uniform, &input, &bright, &scratch],
+        );
+        let post_bind = bind(
+            "post buffers",
+            &post_layout,
+            [&self.uniform, &input, &overlay, &bright],
+        );
+        // Pop every scope even if one failed. The live resources are replaced
+        // only after all allocations and bindings have succeeded.
+        let errors = [
+            pollster::block_on(validation.pop()),
+            pollster::block_on(internal.pop()),
+            pollster::block_on(memory.pop()),
+        ];
+        if let Some(error) = errors.into_iter().flatten().next() {
+            return Err(format!("GPU scene resize: {error}"));
+        }
+        self.check_error()?;
+        self.input = input;
+        self.overlay = overlay;
+        self.bloom_bind = bloom_bind;
+        self.post_bind = post_bind;
+        self.packed = packed;
+        self.width = width as u32;
+        self.height = height as u32;
+        Ok(())
     }
 
     fn check_error(&self) -> Result<(), String> {
@@ -897,6 +999,57 @@ mod tests {
             [96.0, 0.0, 1728.0, 1080.0]
         );
         assert_eq!(viewport(640, 400, [640, 480]), [0.0, 40.0, 640.0, 400.0]);
+    }
+
+    #[test]
+    fn offscreen_scene_resize_retains_device_and_preserves_frame_on_rejection() {
+        let Some(adapter) = adapter() else {
+            return;
+        };
+        let mut core = PostProcessor::new(&adapter, 2, 2, wgpu::TextureFormat::Rgba8Unorm).unwrap();
+        let device = core.device.clone();
+        let pipeline = core.post.clone();
+        for (width, height) in [(7, 5), (1, 1), (17, 9), (2, 13), (7, 5)] {
+            core.resize_scene(width, height).unwrap();
+            assert_eq!(core.device, device);
+            assert_eq!(core.post, pipeline);
+            assert_eq!(core.packed.len(), width * height * 3);
+            let target = [width as u32, height as u32];
+            let settings = ColorSettings::default();
+            let frame = vec![LinearRgb([4.0, 2.0, 1.0]); width * height];
+            core.prepare_hdr(&frame, settings, 0.35, &[]).unwrap();
+            core.upload_packed();
+            let actual = read_frame(&core, target, settings, 0.35, &[], false);
+            let mut reference = frame;
+            Bloom::new(width, height)
+                .unwrap()
+                .apply(&mut reference, 0.35, 2.0)
+                .unwrap();
+            let color = ColorPipeline::new(settings).unwrap();
+            for (actual, expected) in actual.into_iter().zip(reference) {
+                near(actual, color.encode(expected), 2);
+            }
+            let rgb = vec![0x4080c0; width * height];
+            let overlay = vec![[0.0, 0.0, 0.0, 0.5]; width * height];
+            core.upload_rgb(&rgb);
+            let expected = read_frame(&core, target, settings, 0.0, &overlay, true);
+            for pixel in &expected {
+                near(*pixel, 0x204060, 1);
+            }
+            let input = core.input.clone();
+            core.resize_scene(width, height).unwrap();
+            assert_eq!(core.input, input, "same-size resize must not allocate");
+            for (invalid_width, invalid_height) in [(0, 1), (1, 0), (usize::MAX, 2), (16384, 16384)]
+            {
+                assert!(core.resize_scene(invalid_width, invalid_height).is_err());
+                assert_eq!((core.width, core.height), (width as u32, height as u32));
+                assert_eq!(core.input, input);
+                assert_eq!(
+                    read_frame(&core, target, settings, 0.0, &overlay, true),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

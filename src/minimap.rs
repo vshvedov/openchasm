@@ -36,6 +36,7 @@ impl WallKey {
 }
 #[derive(Clone)]
 struct ObservationKey {
+    dimensions: [usize; 2],
     pose: [u32; 3],
     walls: Vec<WallKey>,
 }
@@ -47,8 +48,9 @@ impl ObservationKey {
             world.player.angle.to_bits(),
         ]
     }
-    fn matches(&self, world: &World) -> bool {
-        self.pose == Self::pose(world)
+    fn matches(&self, world: &World, dimensions: [usize; 2]) -> bool {
+        self.dimensions == dimensions
+            && self.pose == Self::pose(world)
             && self.walls.len() == world.walls.len()
             && self
                 .walls
@@ -56,8 +58,9 @@ impl ObservationKey {
                 .zip(&world.walls)
                 .all(|(saved, wall)| *saved == WallKey::of(wall))
     }
-    fn new(world: &World) -> Self {
+    fn new(world: &World, dimensions: [usize; 2]) -> Self {
         Self {
+            dimensions,
             pose: Self::pose(world),
             walls: world.walls.iter().map(WallKey::of).collect(),
         }
@@ -74,9 +77,11 @@ impl Minimap {
     /// Discover only the nearest opaque wall along each approximate view ray.
     /// Transparent and invisible walls do not occlude discovery, matching the
     /// independent reference. Actor and raised-wall occlusion are approximate.
-    pub fn observe(&mut self, world: &World) {
+    pub fn observe(&mut self, world: &World, width: usize, height: usize) {
         let player = world.player;
-        if self.visible.len() != world.walls.len()
+        if width == 0
+            || height == 0
+            || self.visible.len() != world.walls.len()
             || !player.angle.is_finite()
             || !player.position.iter().all(|x| x.is_finite())
         {
@@ -85,7 +90,7 @@ impl Minimap {
         if self
             .observation
             .as_ref()
-            .is_some_and(|key| key.matches(world))
+            .is_some_and(|key| key.matches(world, [width, height]))
         {
             return;
         }
@@ -94,7 +99,7 @@ impl Minimap {
         let mut hits = Vec::new();
         for x in 0..RAYS {
             let camera_x = (2.0 * (x as f32 + 0.5) / RAYS as f32 - 1.0)
-                * crate::object_render::CameraView::half_width(super::WIDTH, super::HEIGHT);
+                * crate::object_render::CameraView::half_width(width, height);
             world.ray_hits(
                 [cos + right_x * camera_x, sin + right_y * camera_x],
                 &mut hits,
@@ -107,7 +112,7 @@ impl Minimap {
                 self.visible[*index] = true;
             }
         }
-        self.observation = Some(ObservationKey::new(world));
+        self.observation = Some(ObservationKey::new(world, [width, height]));
     }
     /// Draw current positions of discovered walls and a heading marker.
     pub fn draw<C: UiPixel>(&self, frame: &mut [C], width: usize, height: usize, world: &World) {
@@ -246,11 +251,11 @@ mod tests {
             walls: vec![wall(1.0, 87), wall(2.0, 1), wall(3.0, 2)],
         };
         let mut map = Minimap::new(&world);
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [false, true, false]);
         let saved = map.clone();
         world.player.position = [2.5, 0.0];
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [false, true, true]);
         map = saved;
         assert_eq!(map.visible, [false, true, false]);
@@ -266,7 +271,7 @@ mod tests {
             walls: vec![wall(2.0, 1)],
         };
         let mut map = Minimap::new(&world);
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         map.open = true;
         let mut first = vec![0u32; 640 * 400];
         map.draw(&mut first, 640, 400, &world);
@@ -289,30 +294,33 @@ mod tests {
             walls: vec![wall(1.0, 1), wall(2.0, 2)],
         };
         let mut map = Minimap::new(&world);
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [true, false]);
         let saved = map.clone();
         // A cache hit leaves visibility untouched; simulate an externally
         // cleared bit to distinguish a hit from another raycast in this test.
         map.visible[0] = false;
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [false, false]);
+        map.observe(&world, 800, 400);
+        assert_eq!(map.visible, [true, false]);
+        map.visible[0] = false;
         world.player.angle = 0.01;
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [true, false]);
         world.walls[0].texture = 87;
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [true, true]);
         map = saved;
-        map.observe(&world);
+        map.observe(&world, 640, 400);
         assert_eq!(map.visible, [true, true]);
         world.walls[0].texture = 1;
         let mut moved = Minimap::new(&world);
-        moved.observe(&world);
+        moved.observe(&world, 640, 400);
         assert_eq!(moved.visible, [true, false]);
         world.walls[0].a[0] = 3.0;
         world.walls[0].b[0] = 3.0;
-        moved.observe(&world);
+        moved.observe(&world, 640, 400);
         assert_eq!(moved.visible, [true, true]);
     }
 }

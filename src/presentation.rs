@@ -32,7 +32,7 @@ struct SdlPresenter {
     height: usize,
 }
 impl SdlPresenter {
-    fn new(window: &Window, width: usize, height: usize) -> Result<Self, String> {
+    fn validate_dimensions(width: usize, height: usize) -> Result<(), String> {
         if width == 0
             || height == 0
             || width > 16384
@@ -43,6 +43,10 @@ impl SdlPresenter {
         {
             return Err("presentation dimensions outside 1..=16384".into());
         }
+        Ok(())
+    }
+    fn new(window: &Window, width: usize, height: usize) -> Result<Self, String> {
+        Self::validate_dimensions(width, height)?;
         let mut canvas = window
             .clone()
             .into_canvas()
@@ -51,6 +55,19 @@ impl SdlPresenter {
         canvas
             .set_logical_size(width as u32, height as u32)
             .map_err(|e| e.to_string())?;
+        let texture = Self::create_texture(&canvas, width, height)?;
+        Ok(Self {
+            texture,
+            canvas,
+            width,
+            height,
+        })
+    }
+    fn create_texture(
+        canvas: &Canvas<Window>,
+        width: usize,
+        height: usize,
+    ) -> Result<NonNull<sdl2::sys::SDL_Texture>, String> {
         // SAFETY: canvas owns a valid SDL renderer on this thread. Dimensions
         // are positive and bounded, and SDL copies the format/access values.
         let raw = unsafe {
@@ -62,15 +79,32 @@ impl SdlPresenter {
                 height as i32,
             )
         };
-        let texture = NonNull::new(raw).ok_or_else(sdl2::get_error)?;
         // RGB888 ignores the packed pixel's high byte. SDL's default texture
         // blend mode is NONE, preserving encoded RGB including opaque black.
-        Ok(Self {
-            texture,
-            canvas,
-            width,
-            height,
-        })
+        NonNull::new(raw).ok_or_else(sdl2::get_error)
+    }
+    fn resize_scene(&mut self, width: usize, height: usize) -> Result<(), String> {
+        Self::validate_dimensions(width, height)?;
+        if (width, height) == (self.width, self.height) {
+            return Ok(());
+        }
+        let texture = Self::create_texture(&self.canvas, width, height)?;
+        if let Err(error) = self.canvas.set_logical_size(width as u32, height as u32) {
+            // SAFETY: this unpublished texture belongs to the live canvas.
+            unsafe { sdl2::sys::SDL_DestroyTexture(texture.as_ptr()) };
+            // SDL may have updated its logical dimensions before reporting a
+            // viewport failure. Restore those dimensions as well as ownership.
+            self.canvas
+                .set_logical_size(self.width as u32, self.height as u32)
+                .map_err(|restore| format!("{error}; restoring logical size failed: {restore}"))?;
+            return Err(error.to_string());
+        }
+        let previous = std::mem::replace(&mut self.texture, texture);
+        self.width = width;
+        self.height = height;
+        // SAFETY: the old texture has no remaining owner; canvas is still alive.
+        unsafe { sdl2::sys::SDL_DestroyTexture(previous.as_ptr()) };
+        Ok(())
     }
     fn present(&mut self, pixels: &[u32]) -> Result<(), String> {
         if self.width.checked_mul(self.height) != Some(pixels.len()) {
@@ -177,6 +211,18 @@ impl<'w> Presentation<'w> {
             if self.gpu.is_some() {
                 return Ok(());
             }
+            // SDL recreates its Wayland window with an EGL surface. A second
+            // Vulkan surface owner is unsafe; keep the working SDL presenter.
+            if self.window.subsystem().current_video_driver() == "wayland"
+                && self.window.window_flags() & sdl2::sys::SDL_WindowFlags::SDL_WINDOW_OPENGL as u32
+                    != 0
+            {
+                self.notice = Some(
+                    "GPU on Wayland requires a restart with OPENCHASM_RENDERER=gpu; keeping SDL"
+                        .into(),
+                );
+                return Ok(());
+            }
             // Destroy the SDL renderer before creating a GPU surface for the
             // same window. Session, input and decoded content remain outside.
             self.sdl = None;
@@ -193,6 +239,27 @@ impl<'w> Presentation<'w> {
             self.notice = Some("GPU feature is absent from this build; using SDL".into());
         }
         self.fallback_to_sdl()
+    }
+    /// Replace scene-sized resources without recreating the renderer or surface.
+    /// Invalid dimensions or allocation failures preserve the previous scene.
+    pub fn resize(&mut self, width: usize, height: usize) -> Result<(), String> {
+        if (width, height) == (self.width, self.height) {
+            return Ok(());
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &mut self.gpu {
+            gpu.resize_scene(width, height)?;
+            self.width = width;
+            self.height = height;
+            return Ok(());
+        }
+        self.sdl
+            .as_mut()
+            .ok_or("presentation backend is inactive")?
+            .resize_scene(width, height)?;
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
     pub fn take_notice(&mut self) -> Option<String> {
         self.notice.take()
@@ -268,6 +335,40 @@ impl<'w> Presentation<'w> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "run explicitly with SDL_VIDEODRIVER=dummy and --test-threads=1"]
+    fn sdl_scene_resize_retains_renderer_and_previous_frame_on_invalid_size() {
+        let sdl = sdl2::init().unwrap();
+        let video = sdl.video().unwrap();
+        let window = video
+            .window("OpenChasm resize test", 3, 2)
+            .hidden()
+            .build()
+            .unwrap();
+        let mut presenter = Presentation::new(&window, 2, 2, BackendChoice::Software).unwrap();
+        let renderer = presenter.sdl.as_ref().unwrap().canvas.raw();
+        presenter.present_sdl(&[0xff0000; 4]).unwrap();
+        for (width, height) in [(3, 2), (1, 1), (2, 3), (3, 2)] {
+            presenter.resize(width, height).unwrap();
+            assert_eq!(presenter.sdl.as_ref().unwrap().canvas.raw(), renderer);
+            presenter
+                .present_sdl(&vec![0x00ff00; width * height])
+                .unwrap();
+        }
+        presenter.present_sdl(&[0x00ff00; 6]).unwrap();
+        assert!(presenter.present_sdl(&[0; 4]).is_err());
+        let texture = presenter.sdl.as_ref().unwrap().texture;
+        presenter.resize(3, 2).unwrap();
+        assert_eq!(presenter.sdl.as_ref().unwrap().texture, texture);
+        for (width, height) in [(0, 2), (3, 0), (usize::MAX, 2), (16384, 16384)] {
+            assert!(presenter.resize(width, height).is_err());
+            assert_eq!(presenter.sdl.as_ref().unwrap().canvas.raw(), renderer);
+            assert_eq!(presenter.sdl.as_ref().unwrap().texture, texture);
+            presenter.present_sdl(&[0x0000ff; 6]).unwrap();
+        }
+        assert_eq!((presenter.width, presenter.height), (3, 2));
+        presenter.present_sdl(&[0x0000ff; 6]).unwrap();
+    }
     #[test]
     #[ignore = "run explicitly with SDL_VIDEODRIVER=dummy and --test-threads=1"]
     fn sdl_fallback_preserves_display_channels() {

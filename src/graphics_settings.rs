@@ -1,5 +1,6 @@
 //! Validated client graphics/control preferences and keyboard options menu.
 use crate::color_pipeline::ColorSettings;
+use crate::display_settings::DisplayConfig;
 use crate::ui::UiPixel;
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use openchasm::movement::MovementMode;
@@ -13,7 +14,7 @@ use std::{
 };
 
 const MAX_BYTES: u64 = 16 * 1024;
-const SETTINGS_VERSION: u32 = 3;
+const SETTINGS_VERSION: u32 = 4;
 /// Verified original mouse scale at sensitivity 1, in radians per relative count.
 pub const DEFAULT_MOUSE_SENSITIVITY: f32 = std::f32::consts::PI / 1024.0;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +73,8 @@ pub struct GraphicsSettings {
     pub autorun: bool,
     #[serde(default)]
     pub physics: MovementMode,
+    #[serde(default)]
+    pub display: DisplayConfig,
 }
 impl Default for GraphicsSettings {
     fn default() -> Self {
@@ -89,6 +92,7 @@ impl Default for GraphicsSettings {
             sensitivity: DEFAULT_MOUSE_SENSITIVITY,
             autorun: true,
             physics: MovementMode::Original,
+            display: DisplayConfig::default(),
         }
     }
 }
@@ -98,6 +102,7 @@ impl GraphicsSettings {
             return Err("unsupported settings version");
         }
         self.color_settings().validate()?;
+        self.display.validate()?;
         if !self.bloom.is_finite() || !(0.0..=1.0).contains(&self.bloom) {
             return Err("bloom outside 0..=1");
         }
@@ -179,7 +184,7 @@ impl SettingsStore {
                 settings.sensitivity = DEFAULT_MOUSE_SENSITIVITY;
             }
         }
-        if matches!(settings.version, 1 | 2) {
+        if matches!(settings.version, 1..=3) {
             settings.version = SETTINGS_VERSION;
         }
         settings
@@ -250,11 +255,35 @@ pub enum MenuAction {
     Changed,
     Closed,
 }
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    #[default]
+    Graphics,
+    Controls,
+    Display,
+}
+impl Page {
+    fn next(self) -> Self {
+        match self {
+            Self::Graphics => Self::Controls,
+            Self::Controls => Self::Display,
+            Self::Display => Self::Graphics,
+        }
+    }
+    fn rows(self) -> usize {
+        match self {
+            Self::Graphics => 8,
+            Self::Controls => 3,
+            Self::Display => 2,
+        }
+    }
+}
 #[derive(Default)]
 pub struct GraphicsMenu {
     open: bool,
     selected: usize,
-    controls: bool,
+    page: Page,
 }
 impl GraphicsMenu {
     pub fn open(&mut self) {
@@ -280,7 +309,7 @@ impl GraphicsMenu {
         };
         match *key {
             Keycode::Tab => {
-                self.controls = !self.controls;
+                self.page = self.page.next();
                 self.selected = 0;
                 MenuAction::None
             }
@@ -289,18 +318,30 @@ impl GraphicsMenu {
                 MenuAction::Closed
             }
             Keycode::Up => {
-                let rows = if self.controls { 3 } else { 8 };
+                let rows = self.page.rows();
                 self.selected = (self.selected + rows - 1) % rows;
                 MenuAction::None
             }
             Keycode::Down => {
-                self.selected = (self.selected + 1) % if self.controls { 3 } else { 8 };
+                self.selected = (self.selected + 1) % self.page.rows();
                 MenuAction::None
             }
             Keycode::Left | Keycode::Right | Keycode::Return | Keycode::KpEnter => {
                 let step = if *key == Keycode::Left { -1 } else { 1 };
                 let old = settings.clone();
-                if self.controls {
+                if self.page == Page::Display {
+                    match self.selected {
+                        0 => settings.display.fullscreen = !settings.display.fullscreen,
+                        1 => {
+                            let resolution = settings.display.resolution().shifted(step);
+                            settings
+                                .display
+                                .set_resolution(resolution)
+                                .expect("menu resolutions are validated");
+                        }
+                        _ => unreachable!(),
+                    }
+                } else if self.page == Page::Controls {
                     match self.selected {
                         0 => {
                             settings.sensitivity = (settings.sensitivity
@@ -367,7 +408,12 @@ impl GraphicsMenu {
         for pixel in frame.iter_mut() {
             *pixel = pixel.dim_shift_bias(1, 0);
         }
-        let rows = if self.controls {
+        let rows = if self.page == Page::Display {
+            vec![
+                format!("FULLSCREEN: {}", onoff(settings.display.fullscreen)),
+                format!("RESOLUTION: {}", settings.display.resolution()),
+            ]
+        } else if self.page == Page::Controls {
             vec![
                 format!(
                     "MOUSE SENS: {:.2}X",
@@ -409,10 +455,10 @@ impl GraphicsMenu {
             height,
             x,
             y,
-            if self.controls {
-                "CONTROLS"
-            } else {
-                "GRAPHICS OPTIONS"
+            match self.page {
+                Page::Graphics => "GRAPHICS OPTIONS",
+                Page::Controls => "CONTROLS",
+                Page::Display => "DISPLAY",
             },
         );
         for (i, row) in rows.iter().enumerate() {
@@ -431,14 +477,14 @@ impl GraphicsMenu {
             height,
             x,
             y + 95,
-            if self.controls {
-                "TAB: GRAPHICS"
-            } else {
-                "TAB: CONTROLS"
+            match self.page {
+                Page::Graphics => "TAB: CONTROLS",
+                Page::Controls => "TAB: DISPLAY",
+                Page::Display => "TAB: GRAPHICS",
             },
         );
         draw(frame, width, height, x, y + 105, "ARROWS CHANGE  ESC CLOSE");
-        if self.controls {
+        if self.page == Page::Controls {
             draw(
                 frame,
                 width,
@@ -446,6 +492,15 @@ impl GraphicsMenu {
                 x,
                 y + 115,
                 "SHIFT TEMPORARILY INVERTS RUN",
+            );
+        } else if self.page == Page::Display {
+            draw(
+                frame,
+                width,
+                height,
+                x,
+                y + 115,
+                "FULLSCREEN USES DESKTOP SIZE",
             );
         } else if !settings.uses_hdr() {
             draw(
@@ -511,6 +566,11 @@ mod tests {
         settings.max_fps = 144;
         settings.autorun = false;
         settings.physics = MovementMode::Quake1;
+        settings.display = DisplayConfig {
+            fullscreen: true,
+            width: 1280,
+            height: 720,
+        };
         settings.set_preset(VisualPreset::Enhanced);
         assert_eq!(settings.bloom, 0.35);
         assert!(settings.uses_hdr());
@@ -521,6 +581,14 @@ mod tests {
         assert_eq!(settings.bloom, 0.0);
         assert!(!settings.autorun);
         assert_eq!(settings.physics, MovementMode::Quake1);
+        assert_eq!(
+            settings.display,
+            DisplayConfig {
+                fullscreen: true,
+                width: 1280,
+                height: 720
+            }
+        );
         assert!(settings.validate().is_ok());
         settings.gamma = f32::NAN;
         assert!(settings.validate().is_err());
@@ -531,7 +599,7 @@ mod tests {
         let dir = directory();
         fs::create_dir_all(&dir).unwrap();
         let store = SettingsStore::new(dir.clone());
-        for (version, sensitivity) in [(1, 0.002), (1, 0.004), (2, 0.002), (2, 0.004)] {
+        for (version, sensitivity) in [(1, 0.002), (1, 0.004), (2, 0.002), (2, 0.004), (3, 0.002)] {
             let old = GraphicsSettings {
                 version,
                 sensitivity,
@@ -541,6 +609,7 @@ mod tests {
             let fields = old.as_object_mut().unwrap();
             fields.remove("autorun");
             fields.remove("physics");
+            fields.remove("display");
             let bytes = serde_json::to_vec(&old).unwrap();
             fs::write(dir.join("graphics.json"), &bytes).unwrap();
             let loaded = store.load().unwrap();
@@ -555,6 +624,7 @@ mod tests {
             );
             assert!(loaded.autorun);
             assert_eq!(loaded.physics, MovementMode::Original);
+            assert_eq!(loaded.display, DisplayConfig::default());
             assert_eq!(
                 fs::read(dir.join("graphics.json")).unwrap(),
                 bytes,
@@ -574,6 +644,7 @@ mod tests {
         old.as_object_mut().unwrap().remove("show_help");
         old.as_object_mut().unwrap().remove("autorun");
         old.as_object_mut().unwrap().remove("physics");
+        old.as_object_mut().unwrap().remove("display");
         let restored: GraphicsSettings = serde_json::from_value(old).unwrap();
         assert_eq!(restored, settings);
         assert!(!restored.show_help);
@@ -659,7 +730,7 @@ mod tests {
             menu.event(&key(Keycode::Tab), &mut settings),
             MenuAction::None
         );
-        assert!(menu.controls);
+        assert_eq!(menu.page, Page::Controls);
         assert_eq!(menu.selected, 0);
         assert_eq!(
             menu.event(&key(Keycode::Right), &mut settings),
@@ -681,7 +752,7 @@ mod tests {
         assert_eq!(frame[0], 0x7f7f7f);
         assert!(frame.contains(&0xffffff));
         menu.event(&key(Keycode::Tab), &mut settings);
-        assert!(!menu.controls);
+        assert_eq!(menu.page, Page::Display);
         assert_eq!(menu.selected, 0);
         let expected = GraphicsSettings {
             sensitivity: DEFAULT_MOUSE_SENSITIVITY * 1.1,
@@ -699,7 +770,7 @@ mod tests {
         assert_eq!(store.load().unwrap(), settings);
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("graphics.json")).unwrap()).unwrap();
-        assert_eq!(saved["version"], 3);
+        assert_eq!(saved["version"], SETTINGS_VERSION);
         assert_eq!(saved["physics"], "quake1");
         assert_eq!(saved["autorun"], false);
         fs::remove_dir_all(dir).unwrap();
@@ -717,5 +788,52 @@ mod tests {
             assert_eq!(settings.sensitivity, sensitivity);
             assert!(settings.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn display_page_cycles_resolution_and_saves_without_changing_other_options() {
+        let mut settings = GraphicsSettings::default();
+        let mut menu = GraphicsMenu::default();
+        menu.open();
+        for _ in 0..2 {
+            menu.event(&key(Keycode::Tab), &mut settings);
+        }
+        assert_eq!(menu.page, Page::Display);
+        assert_eq!(menu.selected, 0);
+        assert_eq!(
+            menu.event(&key(Keycode::Return), &mut settings),
+            MenuAction::Changed
+        );
+        assert!(settings.display.fullscreen);
+        menu.event(&key(Keycode::Down), &mut settings);
+        menu.event(&key(Keycode::Right), &mut settings);
+        assert_eq!(settings.display.render_dimensions(), Ok((640, 480)));
+        menu.event(&key(Keycode::Down), &mut settings);
+        assert_eq!(menu.selected, 0);
+        menu.event(&key(Keycode::Up), &mut settings);
+        assert_eq!(menu.selected, 1);
+        let mut frame = vec![0x123456u32; 320 * 200];
+        menu.render(&mut frame, 320, 200, &settings);
+        assert!(frame.contains(&0xffffff));
+        menu.event(&key(Keycode::Tab), &mut settings);
+        assert_eq!(menu.page, Page::Graphics);
+        assert_eq!(menu.selected, 0);
+        let display = settings.display;
+        assert_eq!(
+            settings,
+            GraphicsSettings {
+                display,
+                ..GraphicsSettings::default()
+            }
+        );
+        let dir = directory();
+        let store = SettingsStore::new(dir.clone());
+        store.save(&settings).unwrap();
+        assert_eq!(store.load().unwrap(), settings);
+        let bytes = fs::read(dir.join("graphics.json")).unwrap();
+        settings.display.width = u32::MAX;
+        assert!(store.save(&settings).is_err());
+        assert_eq!(fs::read(dir.join("graphics.json")).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

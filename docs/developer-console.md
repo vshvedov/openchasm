@@ -29,7 +29,7 @@ For repeatable profiling, `OPENCHASM_PROFILE=1` prints periodic timings to stder
 `OPENCHASM_UNCAPPED=1` starts without the frame cap; normal launches remain capped.
 
 Graphics controls are available with `options`, or from the pause menu. Use
-Up/Down to select a row, Left/Right or Enter to change it, Tab to switch between Graphics and Controls, and Escape to close.
+Up/Down to select a row, Left/Right or Enter to change it, Tab to cycle Graphics, Controls and Display, and Escape to close.
 The client saves explicit changes to `graphics.json` in SDL's per-user
 OpenChasm preference directory. A missing file uses defaults; invalid files are
 reported and ignored by the host.
@@ -51,7 +51,10 @@ Missing HUD assets fall back to the text status display.
 `renderer gpu` or `renderer auto` tries the optional GPU backend, falling back
 to SDL when unavailable. Backend switches retain the session. This selection
 is session-local; `OPENCHASM_RENDERER=auto|gpu|software` selects startup behavior.
-Build with `--features gpu` to include GPU post-processing.
+Build with `--features gpu` to include GPU post-processing. On native Wayland,
+SDL presentation owns an EGL surface; returning from SDL to GPU requires restarting
+with `OPENCHASM_RENDERER=gpu`. A runtime request keeps SDL active and explains this
+instead of creating competing surface owners.
 
 Default mouse sensitivity now matches the original coefficient `pi/1024` radians
 per relative count at original sensitivity 1. Version-one preferences using the
@@ -90,3 +93,18 @@ Console cheats and level selection:
 God mode is included in checkpoints and retained by restart and level changes,
 but starts off in a new game. These are local developer commands; no multiplayer
 permission model is implemented yet.
+
+Use **F11** or **Alt+Enter** to toggle fullscreen, or `fullscreen` in the console.
+`fullscreen on` / `fullscreen off` set it explicitly. The Display page in Options
+contains fullscreen and resolution controls. `resolution` reports the selected
+size; `resolution 1280x720` or `resolution 1280 720` changes it immediately.
+Sizes from 320x200 through 1920x1200 are supported. Resolution changes resize the
+world, effects, HUD/UI and presentation buffers, retaining the game session.
+Higher resolutions cost more CPU rendering time.
+
+Fullscreen uses the desktop display mode and scales the selected scene size
+with aspect-preserving bars where needed. Windowed mode requests the selected
+size; a tiling compositor can choose a different output size. Fullscreen and
+resolution preferences persist between launches. Relative look uses SDL's raw
+relative-count accumulator, so render size, window size and presentation backend
+do not change its angular sensitivity.

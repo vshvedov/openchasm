@@ -340,4 +340,18 @@ with sRGB/unorm targets, extreme settings, tiny/odd images, bloom, opaque black
 coverage and invalid-input state preservation. Native macOS/Windows GPU runtime
 validation remains outstanding. CI now checks both feature configurations on
 all three platforms. The backend still consumes a CPU-rasterized world image;
-it is not a high-resolution 3D world renderer.
+world geometry remains CPU-rasterized.
+
+Scene resolution is now selected independently of the desktop fullscreen mode.
+Resizing replaces scene storage/bind groups and packing capacity while retaining
+the GPU device, pipelines and surface; SDL replaces only its streaming texture.
+Offscreen tests check repeated odd/tiny resizes and rejected-size preservation.
+
+On native Wayland, GPU startup marks the SDL window as Vulkan; otherwise SDL
+implicitly creates an EGL surface that competes with external Vulkan presentation
+and can break fullscreen/resizing. GPU-to-SDL fallback lets SDL recreate its
+native OpenGL window after the Vulkan surface is dropped. Returning to GPU on
+that Wayland window is refused with a restart instruction, retaining SDL.
+SDL2's Wayland driver has no native software framebuffer, so forcing its software
+renderer is not a valid fallback. Other native backends retain the existing
+runtime backend-switch path; physical macOS/Windows testing remains outstanding.

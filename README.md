@@ -26,8 +26,16 @@ pauses gameplay and releases the mouse. See [console controls](docs/developer-co
 Open **Escape → Options** to change the visual preset, tone mapping,
 colour controls, bloom and frame cap. `remaster` is the default; `enhanced` adds
 optional bloom. The tilde console also accepts `graphics enhanced`,
-`graphics remaster` and `options`. Press **Tab** in Options to switch to Controls, where you can adjust mouse sensitivity, autorun and Original/Quake 1 movement. Quake mode uses Quake ground friction, acceleration, air movement and jumping on Chasm collision geometry; it does not implement Quake BSP slopes, water or stair traversal. Changes are saved per user. The graphical status bar uses your game content;
+`graphics remaster` and `options`. Press **Tab** in Options to cycle Graphics, Controls and Display. In Controls, adjust mouse sensitivity, autorun and Original/Quake 1 movement. Quake mode uses Quake ground friction, acceleration, air movement and jumping on Chasm collision geometry; it does not implement Quake BSP slopes, water or stair traversal. Changes are saved per user. The graphical status bar uses your game content;
 `showhelp on` restores the development control overlay.
+
+Use **F11** or **Alt+Enter** to toggle fullscreen. The Display page selects
+fullscreen and rendering resolution, saved between launches. The console also
+accepts `fullscreen` and `resolution 1280x720`. Higher resolutions require more
+CPU rendering time.
+
+For testing, `god` toggles damage immunity, `giveall` grants weapons and ammunition,
+and `map 02` starts another available level. Enter `map` to list available levels.
 
 Examples:
 

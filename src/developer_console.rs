@@ -40,6 +40,8 @@ const COMMANDS: &[&str] = &[
     "map",
     "level",
     "changelevel",
+    "fullscreen",
+    "resolution",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,6 +54,8 @@ pub enum Command {
     God(Option<bool>),
     GiveAll,
     Map(Option<u8>),
+    Fullscreen(Option<bool>),
+    Resolution(Option<crate::display_settings::Resolution>),
     Restart,
     Quit,
     /// Radians per relative mouse count; None requests the current value.
@@ -246,7 +250,7 @@ impl Console {
         let args: Vec<_> = parts.collect();
         match command.as_str() {
             "help" | "cmdlist" if args.is_empty() => self
-                .push("help cmdlist clear echo version fps showhelp maxfps status restart quit sensitivity autorun physics options graphics renderer tonemap gamma brightness saturation bloom god giveall allweapons give map level changelevel"),
+                .push("help cmdlist clear echo version status\nrestart quit god giveall allweapons\ngive all | map [01] | level [01]\nchangelevel [01] | fullscreen\nfps showhelp maxfps options graphics\nrenderer resolution\nsensitivity autorun physics\ntonemap gamma brightness\nsaturation bloom"),
             "clear" if args.is_empty() => self.lines.clear(),
             "echo" => self.push(
                 trimmed
@@ -302,12 +306,18 @@ impl Console {
                 [v] if v.eq_ignore_ascii_case("quake1") => return Some(Command::Physics(Some(MovementMode::Quake1))),
                 _ => self.push("usage: physics [original|quake1]"),
             },
-            "god" => match args.as_slice() {
-                [] => return Some(Command::God(None)),
-                [v] if v.eq_ignore_ascii_case("on") || *v == "1" => return Some(Command::God(Some(true))),
-                [v] if v.eq_ignore_ascii_case("off") || *v == "0" => return Some(Command::God(Some(false))),
-                _ => self.push("usage: god [on|off|1|0] (no argument toggles)"),
-            },
+            "god" | "fullscreen" => {
+                let value = match args.as_slice() {
+                    [] => Some(None),
+                    [v] if v.eq_ignore_ascii_case("on") || *v == "1" => Some(Some(true)),
+                    [v] if v.eq_ignore_ascii_case("off") || *v == "0" => Some(Some(false)),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    return Some(if command == "god" { Command::God(value) } else { Command::Fullscreen(value) });
+                }
+                self.push(&format!("usage: {command} [on|off|1|0] (no argument toggles)"));
+            }
             "giveall" | "allweapons" if args.is_empty() => return Some(Command::GiveAll),
             "give" if args.len() == 1 && args[0].eq_ignore_ascii_case("all") => return Some(Command::GiveAll),
             "giveall" | "allweapons" | "give" => self.push("usage: giveall (or give all)"),
@@ -323,6 +333,16 @@ impl Console {
                     _ => {}
                 }
                 self.push("usage: map [01..99] (no argument lists available levels)");
+            }
+            "resolution" => {
+                let value = match args.as_slice() {
+                    [] => Some(None),
+                    [size] => size.parse::<crate::display_settings::Resolution>().ok().map(Some),
+                    [width, height] => format!("{width}x{height}").parse::<crate::display_settings::Resolution>().ok().map(Some),
+                    _ => None,
+                };
+                if let Some(value) = value { return Some(Command::Resolution(value)); }
+                self.push("usage: resolution [WIDTHxHEIGHT | WIDTH HEIGHT]");
             }
             "options" if args.is_empty() => return Some(Command::Options),
             "graphics" => {
@@ -454,34 +474,63 @@ mod tests {
         console.key(Keycode::Return)
     }
     #[test]
-    fn cheats_and_level_commands_validate_aliases_and_reject_invalid_requests() {
+    fn cheats_levels_and_display_commands_validate_without_side_effects() {
         let mut c = Console::default();
-        for (text, expected) in [
+        for (input, command) in [
             ("god", Command::God(None)),
             ("god on", Command::God(Some(true))),
             ("god 0", Command::God(Some(false))),
             ("giveall", Command::GiveAll),
             ("allweapons", Command::GiveAll),
-            ("give all", Command::GiveAll),
+            ("give ALL", Command::GiveAll),
             ("map", Command::Map(None)),
             ("map 01", Command::Map(Some(1))),
             ("level 19", Command::Map(Some(19))),
             ("changelevel MAP02", Command::Map(Some(2))),
+            ("fullscreen", Command::Fullscreen(None)),
+            ("fullscreen off", Command::Fullscreen(Some(false))),
+            ("resolution", Command::Resolution(None)),
+            (
+                "resolution 1280x720",
+                Command::Resolution(Some(crate::display_settings::Resolution {
+                    width: 1280,
+                    height: 720,
+                })),
+            ),
+            (
+                "resolution 800 600",
+                Command::Resolution(Some(crate::display_settings::Resolution {
+                    width: 800,
+                    height: 600,
+                })),
+            ),
         ] {
-            assert_eq!(submit(&mut c, text), Some(expected));
+            assert_eq!(submit(&mut c, input), Some(command), "{input}");
         }
-        for text in [
+        for input in [
             "god maybe",
+            "god on off",
             "give weapon",
             "giveall now",
             "map 00",
             "map 100",
             "map ../01",
             "map 01 extra",
+            "fullscreen yes",
+            "resolution 0x0",
+            "resolution 999999x999999",
+            "resolution 640 nan",
         ] {
-            assert_eq!(submit(&mut c, text), None);
-            assert!(c.lines.back().unwrap().starts_with("usage:"));
+            assert_eq!(submit(&mut c, input), None, "{input}");
+            assert!(c.lines.back().unwrap().starts_with("usage:"), "{input}");
         }
+        c.insert("fullsc");
+        c.key(Keycode::Tab);
+        assert_eq!(c.input, "fullscreen ");
+        c.input.clear();
+        c.cursor = 0;
+        submit(&mut c, "help");
+        assert!(c.lines.iter().any(|line| line.contains("giveall")));
     }
     #[test]
     fn editing_preserves_utf8_boundaries_and_supports_navigation() {
@@ -611,7 +660,7 @@ mod tests {
             assert!(c.lines.back().unwrap().starts_with("usage:"));
         }
         submit(&mut c, "help");
-        assert!(c.lines.back().unwrap().contains("autorun physics"));
+        assert!(c.lines.iter().any(|line| line.contains("autorun physics")));
         for (prefix, completed) in [("aut", "autorun "), ("phy", "physics ")] {
             c.insert(prefix);
             c.key(Keycode::Tab);
@@ -654,6 +703,6 @@ mod tests {
         submit(&mut c, "clear");
         assert!(c.lines.is_empty());
         submit(&mut c, "help");
-        assert!(c.lines.back().unwrap().contains("sensitivity"));
+        assert!(c.lines.iter().any(|line| line.contains("sensitivity")));
     }
 }

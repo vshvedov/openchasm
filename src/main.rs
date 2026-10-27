@@ -4,6 +4,7 @@ mod bloom;
 mod color_pipeline;
 mod content;
 mod developer_console;
+mod display_settings;
 mod explosion_render;
 mod frame_stats;
 mod gltf_model;

@@ -143,6 +143,75 @@ fn raw_cells(map: &Map) -> [u8; 4096] {
             .texture_id
     })
 }
+/// Load the same actor source and clip table used by the client renderer.
+/// Missing or invalid metadata leaves the corresponding definition on the
+/// explicit legacy AI fallback; known missing slots stay absent.
+fn load_actor_clips(
+    resources: &mut ResourceSet,
+    state: &actors::ActorState,
+    definitions: &actors::ActorDefinitions,
+) -> Vec<Option<openchasm::actor_clips::ActorClipSet>> {
+    use openchasm::actor_clips::ActorClipSet;
+    let mut clips = vec![None; definitions.entries.len()];
+    let mut used = std::collections::BTreeSet::new();
+    used.extend(state.actors.iter().map(|actor| actor.definition_index));
+    for index in used {
+        let Some(definition) = definitions.entries.get(index) else {
+            continue;
+        };
+        let result = if let Some(path) = definition.car_path() {
+            resources
+                .read(&path)
+                .and_then(|bytes| monster::Monster::parse(&bytes))
+                .map(|car| ActorClipSet::from_car(&car))
+        } else {
+            let path = format!(
+                "monster/{}.gltf",
+                definition.model_name.to_ascii_lowercase()
+            );
+            gltf_model::GltfModel::load(resources, &path).and_then(|model| {
+                let frame_count = u32::try_from(model.frame_count).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "actor frame count exceeds limit",
+                    )
+                })?;
+                resources
+                    .read(&format!("{path}.ani"))
+                    .and_then(|table| ActorClipSet::parse_gltf(&table, Some(frame_count)))
+            })
+        };
+        match result {
+            Ok(set) => {
+                if set.clips[0].is_none() {
+                    eprintln!(
+                        "actor {}: run clip missing; timed attacks disabled",
+                        definition.model_name
+                    );
+                }
+                if definition.rocket >= 0 && set.clips[5].is_none() {
+                    eprintln!(
+                        "actor {}: ranged clip missing; ranged attacks disabled",
+                        definition.model_name
+                    );
+                }
+                if definition.kick > 0 && !(6..=8).any(|slot| set.clips[slot].is_some()) {
+                    eprintln!(
+                        "actor {}: melee clips missing; melee attacks disabled",
+                        definition.model_name
+                    );
+                }
+                clips[index] = Some(set);
+            }
+            Err(error) => eprintln!(
+                "actor {}: clip metadata unavailable ({error}); using legacy AI timing",
+                definition.model_name
+            ),
+        }
+    }
+    clips
+}
+
 fn make_world(map: &Map, graphics: &[WallGraphic]) -> Result<World, Box<dyn Error>> {
     let spawn = map
         .monsters
@@ -325,6 +394,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let actor_state =
                     actors::ActorState::from_placements(&map.monsters, &actor_definitions);
                 object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
+                let actor_clips =
+                    load_actor_clips(&mut resources, &actor_state, &actor_definitions);
                 let instances = objects::instances(&map);
                 // Only opt in for visible, difficulty-enabled object placements
                 // with a representable render instance; other targets stay closed.
@@ -443,6 +514,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         shot_blocking,
                         difficulty: openchasm::pickups::Difficulty::Normal,
                     });
+                session.ai.set_clip_metadata(actor_clips);
                 session.set_explosions_enabled(true);
                 session.set_mines_enabled(mine_available);
                 session.set_objects(openchasm::object_combat::ObjectCombat::new(
@@ -606,5 +678,74 @@ mod wall_graphics_tests {
         assert!(!graphics[1].disable_walk_collision);
         assert!(!graphics[120].disable_walk_collision);
         assert_eq!(graphics[89].filename, None);
+    }
+    #[test]
+    fn missing_actor_metadata_uses_legacy_fallback() {
+        let path =
+            std::env::temp_dir().join(format!("openchasm-missing-clips-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let defs = actors::ActorDefinitions::parse(
+            b"[MONSTERS]\n2\nhero.car 100 100 10 5 100 0 0 0\nmissing.car 50 50 10 5 100 20 0 0\n",
+        )
+        .unwrap();
+        let placement = map::Monster {
+            id: 101,
+            position: [256, 256],
+            angle: 0,
+            flags: 2,
+        };
+        let state = actors::ActorState::from_placements(&[placement], &defs);
+        let clips = load_actor_clips(&mut resources, &state, &defs);
+        assert!(clips[1].is_none());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn installed_early_maps_load_all_actor_clip_sources() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).expect("open selected archive");
+        let defs = actors::ActorDefinitions::parse(&resources.read("chasm.inf").unwrap()).unwrap();
+        for level in 1..=5 {
+            let map = Map::parse(&resources.read(&format!("map/map.{level:02}")).unwrap()).unwrap();
+            let state = actors::ActorState::from_placements(&map.monsters, &defs);
+            let clips = load_actor_clips(&mut resources, &state, &defs);
+            for actor in state.actors.iter().filter(|a| a.placement.flags & 2 != 0) {
+                let def = &defs.entries[actor.definition_index];
+                let set = clips[actor.definition_index]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("level {level}, {} metadata", def.model_name));
+                assert!(
+                    set.bounds_verified,
+                    "level {level}, {} bounds",
+                    def.model_name
+                );
+                assert!(
+                    set.clips[0].is_some(),
+                    "level {level}, {} run",
+                    def.model_name
+                );
+                if def.rocket >= 0 {
+                    assert!(
+                        set.clips[5].is_some(),
+                        "level {level}, {} ranged",
+                        def.model_name
+                    );
+                }
+                if def.kick > 0 {
+                    assert!(
+                        (6..=8).any(|slot| set.clips[slot].is_some()),
+                        "level {level}, {} melee",
+                        def.model_name
+                    );
+                }
+            }
+        }
     }
 }

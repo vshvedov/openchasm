@@ -6,6 +6,7 @@ use crate::texture::CelImage;
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
+use openchasm::game::GameInventory;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -138,9 +139,13 @@ pub fn run(
     textures: Vec<Option<CelImage>>,
     planes: PlaneRenderer,
     mut processes: ProcessRuntime,
-    objects: ObjectScene,
+    mut objects: ObjectScene,
+    mut game: GameInventory,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
+    for cell in game.pickups.hidden_cells() {
+        objects.set_visible(cell, false);
+    }
     let textures: Vec<Option<ViewerTexture>> = textures
         .into_iter()
         .map(|item| item.map(ViewerTexture::from))
@@ -177,6 +182,10 @@ pub fn run(
         pending_interact |= window.is_key_pressed(Key::E, KeyRepeat::No);
         while accumulator >= STEP {
             world.step(input, STEP);
+            for event in game.collect_near(world.player.position) {
+                objects.set_visible(event.cell, false);
+            }
+            processes.set_keys(game.inventory.keys);
             processes.tick(&mut world, STEP, pending_interact);
             pending_interact = false;
             accumulator -= STEP;
@@ -189,6 +198,20 @@ pub fn run(
             Some(&planes),
             Some(&objects),
             label,
+        );
+        text(
+            &mut frame,
+            8,
+            HEIGHT - 18,
+            &format!(
+                "HEALTH {}  ARMOR {}  AMMO {}  KEYS {}{}{}",
+                game.inventory.health,
+                game.inventory.armor,
+                game.inventory.ammo[0],
+                if game.inventory.keys[0] { "R" } else { "-" },
+                if game.inventory.keys[1] { "G" } else { "-" },
+                if game.inventory.keys[2] { "B" } else { "-" }
+            ),
         );
         window.update_with_buffer(&frame, WIDTH, HEIGHT)?;
     }

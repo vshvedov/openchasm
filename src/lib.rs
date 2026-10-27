@@ -10,4 +10,5 @@ pub mod process_runtime;
 pub mod world;
 
 pub mod actors;
+pub mod game;
 pub mod pickups;

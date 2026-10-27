@@ -274,12 +274,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             let actor_state =
                 actors::ActorState::from_placements(&map.monsters, &actor_definitions);
             object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
+            let weapons =
+                openchasm::inventory::WeaponDefinitions::parse(&resources.read("chasm.inf")?)?;
+            let game = openchasm::game::GameInventory::new(
+                weapons,
+                &objects::instances(&map),
+                &definitions,
+                openchasm::pickups::Difficulty::Normal,
+            );
             viewer::run(
                 world,
                 textures,
                 planes,
                 processes,
                 object_scene,
+                game,
                 &format!("{id}: {name}"),
             )?;
         }

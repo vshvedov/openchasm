@@ -99,6 +99,7 @@ pub struct ScriptedObjects {
     pub quake_enabled: bool,
     destroy_links: Vec<([u8; 2], u16)>,
     pickup_links: Vec<([u8; 2], u16)>,
+    shoot_links: Vec<([u8; 2], u16)>,
     required_objects: Vec<u16>,
 }
 impl ScriptedObjects {
@@ -130,6 +131,12 @@ impl ScriptedObjects {
                 .triggers
                 .iter()
                 .filter(|t| t.kind == "link")
+                .map(|t| ([t.x, t.y], t.process))
+                .collect(),
+            shoot_links: script
+                .triggers
+                .iter()
+                .filter(|t| t.kind == "shoot")
                 .map(|t| ([t.x, t.y], t.process))
                 .collect(),
             destroy_links: script
@@ -370,6 +377,38 @@ impl Session {
         (attempts, true)
     }
 
+    /// Dispatch contact links in authored order without publishing a partial
+    /// staged action. The caller owns rollback of the surrounding hit.
+    fn activate_explosion_contact(
+        &mut self,
+        cell: [u8; 2],
+        events: &mut SessionEvents,
+        attempts: &mut Vec<ProcessEvent>,
+    ) -> bool {
+        let Some(scripted) = &self.scripted_objects else {
+            attempts.extend(self.processes.activate_at("shoot", cell));
+            return true;
+        };
+        let ids: Vec<_> = scripted
+            .shoot_links
+            .iter()
+            .filter_map(|(at, id)| (*at == cell).then_some(*id))
+            .collect();
+        let required = scripted.required_objects.clone();
+        for id in ids {
+            match self.try_staged_process("shoot", cell, id, events) {
+                Ok(event) => attempts.push(event),
+                Err((outcome, preflight)) if !preflight && !required.contains(&id) => attempts
+                    .push(ProcessEvent {
+                        process_id: id,
+                        outcome,
+                    }),
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     /// Apply one impact as a transaction. Damage is only emitted after every
     /// object destruction script has succeeded; direct impact is not applied.
     fn apply_explosion(
@@ -437,11 +476,24 @@ impl Session {
             _ => None,
         };
         if let Some(cell) = hit_cell {
-            attempts.extend(self.processes.activate_at("shoot", cell));
+            if !self.activate_explosion_contact(cell, events, attempts) {
+                *self = before;
+                attempts.truncate(attempt_count);
+                events.object_hits.truncate(hit_count);
+                events.object_transitions.truncate(transition_count);
+                events.quake_changes.truncate(quake_count);
+                events.damage = previous_damage;
+                return false;
+            }
         }
+        let mut applied = Vec::new();
         for item in &damage {
             match item.target {
                 TargetId::Player => {
+                    if self.game.inventory.health == 0 {
+                        continue;
+                    }
+                    applied.push(*item);
                     events.damage = events.damage.saturating_add(
                         self.apply_player_damage(item.damage.clamp(0, u16::MAX as i32) as u16),
                     );
@@ -453,6 +505,10 @@ impl Session {
                         .iter_mut()
                         .find(|actor| actor.source_index == source_index)
                     {
+                        if actor.health <= 0 {
+                            continue;
+                        }
+                        applied.push(*item);
                         actor.health = actor.health.saturating_sub(item.damage).max(0);
                         if actor.health > 0 {
                             self.ai.alert(
@@ -470,6 +526,7 @@ impl Session {
                     else {
                         continue;
                     };
+                    applied.push(*item);
                     self.sync_object_damage(cell, item.damage);
                     if hit.destroyed {
                         let (destroy_attempts, accepted) =
@@ -497,7 +554,7 @@ impl Session {
         }
         events.explosions.push(explosion);
         events.explosion_origins.push(origin);
-        events.explosion_damage.extend(damage);
+        events.explosion_damage.extend(applied);
         true
     }
 
@@ -1078,6 +1135,8 @@ impl Session {
                 .damage
                 .saturating_add(self.apply_player_damage(attack.damage));
         }
+        let pre_tick_projectiles = self.explosions_enabled.then(|| self.projectiles.clone());
+        let mut rejected_impacts = Vec::new();
         events.projectile_impacts = self.projectiles.tick_with_objects(
             DT,
             &self.world,
@@ -1107,7 +1166,7 @@ impl Session {
                     radius: radius_raw as f32 / 256.0,
                     damage: impact.damage,
                 };
-                self.apply_explosion(
+                if !self.apply_explosion(
                     explosion,
                     ExplosionOrigin::Projectile {
                         projectile_id: impact.projectile_id,
@@ -1116,7 +1175,13 @@ impl Session {
                     Some(impact.target),
                     &mut events,
                     &mut attempts,
-                );
+                ) && pre_tick_projectiles.as_ref().is_some_and(|snapshot| {
+                    self.projectiles
+                        .restore_impact(snapshot, impact.projectile_id)
+                }) {
+                    self.projectile_heights.insert(impact.projectile_id, height);
+                    rejected_impacts.push(impact.projectile_id);
+                }
                 continue;
             }
             match impact.target {
@@ -1189,6 +1254,9 @@ impl Session {
                 _ => {}
             }
         }
+        events
+            .projectile_impacts
+            .retain(|impact| !rejected_impacts.contains(&impact.projectile_id));
         if let Some(mission) = &mut self.mission {
             for attempt in attempts {
                 match attempt.outcome {
@@ -3146,5 +3214,125 @@ mod tests {
         );
         assert_eq!(events.explosions[2], explosion);
         assert_eq!(events.explosions.len(), events.explosion_origins.len());
+    }
+    #[test]
+    fn grenade_retries_staged_contact_and_reports_only_applied_blast_damage() {
+        use crate::objects::{ObjectDefinition, ObjectInstance, ObjectKind};
+        use crate::process_runtime::{ProcessCapabilities, ProcessObject};
+        let text = "#proc1\n#action\nchange 2 0 165\n#end\n#links\nshoot 1 0 1\n#end\n";
+        let script = Script::parse(text);
+        let mut session = mission_session(text);
+        let def = |name: &str, health, blow_up| ObjectDefinition {
+            collision_radius: 32,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up,
+            break_limit: health,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: name.into(),
+            animation_name: None,
+        };
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![
+                def("a.3o", 1000, 1),
+                def("b.3o", 1000, 1),
+                def("dummy.3o", 0, 0),
+            ],
+        };
+        let object = |x: usize, definition_index| ObjectInstance {
+            kind: ObjectKind::LevelObject,
+            definition_index,
+            grid_cell: [x, 0],
+            position: [x as f32 + 0.5, 0.5],
+            angle_radians: 0.0,
+            flags: 0,
+            difficulty_flags: 2,
+            extra: 0,
+            size: 0,
+        };
+        let instances = [object(1, 0), object(2, 1)];
+        let mut cells = [0; 4096];
+        cells[64] = 163;
+        cells[128] = 164;
+        let poses: Vec<_> = instances
+            .iter()
+            .map(|o| ProcessObject {
+                cell: [o.grid_cell[0] as u8, 0],
+                position: o.position,
+                angle_radians: 0.0,
+                elevation_raw: 0.0,
+                blocking_radius: 0.125,
+            })
+            .collect();
+        session.processes = ProcessRuntime::with_staged_actions(
+            &script,
+            &session.world,
+            ProcessCapabilities::default(),
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &defs,
+            &script,
+            Difficulty::Normal,
+        ));
+        session.set_scripted_objects(ScriptedObjects::new(
+            ObjectStates::new(&instances, &defs).unwrap(),
+            defs,
+            PresentationManifest::default(),
+            &script,
+            false,
+        ));
+        session.rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: "grenade.3o".into(),
+            power: 100,
+            raw_fields: vec![2, 0, 424, 42, 100, 0, 0, 1, 0, 0, 0, 18],
+        }]);
+        session.game.inventory.weapons[5] = true;
+        session.game.inventory.ammo[5] = 1;
+        session.set_explosions_enabled(true);
+        session.step(SessionInput {
+            fire: true,
+            select_weapon: Some(5),
+            ..Default::default()
+        });
+        for _ in 0..15 {
+            let events = session.step(SessionInput::default());
+            assert!(events.projectile_impacts.is_empty());
+            assert!(events.explosions.is_empty());
+        }
+        assert_eq!(
+            session.projectiles.active().len(),
+            1,
+            "failed staged contact must retry"
+        );
+        assert_eq!(session.game.inventory.health, 100);
+        assert_eq!(session.processes.cell_type([2, 0]), Some(164));
+        session
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([2, 0], 165);
+        let events = session.step(SessionInput::default());
+        assert_eq!(events.projectile_impacts.len(), 1);
+        assert_eq!(events.explosions.len(), 1);
+        assert_eq!(session.processes.cell_type([2, 0]), Some(165));
+        assert!(events
+            .explosion_damage
+            .iter()
+            .any(|d| d.target == TargetId::Object { cell: [1, 0] }));
+        assert!(!events
+            .explosion_damage
+            .iter()
+            .any(|d| d.target == TargetId::Object { cell: [2, 0] }));
+        assert!(!events.object_hits.iter().any(|(cell, _)| *cell == [2, 0]));
+        assert!(session.projectiles.active().is_empty());
     }
 }

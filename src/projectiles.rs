@@ -161,6 +161,27 @@ impl ProjectileSystem {
         &self.projectiles
     }
 
+    /// Restore an impacted projectile from a pre-tick snapshot after the host
+    /// rejects its effect transaction. Existing projectiles remain unchanged.
+    pub fn restore_impact(&mut self, before: &Self, id: u64) -> bool {
+        if self
+            .projectiles
+            .iter()
+            .any(|projectile| projectile.id == id)
+        {
+            return false;
+        }
+        let Some(projectile) = before
+            .projectiles
+            .iter()
+            .find(|projectile| projectile.id == id)
+        else {
+            return false;
+        };
+        self.projectiles.push(projectile.clone());
+        true
+    }
+
     /// Only non-instant, positive-power rocket definitions can be spawned.
     pub fn spawn(
         &mut self,

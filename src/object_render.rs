@@ -153,6 +153,7 @@ struct Instance {
     cell: Option<[usize; 2]>,
     actor_source_index: Option<usize>,
     object_definition_index: Option<usize>,
+    original_definition_index: Option<usize>,
     object_animation_playing: bool,
     object_animation_initially_playing: bool,
     object_animation_seconds: f64,
@@ -233,6 +234,8 @@ pub struct ObjectScene {
     meshes: Vec<Mesh>,
     instances: Vec<Instance>,
     palette: [u32; 256],
+    object_cache: HashMap<(String, Option<String>), Option<usize>>,
+    level_meshes: Vec<Option<(usize, bool, bool)>>,
 }
 
 fn texture_uv(polygon: &crate::model::Polygon, corner: usize, car_uv: bool) -> [f32; 2] {
@@ -635,6 +638,95 @@ fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: 
     }
 }
 
+fn load_object_mesh(
+    resources: &mut ResourceSet,
+    definition: &objects::ObjectDefinition,
+    meshes: &mut Vec<Mesh>,
+    cache: &mut HashMap<(String, Option<String>), Option<usize>>,
+    warnings: &mut BTreeSet<String>,
+) -> Option<usize> {
+    let model_3o = definition.model_3o_path();
+    let gltf_only = model_3o.is_none();
+    let path = model_3o.unwrap_or_else(|| definition.model_gltf_path());
+    let animation_path = if gltf_only {
+        None
+    } else {
+        definition.animation_path()
+    };
+    let cache_key = (path.clone(), animation_path.clone());
+    *cache.entry(cache_key).or_insert_with(|| {
+        if gltf_only {
+            match GltfModel::load(resources, &path) {
+                Ok(gltf) => {
+                    let radius = gltf_radius(&gltf);
+                    let index = meshes.len();
+                    meshes.push(Mesh {
+                        model: Model {
+                            vertices: vec![],
+                            polygons: vec![],
+                            skin_height: 0,
+                            skin_indices: vec![],
+                        },
+                        radius,
+                        car_uv: false,
+                        animations: std::array::from_fn(|_| None),
+                        gltf: Some(gltf),
+                        gltf_actor_clips: [None; 20],
+                    });
+                    return Some(index);
+                }
+                Err(error) => {
+                    warnings.insert(format!("{path}: {error}"));
+                    return None;
+                }
+            }
+        }
+        match resources.read(&path).and_then(|bytes| Model::parse(&bytes)) {
+            Ok(model) => {
+                let mut animations: [Option<Animation>; 20] = std::array::from_fn(|_| None);
+                if let Some(animation_path) = &animation_path {
+                    match resources
+                        .read(animation_path)
+                        .and_then(|bytes| Animation::parse(&bytes))
+                    {
+                        Ok(animation) if animation.matches_model(&model) => {
+                            animations[0] = Some(animation)
+                        }
+                        Ok(_) => {
+                            warnings.insert(format!(
+                                "{animation_path}: vertex count mismatch for {path}"
+                            ));
+                        }
+                        Err(error) => {
+                            warnings.insert(format!("{animation_path}: {error}"));
+                        }
+                    }
+                }
+                let mut radius = vertex_radius(&model.vertices);
+                if let Some(animation) = &animations[0] {
+                    for frame in &animation.frames {
+                        radius = radius.max(vertex_radius(frame));
+                    }
+                }
+                let index = meshes.len();
+                meshes.push(Mesh {
+                    model,
+                    radius,
+                    car_uv: false,
+                    animations,
+                    gltf: None,
+                    gltf_actor_clips: [None; 20],
+                });
+                Some(index)
+            }
+            Err(error) => {
+                warnings.insert(format!("{path}: {error}"));
+                None
+            }
+        }
+    })
+}
+
 impl ObjectScene {
     /// Load supported original models once, retaining only unique diagnostics.
     /// glTF-only and missing/unreadable objects are skipped for now.
@@ -648,6 +740,7 @@ impl ObjectScene {
         let mut instances = Vec::new();
         let mut cache: HashMap<(String, Option<String>), Option<usize>> = HashMap::new();
         let mut warnings = BTreeSet::new();
+        let mut level_meshes = vec![None; definitions.level_objects.len()];
         for instance in objects::instances(map) {
             let Some(definition) = definitions.definition(&instance) else {
                 warnings.insert(format!(
@@ -656,92 +749,28 @@ impl ObjectScene {
                 ));
                 continue;
             };
-            let model_3o = definition.model_3o_path();
-            let gltf_only = model_3o.is_none();
-            let path = model_3o.unwrap_or_else(|| definition.model_gltf_path());
-            let animation_path = if gltf_only {
-                None
-            } else {
-                definition.animation_path()
-            };
-            let cache_key = (path.clone(), animation_path.clone());
-            let mesh_index = *cache.entry(cache_key).or_insert_with(|| {
-                if gltf_only {
-                    match GltfModel::load(resources, &path) {
-                        Ok(gltf) => {
-                            let radius = gltf_radius(&gltf);
-                            let index = meshes.len();
-                            meshes.push(Mesh {
-                                model: Model {
-                                    vertices: vec![],
-                                    polygons: vec![],
-                                    skin_height: 0,
-                                    skin_indices: vec![],
-                                },
-                                radius,
-                                car_uv: false,
-                                animations: std::array::from_fn(|_| None),
-                                gltf: Some(gltf),
-                                gltf_actor_clips: [None; 20],
-                            });
-                            return Some(index);
-                        }
-                        Err(error) => {
-                            warnings.insert(format!("{path}: {error}"));
-                            return None;
-                        }
-                    }
-                }
-                match resources.read(&path).and_then(|bytes| Model::parse(&bytes)) {
-                    Ok(model) => {
-                        let mut animations: [Option<Animation>; 20] = std::array::from_fn(|_| None);
-                        if let Some(animation_path) = &animation_path {
-                            match resources
-                                .read(animation_path)
-                                .and_then(|bytes| Animation::parse(&bytes))
-                            {
-                                Ok(animation) if animation.matches_model(&model) => {
-                                    animations[0] = Some(animation)
-                                }
-                                Ok(_) => {
-                                    warnings.insert(format!(
-                                        "{animation_path}: vertex count mismatch for {path}"
-                                    ));
-                                }
-                                Err(error) => {
-                                    warnings.insert(format!("{animation_path}: {error}"));
-                                }
-                            }
-                        }
-                        let mut radius = vertex_radius(&model.vertices);
-                        if let Some(animation) = &animations[0] {
-                            for frame in &animation.frames {
-                                radius = radius.max(vertex_radius(frame));
-                            }
-                        }
-                        let index = meshes.len();
-                        meshes.push(Mesh {
-                            model,
-                            radius,
-                            car_uv: false,
-                            animations,
-                            gltf: None,
-                            gltf_actor_clips: [None; 20],
-                        });
-                        Some(index)
-                    }
-                    Err(error) => {
-                        warnings.insert(format!("{path}: {error}"));
-                        None
-                    }
-                }
-            });
+            let mesh_index = load_object_mesh(
+                resources,
+                definition,
+                &mut meshes,
+                &mut cache,
+                &mut warnings,
+            );
             if let Some(mesh) = mesh_index {
                 let initially_playing = meshes[mesh]
                     .gltf
                     .as_ref()
                     .is_some_and(|gltf| gltf.frame_count > 1)
                     && definition.action_code != 255;
+                if instance.kind == objects::ObjectKind::LevelObject {
+                    level_meshes[instance.definition_index] = Some((
+                        mesh,
+                        initially_playing,
+                        definition.animation_path().is_none()
+                            || meshes[mesh].gltf.is_some()
+                            || meshes[mesh].animations[0].is_some(),
+                    ));
+                }
                 instances.push(Instance {
                     mesh,
                     position: instance.position,
@@ -750,6 +779,12 @@ impl ObjectScene {
                     cell: Some(instance.grid_cell),
                     actor_source_index: None,
                     object_definition_index: if instance.kind == objects::ObjectKind::LevelObject {
+                        Some(instance.definition_index)
+                    } else {
+                        None
+                    },
+                    original_definition_index: if instance.kind == objects::ObjectKind::LevelObject
+                    {
                         Some(instance.definition_index)
                     } else {
                         None
@@ -774,6 +809,8 @@ impl ObjectScene {
             meshes,
             instances,
             palette,
+            object_cache: cache,
+            level_meshes,
         }
     }
 
@@ -878,6 +915,7 @@ impl ObjectScene {
                     cell: None,
                     actor_source_index: Some(actor.source_index),
                     object_definition_index: None,
+                    original_definition_index: None,
                     object_animation_playing: false,
                     object_animation_initially_playing: false,
                     object_animation_seconds: 0.0,
@@ -923,6 +961,111 @@ impl ObjectScene {
             true
         } else {
             false
+        }
+    }
+
+    /// Load a replacement definition ahead of a scripted transition. Only
+    /// raw level-object types 163..=226 are supported. Missing assets return
+    /// false and leave transitions disabled for this type.
+    #[allow(dead_code)]
+    pub fn preload_level_object(
+        &mut self,
+        resources: &mut ResourceSet,
+        definitions: &ObjectDefinitions,
+        raw_type: u8,
+    ) -> bool {
+        let Some(index) = raw_type
+            .checked_sub(163)
+            .map(usize::from)
+            .filter(|&i| i < 64)
+        else {
+            return false;
+        };
+        let Some(definition) = definitions.level_objects.get(index) else {
+            return false;
+        };
+        if self.level_meshes.len() < definitions.level_objects.len() {
+            self.level_meshes
+                .resize(definitions.level_objects.len(), None);
+        }
+        if let Some((_, _, complete)) = self.level_meshes[index] {
+            return complete;
+        }
+        let mut warnings = BTreeSet::new();
+        let mesh = load_object_mesh(
+            resources,
+            definition,
+            &mut self.meshes,
+            &mut self.object_cache,
+            &mut warnings,
+        );
+        for warning in warnings {
+            eprintln!("object preview: {warning}");
+        }
+        let Some(mesh) = mesh else {
+            return false;
+        };
+        if definition.model_3o_path().is_some()
+            && definition.animation_path().is_some()
+            && self.meshes[mesh].animations[0].is_none()
+        {
+            return false;
+        }
+        let initially_playing = self.meshes[mesh]
+            .gltf
+            .as_ref()
+            .is_some_and(|model| model.frame_count > 1)
+            && definition.action_code != 255;
+        self.level_meshes[index] = Some((mesh, initially_playing, true));
+        true
+    }
+
+    /// Swap a placed level object to a preloaded raw type. A missing cell,
+    /// item cell, invalid type or missing model leaves the scene unchanged.
+    #[allow(dead_code)]
+    pub fn replace_level_object(&mut self, cell: [usize; 2], raw_type: u8) -> bool {
+        let Some(index) = raw_type
+            .checked_sub(163)
+            .map(usize::from)
+            .filter(|&i| i < 64)
+        else {
+            return false;
+        };
+        let Some(Some((mesh, initially_playing, true))) = self.level_meshes.get(index).copied()
+        else {
+            return false;
+        };
+        let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.cell == Some(cell) && item.original_definition_index.is_some())
+        else {
+            return false;
+        };
+        instance.mesh = mesh;
+        instance.object_definition_index = Some(index);
+        instance.object_animation_playing = initially_playing;
+        instance.object_animation_initially_playing = initially_playing;
+        instance.object_animation_seconds = 0.0;
+        true
+    }
+
+    /// Restore authored level-object meshes and their initial animations. Pose
+    /// and visibility are governed separately by the owning simulation.
+    #[allow(dead_code)]
+    pub fn reset_level_objects(&mut self) {
+        for instance in &mut self.instances {
+            if let Some(index) = instance.original_definition_index {
+                if let Some(Some((mesh, initially_playing, _))) =
+                    self.level_meshes.get(index).copied()
+                {
+                    instance.mesh = mesh;
+                    instance.object_definition_index = Some(index);
+                    instance.object_animation_playing = initially_playing;
+                    instance.object_animation_initially_playing = initially_playing;
+                    instance.object_animation_seconds = 0.0;
+                }
+            }
         }
     }
 
@@ -1191,6 +1334,7 @@ mod tests {
             cell: Some([1, 1]),
             actor_source_index: None,
             object_definition_index: Some(0),
+            original_definition_index: None,
             object_animation_playing: false,
             object_animation_initially_playing: false,
             object_animation_seconds: 0.0,
@@ -1202,6 +1346,8 @@ mod tests {
             meshes: vec![mesh],
             instances: vec![instance],
             palette: [0; 256],
+            object_cache: HashMap::new(),
+            level_meshes: Vec::new(),
         }
     }
     #[test]
@@ -1248,6 +1394,8 @@ mod tests {
             meshes: vec![],
             instances: vec![],
             palette: [0; 256],
+            object_cache: HashMap::new(),
+            level_meshes: Vec::new(),
         };
         scene.add_actors(&mut resources, &actors, &defs);
         assert_eq!(scene.meshes.len(), 1); // shared mesh
@@ -1400,9 +1548,20 @@ mod tests {
             model_name: "a.3o".into(),
             animation_name,
         };
+        std::fs::copy(dir.join("model/a.3o"), dir.join("model/b.3o")).unwrap();
+        let mut b = def(None);
+        b.model_name = "b.3o".into();
+        let mut missing = def(None);
+        missing.model_name = "missing.3o".into();
         let definitions = crate::objects::ObjectDefinitions {
             items: vec![],
-            level_objects: vec![def(Some("%a.ani".into())), def(None)],
+            level_objects: vec![
+                def(Some("%a.ani".into())),
+                def(None),
+                b,
+                missing,
+                def(Some("missing.ani".into())),
+            ],
         };
         let palette = Palette::parse(&[0; 768]).unwrap();
         let mut resources = ResourceSet::open(&dir).unwrap();
@@ -1432,6 +1591,26 @@ mod tests {
             .instances
             .iter()
             .all(|i| !i.object_animation_playing && i.object_animation_seconds == 0.0));
+        let original_mesh = scene.instances[0].mesh;
+        let original_position = scene.instances[0].position;
+        assert!(!scene.replace_level_object([1, 1], 165)); // not preloaded
+        assert!(scene.preload_level_object(&mut resources, &definitions, 165));
+        assert_eq!(scene.meshes.len(), 3);
+        assert!(!scene.preload_level_object(&mut resources, &definitions, 166));
+        assert!(!scene.preload_level_object(&mut resources, &definitions, 167)); // missing ANI
+        assert!(!scene.preload_level_object(&mut resources, &definitions, 162));
+        assert!(!scene.replace_level_object([9, 9], 165));
+        assert!(scene.replace_level_object([1, 1], 165));
+        assert_eq!(scene.instances[0].object_definition_index, Some(2));
+        assert_ne!(scene.instances[0].mesh, original_mesh);
+        assert_eq!(scene.instances[0].position, original_position);
+        assert_eq!(scene.play_object_animation(33), 1);
+        assert!(!scene.replace_level_object([1, 1], 166));
+        assert_eq!(scene.instances[0].object_definition_index, Some(2));
+        scene.reset_level_objects();
+        assert_eq!(scene.instances[0].mesh, original_mesh);
+        assert_eq!(scene.instances[0].object_definition_index, Some(0));
+        assert_eq!(scene.instances[0].object_animation_seconds, 0.0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1478,6 +1657,7 @@ mod tests {
             cell: None,
             actor_source_index: Some(id),
             object_definition_index: None,
+            original_definition_index: None,
             object_animation_playing: false,
             object_animation_initially_playing: false,
             object_animation_seconds: 0.0,
@@ -1489,6 +1669,8 @@ mod tests {
             meshes: vec![],
             instances: vec![instance(7), instance(8)],
             palette: [0; 256],
+            object_cache: HashMap::new(),
+            level_meshes: Vec::new(),
         };
         assert!(scene.set_actor_animation(7, ActorAnimationMode::Idle, 0.25));
         assert_eq!(scene.instances[0].animation_seconds, 0.25);
@@ -1515,6 +1697,7 @@ mod tests {
                     cell: Some([1, 2]),
                     actor_source_index: None,
                     object_definition_index: None,
+                    original_definition_index: None,
                     object_animation_playing: false,
                     object_animation_initially_playing: false,
                     object_animation_seconds: 0.0,
@@ -1530,6 +1713,7 @@ mod tests {
                     cell: Some([3, 4]),
                     actor_source_index: None,
                     object_definition_index: None,
+                    original_definition_index: None,
                     object_animation_playing: false,
                     object_animation_initially_playing: false,
                     object_animation_seconds: 0.0,
@@ -1539,6 +1723,8 @@ mod tests {
                 },
             ],
             palette: [0; 256],
+            object_cache: HashMap::new(),
+            level_meshes: Vec::new(),
         };
         assert!(scene.set_visible([1, 2], false));
         assert!(!scene.instances[0].visible);
@@ -1608,6 +1794,8 @@ mod tests {
             meshes: vec![],
             instances: vec![],
             palette: [0; 256],
+            object_cache: HashMap::new(),
+            level_meshes: Vec::new(),
         };
         scene.add_actors(&mut resources, &actors, &definitions);
         assert_eq!(scene.meshes.len(), 1);

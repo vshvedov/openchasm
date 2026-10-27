@@ -144,8 +144,16 @@ fn object_vertices(mesh: &Mesh, playing: bool, seconds: f64) -> &[ModelVertex] {
     let Some(animation) = mesh.animations[0].as_ref().filter(|a| !a.frames.is_empty()) else {
         return &mesh.model.vertices;
     };
+    let count = animation.frames.len();
+    // The installed rain clip ends with an exact duplicate of its first frame.
+    // Avoid holding that frame twice at the loop boundary.
+    let loop_frames = if count > 1 && animation.frames.first() == animation.frames.last() {
+        count - 1
+    } else {
+        count
+    };
     let index = if playing {
-        (seconds.max(0.0) * ACTOR_ANIMATION_FPS).rem_euclid(animation.frames.len() as f64) as usize
+        (seconds.max(0.0) * GLTF_OBJECT_FPS).rem_euclid(loop_frames as f64) as usize
     } else {
         0
     };
@@ -201,6 +209,18 @@ pub struct ObjectScene {
     object_cache: HashMap<(String, Option<String>), Option<usize>>,
     level_meshes: Vec<Option<(usize, bool, bool)>>,
     mine_mesh: Option<usize>,
+    stopped_initial_types: BTreeSet<usize>,
+}
+
+fn object_initially_playing(mesh: &Mesh, definition: &objects::ObjectDefinition) -> bool {
+    definition.action_code != 255
+        && (mesh.animations[0]
+            .as_ref()
+            .is_some_and(|animation| animation.frames.len() > 1)
+            || mesh
+                .gltf
+                .as_ref()
+                .is_some_and(|model| model.frame_count > 1))
 }
 
 fn texture_uv(polygon: &crate::model::Polygon, corner: usize, car_uv: bool) -> [f32; 2] {
@@ -750,11 +770,7 @@ impl ObjectScene {
                 &mut warnings,
             );
             if let Some(mesh) = mesh_index {
-                let initially_playing = meshes[mesh]
-                    .gltf
-                    .as_ref()
-                    .is_some_and(|gltf| gltf.frame_count > 1)
-                    && definition.action_code != 255;
+                let initially_playing = object_initially_playing(&meshes[mesh], definition);
                 if instance.kind == objects::ObjectKind::LevelObject {
                     level_meshes[instance.definition_index] = Some((
                         mesh,
@@ -806,6 +822,7 @@ impl ObjectScene {
             object_cache: cache,
             level_meshes,
             mine_mesh: None,
+            stopped_initial_types: BTreeSet::new(),
         }
     }
 
@@ -1007,11 +1024,7 @@ impl ObjectScene {
         {
             return false;
         }
-        let initially_playing = self.meshes[mesh]
-            .gltf
-            .as_ref()
-            .is_some_and(|model| model.frame_count > 1)
-            && definition.action_code != 255;
+        let initially_playing = object_initially_playing(&self.meshes[mesh], definition);
         self.level_meshes[index] = Some((mesh, initially_playing, true));
         true
     }
@@ -1057,10 +1070,48 @@ impl ObjectScene {
                 {
                     instance.mesh = mesh;
                     instance.object_definition_index = Some(index);
+                    let initially_playing =
+                        initially_playing && !self.stopped_initial_types.contains(&index);
                     instance.object_animation_playing = initially_playing;
                     instance.object_animation_initially_playing = initially_playing;
                     instance.object_animation_seconds = 0.0;
                 }
+            }
+        }
+    }
+
+    /// Apply top-level `#stopani` directives from the authored process file.
+    /// IDs >= 33 select level-object definitions; invalid entries are ignored.
+    /// Call once during level setup, before the initial scene snapshot.
+    #[allow(dead_code)] // The application supplies the level's process bytes.
+    pub fn configure_stopped_animations(&mut self, process: &[u8]) {
+        let text = String::from_utf8_lossy(process);
+        self.stopped_initial_types.clear();
+        for raw in text.lines() {
+            let mut words = raw.split(';').next().unwrap_or("").split_whitespace();
+            if !words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("#stopani"))
+            {
+                continue;
+            }
+            if let Some(index) = words
+                .next()
+                .and_then(|word| word.parse::<usize>().ok())
+                .and_then(|id| id.checked_sub(33))
+                .filter(|&index| index < 64)
+            {
+                self.stopped_initial_types.insert(index);
+            }
+        }
+        for instance in &mut self.instances {
+            if instance
+                .original_definition_index
+                .is_some_and(|index| self.stopped_initial_types.contains(&index))
+            {
+                instance.object_animation_playing = false;
+                instance.object_animation_initially_playing = false;
+                instance.object_animation_seconds = 0.0;
             }
         }
     }
@@ -1560,6 +1611,7 @@ pub(crate) mod tests {
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
             mine_mesh: None,
+            stopped_initial_types: BTreeSet::new(),
         }
     }
     #[test]
@@ -1609,6 +1661,7 @@ pub(crate) mod tests {
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
             mine_mesh: None,
+            stopped_initial_types: BTreeSet::new(),
         };
         scene.add_actors(&mut resources, &actors, &defs);
         assert_eq!(scene.meshes.len(), 1); // shared mesh
@@ -1942,6 +1995,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn installed_level01_rain_animates_and_stopani_objects_start_stopped() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let map = crate::map::Map::parse(&resources.read("map/map.01").unwrap()).unwrap();
+        let definitions = ObjectDefinitions::parse(
+            &resources.read("chasm.inf").unwrap(),
+            &resources.read("map/resource.01").unwrap(),
+        )
+        .unwrap();
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let script = resources.read("map/process.01").unwrap();
+        let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+        scene.configure_stopped_animations(&script);
+        let rain = scene
+            .instances
+            .iter()
+            .find(|instance| instance.object_definition_index == Some(1))
+            .expect("level 01 rain placement");
+        assert!(rain.object_animation_playing);
+        let mesh = &scene.meshes[rain.mesh];
+        let frames = &mesh.animations[0].as_ref().unwrap().frames;
+        assert!(frames.len() > 2 && frames.first() == frames.last());
+        assert_ne!(
+            object_vertices(mesh, true, 0.0),
+            object_vertices(mesh, true, 0.051)
+        );
+        assert_eq!(
+            object_vertices(mesh, true, (frames.len() - 1) as f64 * 0.05),
+            &frames[0]
+        );
+        let stopped: Vec<_> = scene
+            .instances
+            .iter()
+            .filter(|instance| instance.original_definition_index == Some(25))
+            .collect();
+        assert!(!stopped.is_empty());
+        assert!(stopped
+            .iter()
+            .all(|instance| !instance.object_animation_playing));
+        let stopped_count = stopped.len();
+        assert_eq!(scene.play_object_animation(58), stopped_count);
+        scene.reset_level_objects();
+        assert!(scene
+            .instances
+            .iter()
+            .filter(|instance| instance.original_definition_index == Some(25))
+            .all(|instance| !instance.object_animation_playing));
+    }
+
+    #[test]
     fn playani_targets_all_level_objects_and_preserves_instance_state() {
         use std::time::{SystemTime, UNIX_EPOCH};
         let unique = SystemTime::now()
@@ -2001,10 +2111,17 @@ pub(crate) mod tests {
         let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
         assert_eq!(scene.instances.len(), 3);
         assert_eq!(scene.meshes.len(), 2); // same model, different animation association
+        assert!(scene.instances[..2]
+            .iter()
+            .all(|instance| instance.object_animation_playing));
+        scene.configure_stopped_animations(b"#stopani 33\n");
+        assert!(scene.instances[..2]
+            .iter()
+            .all(|instance| !instance.object_animation_playing));
         assert_eq!(scene.play_object_animation(1), 0); // unknown legacy special ID
         assert_eq!(scene.play_object_animation(34), 0); // no ANI
         assert_eq!(scene.play_object_animation(33), 2);
-        assert!(scene.tick_object_animations(1.0 / 18.0 + 0.001));
+        assert!(scene.tick_object_animations(0.051));
         for instance in &scene.instances[..2] {
             assert!(instance.object_animation_playing);
             assert_eq!(
@@ -2176,6 +2293,7 @@ pub(crate) mod tests {
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
             mine_mesh: None,
+            stopped_initial_types: BTreeSet::new(),
         };
         assert!(scene.set_actor_animation(7, ActorAnimationMode::Idle, 0.25));
         assert_eq!(scene.instances[0].animation_seconds, 0.25);
@@ -2233,6 +2351,7 @@ pub(crate) mod tests {
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
             mine_mesh: None,
+            stopped_initial_types: BTreeSet::new(),
         };
         assert!(scene.set_visible([1, 2], false));
         assert!(!scene.instances[0].visible);
@@ -2305,6 +2424,7 @@ pub(crate) mod tests {
             object_cache: HashMap::new(),
             level_meshes: Vec::new(),
             mine_mesh: None,
+            stopped_initial_types: BTreeSet::new(),
         };
         scene.add_actors(&mut resources, &actors, &definitions);
         assert_eq!(scene.meshes.len(), 1);

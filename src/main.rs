@@ -496,6 +496,7 @@ fn play(
         let definitions = objects::ObjectDefinitions::parse(&info, &resource)?;
         let mut object_scene =
             object_render::ObjectScene::load(resources, &map, &definitions, &palette);
+        object_scene.configure_stopped_animations(&script_data);
         let mine_available = object_scene.preload_mine(resources, &definitions);
         if !mine_available {
             eprintln!("mine placement disabled: mine model unavailable");

@@ -427,6 +427,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         shot_blocking,
                         difficulty: openchasm::pickups::Difficulty::Normal,
                     });
+                session.set_explosions_enabled(true);
                 session.set_objects(openchasm::object_combat::ObjectCombat::new(
                     &instances,
                     &definitions,

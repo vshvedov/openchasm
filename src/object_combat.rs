@@ -1,10 +1,11 @@
 //! Provisional horizontal shot selection and damage for map objects.
 //!
-//! Only destructible objects or objects explicitly referenced by `shoot` /
-//! `destroy` links are indexed. Hit shapes are approximate cylinders, not
+//! Destructible objects and objects explicitly referenced by `shoot` /
+//! `destroy` links are shootable; other placements are retained for changes. Hit shapes are approximate cylinders, not
 //! original 3O geometry. Callers compare the reported distance against walls
 //! and actors before applying damage or dispatching process-link events.
 use crate::map::UNITS_PER_TILE;
+use crate::object_states::{ObjectTransition, TransitionKind};
 use crate::objects::{ObjectDefinitions, ObjectInstance, ObjectKind};
 use crate::pickups::Difficulty;
 use crate::process::Script;
@@ -13,9 +14,25 @@ use std::collections::BTreeSet;
 const DEFAULT_RADIUS: f32 = 0.125;
 const MAX_RADIUS: f32 = 2.0;
 
+fn target_radius(def: &crate::objects::ObjectDefinition) -> f32 {
+    if def.collision_radius > 0 {
+        (def.collision_radius as f32 / UNITS_PER_TILE).clamp(DEFAULT_RADIUS, MAX_RADIUS)
+    } else {
+        DEFAULT_RADIUS
+    }
+}
+
+fn is_shootable(def: &crate::objects::ObjectDefinition, linked: bool) -> bool {
+    // The authored dummy model represents an empty replacement cell.
+    !def.model_name.eq_ignore_ascii_case("dummy.3o") && (def.break_limit > 0 || linked)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Target {
     cell: [usize; 2],
+    raw_type: u8,
+    linked: bool,
+    shootable: bool,
     position: [f32; 2],
     radius: f32,
     health: Option<i32>,
@@ -50,7 +67,8 @@ pub struct ObjectCombat {
 }
 
 impl ObjectCombat {
-    /// Index level objects with positive break limit or a shoot/destroy link.
+    /// Retain level objects; only positive break limit or shoot/destroy links
+    /// make a non-dummy object shootable.
     /// Map item pickups and unrelated decorative objects are not yet shot
     /// blockers. Difficulty filtering follows the single-player pickup system.
     pub fn new(
@@ -78,16 +96,21 @@ impl ObjectCombat {
             let Some(def) = definitions.definition(instance) else {
                 continue;
             };
-            if def.break_limit <= 0 && !linked.contains(&instance.grid_cell) {
+            let Some(raw_type) = u8::try_from(instance.definition_index)
+                .ok()
+                .and_then(|index| index.checked_add(163))
+                .filter(|raw| *raw <= 226)
+            else {
                 continue;
-            }
-            let radius = if def.collision_radius > 0 {
-                (def.collision_radius as f32 / UNITS_PER_TILE).clamp(DEFAULT_RADIUS, MAX_RADIUS)
-            } else {
-                DEFAULT_RADIUS
             };
+            let linked = linked.contains(&instance.grid_cell);
+            let shootable = is_shootable(def, linked);
+            let radius = target_radius(def);
             targets.push(Target {
                 cell: instance.grid_cell,
+                raw_type,
+                linked,
+                shootable,
                 position: instance.position,
                 radius,
                 health: (def.break_limit > 0).then_some(def.break_limit),
@@ -98,6 +121,66 @@ impl ObjectCombat {
             });
         }
         Self { targets }
+    }
+
+    /// Synchronize a committed script transition. This validates the prior and
+    /// destination types and the authored destination health before mutation;
+    /// invalid or stale transitions return false and leave combat unchanged.
+    /// Position, difficulty, enabled state and coordinate-based links survive.
+    pub fn apply_transition(
+        &mut self,
+        transition: &ObjectTransition,
+        definitions: &ObjectDefinitions,
+    ) -> bool {
+        let Some(index) = transition
+            .new_type
+            .checked_sub(163)
+            .map(usize::from)
+            .filter(|&index| index < 64)
+        else {
+            return false;
+        };
+        let Some(def) = definitions.level_objects.get(index) else {
+            return false;
+        };
+        if transition.new_health != def.break_limit.max(0)
+            || transition.previous_health < 0
+            || !transition.reset_animation
+            || (transition.kind == TransitionKind::Explode
+                && transition.previous_type.checked_add(1) != Some(transition.new_type))
+        {
+            return false;
+        }
+        let Some(target) = self.targets.iter_mut().find(|target| {
+            target.cell == transition.cell && target.raw_type == transition.previous_type
+        }) else {
+            return false;
+        };
+        target.raw_type = transition.new_type;
+        target.shootable = is_shootable(def, target.linked);
+        target.radius = target_radius(def);
+        target.health = (def.break_limit > 0).then_some(transition.new_health);
+        target.blow_up = def.blow_up;
+        target.destroyed = false;
+        true
+    }
+
+    /// Apply a complete ordered batch atomically. Clone this combat state and
+    /// preflight before committing the corresponding authoritative state.
+    pub fn apply_transitions(
+        &mut self,
+        transitions: &[ObjectTransition],
+        definitions: &ObjectDefinitions,
+    ) -> bool {
+        let mut staged = self.clone();
+        if !transitions
+            .iter()
+            .all(|transition| staged.apply_transition(transition, definitions))
+        {
+            return false;
+        }
+        *self = staged;
+        true
     }
 
     /// Find the nearest eligible object hit without applying damage. Direction
@@ -125,7 +208,8 @@ impl ObjectCombat {
         let ray = [direction[0] / magnitude, direction[1] / magnitude];
         let mut nearest = None;
         for target in &self.targets {
-            if !target.difficulty_enabled
+            if !target.shootable
+                || !target.difficulty_enabled
                 || !target.enabled
                 || target.destroyed
                 || !target.position.iter().all(|v| v.is_finite())
@@ -172,7 +256,11 @@ impl ObjectCombat {
             return None;
         }
         let target = self.targets.iter_mut().find(|target| {
-            target.cell == cell && target.difficulty_enabled && target.enabled && !target.destroyed
+            target.cell == cell
+                && target.shootable
+                && target.difficulty_enabled
+                && target.enabled
+                && !target.destroyed
         })?;
         if let Some(health) = &mut target.health {
             *health = health.saturating_sub(damage).max(0);
@@ -194,23 +282,25 @@ impl ObjectCombat {
     pub fn is_active(&self, cell: [usize; 2]) -> Option<bool> {
         self.targets
             .iter()
-            .find(|target| target.cell == cell)
+            .find(|target| target.cell == cell && target.shootable)
             .map(|target| target.difficulty_enabled && target.enabled && !target.destroyed)
     }
 
     /// Visibility of each tracked object, for presentation synchronization.
     pub fn visibility(&self) -> impl Iterator<Item = ([usize; 2], bool)> + '_ {
-        self.targets.iter().map(|target| {
-            (
-                target.cell,
-                target.difficulty_enabled && target.enabled && !target.destroyed,
-            )
-        })
+        self.targets
+            .iter()
+            .filter(|target| target.shootable)
+            .map(|target| {
+                (
+                    target.cell,
+                    target.difficulty_enabled && target.enabled && !target.destroyed,
+                )
+            })
     }
 
     /// Toggle visibility/collision for script-controlled objects. This does not
-    /// resurrect a destroyed object; reconstruction of replacement models is a
-    /// future process-system responsibility.
+    /// resurrect a destroyed object; use `apply_transition` for replacements.
     pub fn set_enabled(&mut self, cell: [usize; 2], enabled: bool) -> bool {
         if let Some(target) = self.targets.iter_mut().find(|target| target.cell == cell) {
             target.enabled = enabled;
@@ -369,5 +459,96 @@ mod tests {
             Difficulty::Normal,
         );
         assert!(combat.raycast([0.0, 0.0], [1.0, 0.0], 2.0, 0.0).is_none());
+    }
+    #[test]
+    fn transitions_update_targets_and_preserve_motion_difficulty_and_links() {
+        use crate::object_states::{ObjectAction, ObjectStates};
+        let mut dummy = definition(64, 0);
+        dummy.model_name = "dummy.3o".into();
+        let mut tough = definition(64, 12);
+        tough.blow_up = 7;
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition(0, 0), tough, dummy],
+        };
+        let objects = [
+            instance(0, [1, 1], [1.0, 0.0], 7),
+            instance(0, [2, 2], [2.0, 0.0], 1),
+        ];
+        let script = Script::parse("#links\nshoot 1 1 9\n#end\n");
+        let mut states = ObjectStates::new(&objects, &defs).unwrap();
+        let mut combat = ObjectCombat::new(&objects, &defs, &script, Difficulty::Normal);
+        assert!(combat.set_position([1, 1], [3.0, 0.0]));
+        let transitions = states
+            .apply_batch(&[
+                ObjectAction::Change {
+                    cell: [1, 1],
+                    raw_type: 164,
+                },
+                ObjectAction::Change {
+                    cell: [2, 2],
+                    raw_type: 164,
+                },
+            ])
+            .unwrap();
+        assert!(combat.apply_transitions(&transitions, &defs));
+        assert_eq!(
+            combat
+                .raycast([0.0, 0.0], [1.0, 0.0], 5.0, 0.0)
+                .unwrap()
+                .cell,
+            [1, 1]
+        );
+        assert_eq!(combat.is_active([2, 2]), Some(false));
+        let hit = combat.apply_hit([1, 1], 12).unwrap();
+        assert!(hit.destroyed);
+        assert_eq!(hit.blow_up, 7);
+        let transitions = states
+            .apply_batch(&[ObjectAction::Explode { cell: [1, 1] }])
+            .unwrap();
+        assert!(combat.apply_transitions(&transitions, &defs));
+        assert!(combat.raycast([0.0, 0.0], [1.0, 0.0], 5.0, 0.0).is_none());
+        // Returning to an immortal linked object restores its shoot link.
+        let transitions = states
+            .apply_batch(&[ObjectAction::Change {
+                cell: [1, 1],
+                raw_type: 163,
+            }])
+            .unwrap();
+        assert!(combat.apply_transitions(&transitions, &defs));
+        assert_eq!(combat.apply_hit([1, 1], 1).unwrap().remaining_health, None);
+    }
+
+    #[test]
+    fn transitions_can_make_a_decoration_shootable_and_reject_invalid_batches_atomically() {
+        use crate::object_states::{ObjectAction, ObjectStates};
+        let defs = ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![definition(0, 0), definition(32, 10)],
+        };
+        let objects = [instance(0, [1, 1], [1.0, 0.0], 7)];
+        let mut states = ObjectStates::new(&objects, &defs).unwrap();
+        let mut combat = ObjectCombat::new(&objects, &defs, &Script::default(), Difficulty::Normal);
+        assert_eq!(combat.is_active([1, 1]), None);
+        let transitions = states
+            .apply_batch(&[ObjectAction::Change {
+                cell: [1, 1],
+                raw_type: 164,
+            }])
+            .unwrap();
+        let mut bad = transitions[0].clone();
+        bad.new_type = 255;
+        assert!(!combat.apply_transitions(&[transitions[0].clone(), bad], &defs));
+        assert_eq!(combat.is_active([1, 1]), None);
+        assert!(combat.apply_transitions(&transitions, &defs));
+        assert_eq!(
+            combat.apply_hit([1, 1], 1).unwrap().remaining_health,
+            Some(9)
+        );
+        assert!(!combat.apply_transitions(&transitions, &defs)); // stale
+        assert_eq!(
+            combat.apply_hit([1, 1], 1).unwrap().remaining_health,
+            Some(8)
+        );
     }
 }

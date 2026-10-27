@@ -19,6 +19,8 @@ The original and clone were launched on level 01 at normal difficulty. Local cap
 
 The installed remaster configuration enables tone mapping, shadows and motion blur, with gamma, brightness and saturation at neutral values. Further executable analysis confirms the material sRGB, linear HDR, exposure, ACES and output sRGB chain, including weapon-before/HUD-after post-process ordering. The software renderer now implements that colour chain, with optional bloom before tone mapping; generated lighting and shadows still need calibration. See [original rendering evidence](remaster-rendering.md).
 
+- Actor mesh yaw now includes the verified quarter-turn needed to align authored CAR/glTF forward with authoritative movement. Chase velocity follows the actor heading, and attack windups keep turning toward the player. Installed level-one checks walk into visibility, release movement, then verify continued pursuit and actual melee/projectile player damage. These controlled encounters do not prove all enemies or campaign situations.
+
 ## Remaining material gaps
 
 | Priority | Finding | Evidence and required work |

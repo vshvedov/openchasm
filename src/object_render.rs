@@ -151,6 +151,19 @@ struct Instance {
     visible: bool,
 }
 
+/// Actor assets face local -Y; authoritative map yaw faces [cos(yaw),sin(yaw)].
+/// CAR muzzle geometry and the independent renderer establish the +quarter-turn
+/// conversion. Keep stored instance yaw authoritative, including snapshots.
+fn instance_rotation(instance: &Instance) -> (f32, f32) {
+    let angle = instance.angle
+        + if instance.actor_source_index.is_some() {
+            std::f32::consts::FRAC_PI_2
+        } else {
+            0.0
+        };
+    angle.sin_cos()
+}
+
 /// Choose a pose from the available slot list. Missing slots use the base mesh.
 fn actor_vertices(mesh: &Mesh, mode: ActorAnimationMode, seconds: f64) -> &[ModelVertex] {
     let animation = mode.preferred_slots().iter().find_map(|&slot| {
@@ -758,7 +771,7 @@ fn draw_gltf<C: RenderPixel>(
     } else {
         0
     };
-    let (sin, cos) = instance.angle.sin_cos();
+    let (sin, cos) = instance_rotation(instance);
     let [forward_x, forward_y] = camera.player.forward();
     let [right_x, right_y] = camera.player.right();
     let dx = instance.position[0] - camera.player.position[0];
@@ -1763,7 +1776,7 @@ impl ObjectScene {
                 draw_gltf(&mut raster, mesh, instance, camera);
                 continue;
             }
-            let (sin, cos) = instance.angle.sin_cos();
+            let (sin, cos) = instance_rotation(instance);
             let pose_vertices = if mesh.car_uv {
                 actor_car_instance_vertices(mesh, instance)
             } else {
@@ -2066,6 +2079,77 @@ pub(crate) mod tests {
         assert_eq!(depth_a, depth_b);
         assert_eq!(fragments_a, fragments_b);
         assert!(!fragments_a.is_empty());
+    }
+
+    #[test]
+    fn actor_local_forward_projects_along_authoritative_map_heading() {
+        let mut scene = gltf_scene(255);
+        let instance = &mut scene.instances[0];
+        instance.actor_source_index = Some(7);
+        for angle in [0.0, 0.7, std::f32::consts::FRAC_PI_2, std::f32::consts::PI] {
+            instance.angle = angle;
+            let (sin, cos) = instance_rotation(instance);
+            // A marker one unit in front of an actor asset is local (0,-1,0).
+            let front = [sin, -cos];
+            let camera = CameraView {
+                player: Player {
+                    position: [0.0; 2],
+                    angle,
+                },
+                eye_height: 1.0,
+                pitch: 0.0,
+            };
+            let forward = camera.player.forward();
+            let right = camera.player.right();
+            let depth = front[0] * forward[0] + front[1] * forward[1];
+            let side = front[0] * right[0] + front[1] * right[1];
+            assert!(depth > 0.999 && side.abs() < 1e-6);
+            let projected = project(
+                Vertex {
+                    side,
+                    depth: 3.0 + depth,
+                    up: 0.0,
+                    uv: [0.0; 2],
+                    normal: [0.0; 3],
+                },
+                640,
+                400,
+                200.0,
+            );
+            assert!((projected.x - 320.0).abs() < 1e-4);
+        }
+        instance.actor_source_index = None;
+        instance.angle = 0.0;
+        assert_eq!(instance_rotation(instance), (0.0, 1.0));
+    }
+
+    #[test]
+    fn installed_mongf_muzzle_confirms_actor_negative_y_forward_when_available() {
+        let path = std::path::Path::new("assets/csm.bin");
+        if !path.exists() {
+            return;
+        }
+        let mut resources = ResourceSet::open(path).unwrap();
+        let monster =
+            crate::monster::Monster::parse(&resources.read("monster/mongf.car").unwrap()).unwrap();
+        let animation = monster.animations[5].as_ref().unwrap();
+        let vertices = &animation.frames[animation.frames.len() / 2];
+        let muzzle: std::collections::BTreeSet<_> = monster
+            .model
+            .polygons
+            .iter()
+            .filter(|polygon| polygon.group & 128 != 0)
+            .flat_map(|polygon| polygon.vertices[..polygon.vertex_count()].iter().copied())
+            .collect();
+        assert!(!muzzle.is_empty());
+        let center: [f32; 2] = std::array::from_fn(|axis| {
+            muzzle
+                .iter()
+                .map(|&index| f32::from(vertices[index as usize].position[axis]) * MODEL_SCALE)
+                .sum::<f32>()
+                / muzzle.len() as f32
+        });
+        assert!(center[1] < -0.25 && center[1].abs() > center[0].abs() * 2.0);
     }
 
     #[test]
@@ -3227,7 +3311,9 @@ pub(crate) mod tests {
         let map_actor = |x| crate::map::Monster {
             position: [x, 256],
             id: 101,
-            angle: 0,
+            // This synthetic triangle lies in local YZ. Include the actor
+            // quarter-turn so it faces the +X test camera instead of edge-on.
+            angle: 2,
             flags: 0,
         };
         let actors = ActorState::from_placements(&[map_actor(256), map_actor(512)], &definitions);

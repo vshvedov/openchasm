@@ -716,6 +716,19 @@ impl EnemyAi {
             if sees_player {
                 brain.last_seen = Some(target);
             }
+            // Facing is authoritative in both chase and attack phases. A target
+            // can move during the wind-up; keep turning before the phase's early
+            // return instead of firing from a frozen presentation heading.
+            if let Some(destination) = brain.last_seen {
+                let direction = sub(destination, actor.position);
+                if dot(direction, direction) > 1e-12 {
+                    actor.angle_radians = turn_toward(
+                        actor.angle_radians,
+                        direction[1].atan2(direction[0]),
+                        def.rotation_speed.clamp(0, 20) as f32 * DT,
+                    );
+                }
+            }
             if let Some(mut phase) = brain.attack_phase {
                 phase.elapsed_ticks = phase.elapsed_ticks.saturating_add(1);
                 let frame = u64::from(phase.elapsed_ticks) * 5 / 18;
@@ -768,14 +781,6 @@ impl EnemyAi {
             };
             let to_goal = sub(destination, actor.position);
             let goal_distance = dot(to_goal, to_goal).sqrt();
-            if goal_distance > 1e-6 {
-                let target_angle = to_goal[1].atan2(to_goal[0]);
-                actor.angle_radians = turn_toward(
-                    actor.angle_radians,
-                    target_angle,
-                    def.rotation_speed.clamp(0, 20) as f32 * DT,
-                );
-            }
             if let Some(clips) = self
                 .clips
                 .get(actor.definition_index)
@@ -882,10 +887,11 @@ impl EnemyAi {
             // the upper bound and rest of the movement rules are provisional.
             let speed = (def.speed as f32 / 10.0).clamp(0.0, 8.0);
             let travel = (speed * DT).min(goal_distance);
-            let delta = [
-                to_goal[0] / goal_distance * travel,
-                to_goal[1] / goal_distance * travel,
-            ];
+            // Move along the actor's facing while it turns, as the independent
+            // reconstruction does; a direct target vector makes a turning mesh
+            // slide sideways. Wall/circle sweeps can still slide along contact.
+            let (sin, cos) = actor.angle_radians.sin_cos();
+            let delta = [cos * travel, sin * travel];
             if let (Some(circles), Some(config)) = (&mut circles, collision) {
                 let objects = config.objects;
                 let radius = (def.wall_radius as f32 / 256.0).clamp(0.05, 2.0);
@@ -923,6 +929,11 @@ impl EnemyAi {
         attacks
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "archive.rs"]
+mod installed_archive;
 
 #[cfg(test)]
 mod tests {
@@ -975,12 +986,311 @@ mod tests {
         );
     }
 
+    /// Full headless encounter setup using owned MAP01 placements, geometry,
+    /// materials, object heights, and authored CAR clip metadata.
+    fn installed_map01_session() -> Option<crate::session::Session> {
+        use crate::{
+            game::GameInventory,
+            inventory::WeaponDefinitions,
+            map::Map,
+            object_combat::ObjectCombat,
+            object_heights::{HeightBounds, ObjectHeightCatalog},
+            object_states::ObjectStates,
+            objects::{self, ObjectDefinitions, ObjectKind},
+            process::Script,
+            process_runtime::{ProcessCapabilities, ProcessObject, ProcessRuntime},
+            process_transaction::PresentationManifest,
+            session::{LevelSetup, ScriptedObjects, Session},
+        };
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "assets/csm.bin".into());
+        if explicit.is_none() && !path.exists() {
+            return None;
+        }
+        let mut archive = super::installed_archive::Archive::open(&path).unwrap();
+        let map = Map::parse(&archive.read("map/map.01").unwrap()).unwrap();
+        let info = archive.read("chasm.inf").unwrap();
+        let resource = archive.read("map/resource.01").unwrap();
+        let definitions = ObjectDefinitions::parse(&info, &resource).unwrap();
+        let actor_definitions = ActorDefinitions::parse(&info).unwrap();
+        let actors = ActorState::from_placements(&map.monsters, &actor_definitions);
+        let script = Script::parse(&String::from_utf8_lossy(
+            &archive.read("map/process.01").unwrap(),
+        ));
+        let instances = objects::instances(&map);
+        let mut walks = [true; 128];
+        let mut shots = [true; 128];
+        let text = String::from_utf8_lossy(&resource);
+        let gfx = text
+            .split("#GFX")
+            .nth(1)
+            .unwrap()
+            .split("#end")
+            .next()
+            .unwrap();
+        for row in gfx.lines() {
+            let Some((id, fields)) = row.split_once(':') else {
+                continue;
+            };
+            let Ok(id) = id.trim().parse::<usize>() else {
+                continue;
+            };
+            if !(87..=119).contains(&id) {
+                continue;
+            }
+            if let Some(flags) = fields.split_whitespace().nth(1) {
+                walks[id] = !flags.starts_with('g');
+                shots[id] = flags.as_bytes().get(1) != Some(&b's');
+            }
+        }
+        let point = |p: [u16; 2]| p.map(|v| f32::from(v) / 256.0);
+        let mut walls = Vec::new();
+        for x in 0..64 {
+            for y in 0..64 {
+                let wall = map.wall(x, y).unwrap();
+                if wall.is_wall() && wall.start != wall.end {
+                    walls.push(Wall {
+                        a: point(wall.start),
+                        b: point(wall.end),
+                        texture: wall.texture_id,
+                        blocks_movement: walks[wall.texture_id as usize],
+                        cell: Some([x as u8, y as u8]),
+                    });
+                }
+            }
+        }
+        let spawn = map
+            .monsters
+            .iter()
+            .find(|m| m.is_player_spawn() && m.flags == 0)
+            .unwrap();
+        let world = World {
+            walls,
+            player: Player {
+                position: point(spawn.position),
+                angle: spawn.direction_radians(),
+            },
+        };
+        let cells = std::array::from_fn(|i| map.wall(i / 64, i % 64).unwrap().texture_id);
+        let poses: Vec<_> = instances
+            .iter()
+            .filter(|o| o.difficulty_flags & 2 != 0)
+            .filter_map(|o| {
+                let definition = definitions.definition(o)?;
+                Some(ProcessObject {
+                    cell: o.grid_cell.map(|v| v as u8),
+                    position: o.position,
+                    angle_radians: o.angle_radians,
+                    elevation_raw: 0.0,
+                    blocking_radius: if o.kind == ObjectKind::Item
+                        || (141..=143).contains(&definition.action_code)
+                    {
+                        0.0
+                    } else {
+                        (definition.collision_radius.max(0) as f32 / 256.0).min(2.0)
+                    },
+                })
+            })
+            .collect();
+        let processes = ProcessRuntime::with_wall_changes(
+            &script,
+            &world,
+            ProcessCapabilities {
+                wall_elevation: true,
+                initial_cell_types: None,
+            },
+            &cells,
+            &poses,
+        )
+        .unwrap();
+        let mut heights = ObjectHeightCatalog::new();
+        for (index, definition) in definitions.level_objects.iter().enumerate() {
+            // MAP01's encounter cover is 3O. Other absent bounds retain the
+            // session's conservative fallback rather than requiring a client.
+            if let Some(path) = definition.model_3o_path() {
+                let model = crate::model::Model::parse(&archive.read(&path).unwrap()).unwrap();
+                if let Some(bounds) = HeightBounds::from_3o(&model) {
+                    heights.set(163 + index as u8, bounds);
+                }
+            }
+        }
+        let clips = actor_definitions
+            .entries
+            .iter()
+            .map(|definition| {
+                definition
+                    .car_path()
+                    .and_then(|path| archive.read(&path).ok())
+                    .and_then(|bytes| crate::monster::Monster::parse(&bytes).ok())
+                    .map(|monster| ActorClipSet::from_car(&monster))
+            })
+            .collect();
+        let game = GameInventory::new(
+            WeaponDefinitions::parse(&info).unwrap(),
+            &instances,
+            &definitions,
+            Difficulty::Normal,
+        );
+        let mut session = Session::new(LevelSetup {
+            world,
+            processes,
+            actors,
+            actor_definitions,
+            game,
+            rockets: RocketDefinitions::parse(&info).unwrap(),
+            shot_blocking: shots,
+            difficulty: Difficulty::Normal,
+        });
+        session.set_authored_shot_planes(&map);
+        assert!(session.set_object_heights(heights, cells));
+        session.ai.set_clip_metadata(clips);
+        session.set_objects(ObjectCombat::new(
+            &instances,
+            &definitions,
+            &script,
+            Difficulty::Normal,
+        ));
+        session.set_scripted_objects(ScriptedObjects::new(
+            ObjectStates::new(&instances, &definitions).unwrap(),
+            definitions,
+            PresentationManifest::default(),
+            &script,
+            true,
+        ));
+        assert!(session.set_object_sight(true));
+        Some(session)
+    }
+
+    #[test]
+    fn installed_map01_walk_reveals_spider_and_released_controls_allow_melee_damage() {
+        use crate::session::SessionInput;
+        let Some(mut session) = installed_map01_session() else {
+            return;
+        };
+        session.world.player.position = [31.5, 51.5];
+        session.world.player.angle = -std::f32::consts::FRAC_PI_2;
+        let initial = session
+            .actors
+            .actors
+            .iter()
+            .find(|actor| actor.source_index == 29)
+            .unwrap()
+            .position;
+        let health = session.game.inventory.health;
+        for _ in 0..15 {
+            session.step(SessionInput::default());
+        }
+        assert_eq!(
+            session.ai.mode(29),
+            Some(Mode::Idle),
+            "authored wall hides the approach"
+        );
+        for _ in 0..120 {
+            if session.world.player.position[1] <= 49.55 {
+                break;
+            }
+            session.step(SessionInput {
+                movement: crate::world::Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        assert!(
+            session.world.player.position[1] <= 49.55,
+            "walk must clear the corner"
+        );
+        assert_ne!(session.ai.mode(29), Some(Mode::Idle));
+        let mut melee = false;
+        for _ in 0..360 {
+            let events = session.step(SessionInput::default());
+            melee |= events
+                .enemy_attacks
+                .iter()
+                .any(|attack| attack.source_index == 29 && attack.kind == EnemyAttackKind::Melee);
+            if melee && session.game.inventory.health < health {
+                break;
+            }
+        }
+        let actor = session
+            .actors
+            .actors
+            .iter()
+            .find(|actor| actor.source_index == 29)
+            .unwrap();
+        assert!((actor.position[0] - initial[0]).hypot(actor.position[1] - initial[1]) > 1.0);
+        assert!(
+            melee && session.game.inventory.health < health,
+            "released input must not stop AI or damage"
+        );
+    }
+
+    #[test]
+    fn installed_map01_wingman_commits_a_projectile_and_damages_player() {
+        use crate::{
+            projectiles::{ImpactTarget, Owner},
+            session::SessionInput,
+        };
+        let Some(mut session) = installed_map01_session() else {
+            return;
+        };
+        session.world.player.position = [13.5, 44.0];
+        session.world.player.angle = -std::f32::consts::FRAC_PI_2;
+        let health = session.game.inventory.health;
+        for _ in 0..12 {
+            session.step(SessionInput {
+                movement: crate::world::Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let mut launched = false;
+        let mut active = false;
+        let mut hit = false;
+        for _ in 0..360 {
+            let events = session.step(SessionInput::default());
+            launched |= events.enemy_attacks.iter().any(|attack| {
+                attack.source_index == 21
+                    && matches!(
+                        attack.kind,
+                        EnemyAttackKind::Ranged {
+                            rocket_id: 6,
+                            instant: false,
+                            ..
+                        }
+                    )
+            });
+            active |= session.projectiles.active().iter().any(|projectile| {
+                projectile.owner == Owner::Enemy { source_index: 21 } && projectile.rocket_id == 6
+            });
+            hit |= events.projectile_impacts.iter().any(|impact| {
+                impact.owner == Owner::Enemy { source_index: 21 }
+                    && impact.rocket_id == 6
+                    && impact.target == ImpactTarget::Player
+            });
+            if hit {
+                break;
+            }
+        }
+        assert!(
+            launched && active && hit,
+            "attack event must become a moving projectile and a committed player impact"
+        );
+        assert!(session.game.inventory.health < health);
+    }
+
     fn actor(health: i32, flags: u8) -> (ActorState, ActorDefinitions) {
         let defs = ActorDefinitions::parse(format!("[MONSTERS]\n2\nhero.car 100 100 10 5 100 0 0 0\njoker.car 52 190 10 5 {health} 20 -1 16\n").as_bytes()).unwrap();
         let records = [Monster {
             position: [0, 0],
             id: 101,
-            angle: 0,
+            angle: 4, // Authored +X facing, matching most collision fixtures.
             flags,
         }];
         (ActorState::from_placements(&records, &defs), defs)
@@ -1023,6 +1333,59 @@ mod tests {
         ai.set_player_invisible(false);
         ai.tick(&mut actors, &defs, &w);
         assert_eq!(ai.mode(0), Some(Mode::Chasing));
+    }
+
+    #[test]
+    fn chase_movement_follows_authoritative_heading_during_a_turn() {
+        let (mut state, defs) = actor(100, 7);
+        state.actors[0].angle_radians = 0.0;
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let w = world([0.0, 3.0], vec![]);
+        ai.tick(&mut state, &defs, &w);
+        let actor = &state.actors[0];
+        let forward = [actor.angle_radians.cos(), actor.angle_radians.sin()];
+        assert!(actor.angle_radians > 0.0 && actor.angle_radians < 0.1);
+        assert!(actor.position[0] > 0.0 && actor.position[1] > 0.0);
+        assert!(cross(actor.position, forward).abs() < 1e-6);
+        assert!((dot(actor.position, actor.position).sqrt() - 1.0 / 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn timed_ranged_windup_tracks_player_without_moving_or_restarting_clip() {
+        let (mut state, mut defs) = actor(100, 7);
+        defs.entries[1].speed = 0;
+        defs.entries[1].rocket = 0;
+        state.actors[0].angle_radians = 0.0;
+        let mut ai = EnemyAi::new(&state, Difficulty::Normal);
+        let clips = ActorClipSet::parse_gltf(b"0 0 1\n5 1 10\n", Some(11)).unwrap();
+        ai.set_clip_metadata(vec![None, Some(clips)]);
+        let mut w = world([2.0, 0.0], vec![]);
+        for _ in 0..4 {
+            ai.tick_with_rockets(&mut state, &defs, &rockets(), &w);
+        }
+        assert_eq!(
+            ai.attack_animation(0),
+            Some(AttackAnimation { slot: 5, frame: 0 })
+        );
+        w.player.position = [0.0, 2.0];
+        let mut attacks = Vec::new();
+        for _ in 0..20 {
+            attacks.extend(ai.tick_with_rockets(&mut state, &defs, &rockets(), &w));
+        }
+        assert!(state.actors[0].angle_radians > 1.5);
+        assert_eq!(state.actors[0].position, [0.0; 2]);
+        assert_eq!(
+            ai.attack_animation(0),
+            Some(AttackAnimation { slot: 5, frame: 5 })
+        );
+        assert_eq!(attacks.len(), 1);
+        assert!(matches!(
+            attacks[0].kind,
+            EnemyAttackKind::Ranged {
+                target: [0.0, 2.0],
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1516,6 +1879,7 @@ mod tests {
         let (mut state, mut defs) = actor(100, 7);
         defs.entries[1].kick = 0;
         state.actors[0].position = [0.9, 0.0];
+        state.actors[0].angle_radians = std::f32::consts::PI;
         let mut ai = EnemyAi::new(&state, Difficulty::Normal);
         let w = world([-1.0, 0.0], vec![]);
         let object = CollisionCircle {

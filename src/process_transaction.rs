@@ -35,6 +35,7 @@ pub enum TransactionError {
     PresentationUnavailable { cell: [usize; 2], raw_type: u8 },
     Quake(QuakeError),
     AmbientUnavailable,
+    WallChangesUnavailable,
     Ambient(InvalidAmbientRegion),
     CollisionNotClear { cell: [usize; 2] },
     PoseMismatch { cell: [usize; 2] },
@@ -147,6 +148,9 @@ impl<'a> ProcessTransaction<'a> {
                         blocking_radius: radius,
                     });
                     transitions.extend(changes);
+                }
+                ImmediateAction::WallChange { .. } => {
+                    return Err(TransactionError::WallChangesUnavailable)
                 }
                 ImmediateAction::Quake(zone) => staged_quake
                     .apply_batch(&[zone])

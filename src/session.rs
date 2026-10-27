@@ -1129,7 +1129,7 @@ impl Session {
                                     .map_err(|_| invalid())?;
                                 found = true;
                             }
-                            ImmediateAction::Object(_) => {}
+                            ImmediateAction::Object(_) | ImmediateAction::WallChange { .. } => {}
                         }
                     }
                     if !found {

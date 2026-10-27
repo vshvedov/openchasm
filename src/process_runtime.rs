@@ -365,6 +365,7 @@ type Activation = (Vec<(u16, bool)>, Vec<u16>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImmediateAction {
     Object(ObjectAction),
+    WallChange { cell: [u8; 2], raw_type: u8 },
     Quake(QuakeZone),
     Ambient(AmbientRegion),
 }
@@ -419,9 +420,9 @@ impl RuntimeProcess {
         raw_cells: Option<&[u8; 4096]>,
         hazards_enabled: bool,
         objects: Option<&BTreeMap<[u8; 2], ProcessObject>>,
-        modes: (bool, bool, bool),
+        modes: (bool, bool, bool, bool),
     ) -> Self {
-        let (wind_enabled, immediate_enabled, source_enabled) = modes;
+        let (wind_enabled, immediate_enabled, source_enabled, wall_changes_enabled) = modes;
         let mut motions = Vec::new();
         let mut object_motions = Vec::new();
         let mut empty_motion_cells = Vec::new();
@@ -629,6 +630,46 @@ impl RuntimeProcess {
                 }
                 supported = false;
                 break;
+            }
+            if immediate_enabled && wall_changes_enabled && action.name == "change" {
+                let args = &action.arguments;
+                let parsed = (|| {
+                    if args.len() != 3 {
+                        return None;
+                    }
+                    let x = args[0].parse::<u8>().ok()?;
+                    let y = args[1].parse::<u8>().ok()?;
+                    let raw_type = args[2].parse::<u8>().ok()?;
+                    if x >= 64 || y >= 64 || !(1..=127).contains(&raw_type) {
+                        return None;
+                    }
+                    let old = raw_cells?[usize::from(x) * 64 + usize::from(y)];
+                    if !(1..=127).contains(&old)
+                        || world
+                            .walls
+                            .iter()
+                            .filter(|w| w.cell == Some([x, y]))
+                            .count()
+                            != 1
+                        || world
+                            .walls
+                            .iter()
+                            .find(|w| w.cell == Some([x, y]))
+                            .is_none_or(|w| w.texture != old)
+                    {
+                        return None;
+                    }
+                    Some(ImmediateAction::WallChange {
+                        cell: [x, y],
+                        raw_type,
+                    })
+                })();
+                if let Some(wall) = parsed {
+                    immediate_actions.push(wall);
+                    continue;
+                }
+                // Object changes continue through their existing validation.
+                // Any other target will be rejected below, not ignored.
             }
             if immediate_enabled && action.name == "change" {
                 let args = &action.arguments;
@@ -1366,6 +1407,7 @@ pub struct ProcessRuntime {
     keys: [bool; 3],
     elevations: Vec<f32>,
     static_walls: Vec<bool>,
+    wall_cells: Vec<Option<[u8; 2]>>,
     objects: BTreeMap<[u8; 2], ProcessObject>,
     cell_types: Option<Vec<u8>>,
     effects: Vec<ProcessEffect>,
@@ -1803,6 +1845,24 @@ pub enum RuntimeObjectSyncError {
     ActiveMotion,
 }
 
+/// One ordered wall-to-wall replacement validated by the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeWallTransition {
+    pub cell: [u8; 2],
+    pub wall_index: usize,
+    pub previous_type: u8,
+    pub new_type: u8,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeWallSyncError {
+    ActionMismatch,
+    MissingCellTypes,
+    InvalidTransition,
+    StaleType,
+    WallIdentity,
+    ActiveMotion,
+}
+
 /// A process activation staged on a private copy. Dropping it rolls back;
 /// commit publishes the staged runtime and its effects. The exclusive borrow
 /// prevents intervening runtime changes while the host validates the plan.
@@ -1811,6 +1871,7 @@ pub struct PreparedProcess<'a> {
     staged: ProcessRuntime,
     actions: Vec<ImmediateAction>,
     object_sync_complete: bool,
+    wall_sync_complete: bool,
     ambient_sync_complete: bool,
     scheduled: Option<ProcessRuntime>,
     event: ProcessEvent,
@@ -1822,11 +1883,16 @@ impl PreparedProcess<'_> {
 
     /// Publish only the already-validated schedule, not staged target edits.
     pub(crate) fn commit_schedule(self) -> ProcessEvent {
-        if !self.object_sync_complete
+        if !self.wall_sync_complete
             && self
                 .actions
                 .iter()
-                .any(|a| matches!(a, ImmediateAction::Object(_)))
+                .any(|a| matches!(a, ImmediateAction::WallChange { .. }))
+            || !self.object_sync_complete
+                && self
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, ImmediateAction::Object(_)))
             || !self.ambient_sync_complete
                 && self
                     .actions
@@ -1925,7 +1991,87 @@ impl PreparedProcess<'_> {
         self.object_sync_complete = true;
         Ok(())
     }
+    /// Stage wall transitions after host geometry, material and clearance preflight.
+    /// The complete ordered wall batch is atomic and remains private until commit.
+    pub fn stage_wall_transitions(
+        &mut self,
+        transitions: &[RuntimeWallTransition],
+    ) -> Result<(), RuntimeWallSyncError> {
+        // A failed revalidation must not leave an earlier authorization usable.
+        self.wall_sync_complete = false;
+        let actions: Vec<_> = self
+            .actions
+            .iter()
+            .filter_map(|action| match *action {
+                ImmediateAction::WallChange { cell, raw_type } => Some((cell, raw_type)),
+                _ => None,
+            })
+            .collect();
+        if actions.len() != transitions.len() {
+            return Err(RuntimeWallSyncError::ActionMismatch);
+        }
+        let mut staged = self.staged.clone();
+        for ((cell, raw_type), transition) in actions.into_iter().zip(transitions) {
+            if cell != transition.cell || raw_type != transition.new_type {
+                return Err(RuntimeWallSyncError::ActionMismatch);
+            }
+            if cell[0] >= 64
+                || cell[1] >= 64
+                || !(1..=127).contains(&transition.previous_type)
+                || !(1..=127).contains(&transition.new_type)
+            {
+                return Err(RuntimeWallSyncError::InvalidTransition);
+            }
+            if staged
+                .wall_cells
+                .get(transition.wall_index)
+                .copied()
+                .flatten()
+                != Some(cell)
+                || staged
+                    .wall_cells
+                    .iter()
+                    .filter(|c| **c == Some(cell))
+                    .count()
+                    != 1
+            {
+                return Err(RuntimeWallSyncError::WallIdentity);
+            }
+            // A moving wall cannot change type from another active process.
+            // This process may change and then move its own wall on opening.
+            if staged.processes.iter().any(|(&id, p)| {
+                id != self.event.process_id
+                    && !matches!(p.phase, Phase::Closed)
+                    && p.motions.iter().any(|m| m.wall == transition.wall_index)
+            }) {
+                return Err(RuntimeWallSyncError::ActiveMotion);
+            }
+            let types = staged
+                .cell_types
+                .as_mut()
+                .ok_or(RuntimeWallSyncError::MissingCellTypes)?;
+            let index = usize::from(cell[0]) * 64 + usize::from(cell[1]);
+            if types[index] != transition.previous_type {
+                return Err(RuntimeWallSyncError::StaleType);
+            }
+            types[index] = transition.new_type;
+        }
+        self.staged = staged;
+        self.wall_sync_complete = true;
+        Ok(())
+    }
     pub fn commit(self) -> ProcessEvent {
+        if !self.wall_sync_complete
+            && self
+                .actions
+                .iter()
+                .any(|a| matches!(a, ImmediateAction::WallChange { .. }))
+        {
+            return ProcessEvent {
+                process_id: self.event.process_id,
+                outcome: ProcessOutcome::Unsupported,
+            };
+        }
         if self.scheduled.is_some() {
             return ProcessEvent {
                 process_id: self.event.process_id,
@@ -2063,7 +2209,7 @@ impl ProcessRuntime {
                         cells,
                         true,
                         Some(&runtime.objects),
-                        (true, true, false),
+                        (true, true, false, false),
                     ),
                 )
             })
@@ -2094,12 +2240,44 @@ impl ProcessRuntime {
                         cells,
                         true,
                         Some(&runtime.objects),
-                        (true, true, true),
+                        (true, true, true, false),
                     ),
                 )
             })
             .collect();
         runtime.source_enabled = true;
+        Ok(runtime)
+    }
+    /// Opt into staged wall changes only when the host validates and applies
+    /// texture, material, collision and presentation state transactionally.
+    pub fn with_wall_changes(
+        script: &Script,
+        world: &World,
+        capabilities: ProcessCapabilities<'_>,
+        raw_cells: &[u8; 4096],
+        object_poses: &[ProcessObject],
+    ) -> Result<Self, ProcessObjectError> {
+        let mut runtime =
+            Self::with_source_lights(script, world, capabilities, raw_cells, object_poses)?;
+        let cells = capabilities.initial_cell_types.or(Some(raw_cells));
+        runtime.processes = script
+            .processes
+            .iter()
+            .map(|(&id, process)| {
+                (
+                    id,
+                    RuntimeProcess::new(
+                        process,
+                        world,
+                        capabilities,
+                        cells,
+                        true,
+                        Some(&runtime.objects),
+                        (true, true, true, true),
+                    ),
+                )
+            })
+            .collect();
         Ok(runtime)
     }
     pub fn source_lights_enabled(&self) -> bool {
@@ -2192,7 +2370,7 @@ impl ProcessRuntime {
                             raw_cells,
                             hazards_enabled,
                             enabled.then_some(&objects),
-                            (wind_enabled, false, false),
+                            (wind_enabled, false, false, false),
                         ),
                     )
                 })
@@ -2202,6 +2380,7 @@ impl ProcessRuntime {
             keys: [false; 3],
             elevations: vec![0.0; world.walls.len()],
             static_walls: static_wall_mask(script, world),
+            wall_cells: world.walls.iter().map(|w| w.cell).collect(),
             objects,
             cell_types: capabilities.initial_cell_types.map(|x| x.to_vec()),
             effects: Vec::new(),
@@ -2358,6 +2537,7 @@ impl ProcessRuntime {
             staged,
             actions,
             object_sync_complete: false,
+            wall_sync_complete: false,
             ambient_sync_complete: false,
             scheduled,
             event,
@@ -2420,6 +2600,7 @@ impl ProcessRuntime {
             staged,
             actions,
             object_sync_complete: false,
+            wall_sync_complete: false,
             ambient_sync_complete: false,
             scheduled: None,
             event: ProcessEvent {
@@ -2466,6 +2647,7 @@ impl ProcessRuntime {
             staged,
             actions: Vec::new(),
             object_sync_complete: false,
+            wall_sync_complete: false,
             ambient_sync_complete: false,
             scheduled: None,
             event,
@@ -3013,6 +3195,171 @@ mod tests {
         target.tick(&mut restored_world, 0.1, false);
         assert_eq!(world.walls[0].a, restored_world.walls[0].a);
         assert_eq!(source.wall_elevation(1), target.wall_elevation(1));
+    }
+
+    #[test]
+    fn staged_wall_change_requires_preflight_and_updates_type_atomically() {
+        let script =
+            Script::parse("#proc1\n#action\nchange 1 0 5\n#end\n#links\nlink 0 0 1\n#end\n");
+        let world = world();
+        let mut cells = [0; 4096];
+        cells[64] = 1;
+        let mut legacy = ProcessRuntime::with_staged_actions(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.prepare_at("link", [0, 0], 1).err(),
+            Some(ProcessOutcome::Unsupported)
+        );
+        let mut runtime = ProcessRuntime::with_wall_changes(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        let mut prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        assert_eq!(
+            prepared.actions(),
+            &[ImmediateAction::WallChange {
+                cell: [1, 0],
+                raw_type: 5
+            }]
+        );
+        let bad = RuntimeWallTransition {
+            cell: [1, 0],
+            wall_index: 0,
+            previous_type: 2,
+            new_type: 5,
+        };
+        assert_eq!(
+            prepared.stage_wall_transitions(&[bad]),
+            Err(RuntimeWallSyncError::StaleType)
+        );
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Unsupported);
+        assert_eq!(runtime.cell_type([1, 0]), Some(1));
+        let good = RuntimeWallTransition {
+            previous_type: 1,
+            ..bad
+        };
+        let mut prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        assert_eq!(
+            prepared.stage_wall_transitions(&[RuntimeWallTransition {
+                wall_index: 1,
+                ..good
+            }]),
+            Err(RuntimeWallSyncError::WallIdentity)
+        );
+        prepared.stage_wall_transitions(&[good]).unwrap();
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Accepted);
+        assert_eq!(runtime.cell_type([1, 0]), Some(5));
+        let mut prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        prepared
+            .stage_wall_transitions(&[RuntimeWallTransition {
+                previous_type: 5,
+                ..good
+            }])
+            .unwrap();
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Accepted);
+        assert_eq!(runtime.cell_type([1, 0]), Some(5));
+    }
+
+    #[test]
+    fn wall_change_batch_failure_cannot_commit_a_prefix() {
+        let script = Script::parse(
+            "#proc1\n#action\nchange 1 0 5\nchange 2 0 6\n#end\n#links\nlink 0 0 1\n#end\n",
+        );
+        let mut world = world();
+        world.walls.push(Wall {
+            a: [2.0, 0.0],
+            b: [2.0, 1.0],
+            texture: 2,
+            blocks_movement: true,
+            cell: Some([2, 0]),
+        });
+        let mut cells = [0; 4096];
+        cells[64] = 1;
+        cells[128] = 2;
+        let mut runtime = ProcessRuntime::with_wall_changes(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        let mut prepared = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        let first = RuntimeWallTransition {
+            cell: [1, 0],
+            wall_index: 0,
+            previous_type: 1,
+            new_type: 5,
+        };
+        let second = RuntimeWallTransition {
+            cell: [2, 0],
+            wall_index: 1,
+            previous_type: 3,
+            new_type: 6,
+        };
+        assert_eq!(
+            prepared.stage_wall_transitions(&[first, second]),
+            Err(RuntimeWallSyncError::StaleType)
+        );
+        assert_eq!(prepared.commit().outcome, ProcessOutcome::Unsupported);
+        assert_eq!(runtime.cell_type([1, 0]), Some(1));
+        assert_eq!(runtime.cell_type([2, 0]), Some(2));
+    }
+
+    #[test]
+    fn delayed_wall_change_commits_only_at_due_time_and_rejects_ambiguous_walls() {
+        let script = Script::parse(
+            "#proc1\nStartDelay 1\n#action\nchange 1 0 5\n#end\n#links\nlink 0 0 1\n#end\n",
+        );
+        let mut world = world();
+        let mut cells = [0; 4096];
+        cells[64] = 1;
+        let mut runtime = ProcessRuntime::with_wall_changes(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        let t = RuntimeWallTransition {
+            cell: [1, 0],
+            wall_index: 0,
+            previous_type: 1,
+            new_type: 5,
+        };
+        let mut pending = runtime.prepare_at("link", [0, 0], 1).unwrap();
+        pending.stage_wall_transitions(&[t]).unwrap();
+        assert_eq!(pending.commit_schedule().outcome, ProcessOutcome::Accepted);
+        assert_eq!(runtime.cell_type([1, 0]), Some(1));
+        runtime.tick(&mut world, 1.0, false);
+        let mut due = runtime.prepare_due(1).unwrap();
+        due.stage_wall_transitions(&[t]).unwrap();
+        assert_eq!(due.commit().outcome, ProcessOutcome::Accepted);
+        assert_eq!(runtime.cell_type([1, 0]), Some(5));
+        world.walls.push(world.walls[0].clone());
+        let mut ambiguous = ProcessRuntime::with_wall_changes(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            ambiguous.prepare_at("link", [0, 0], 1).err(),
+            Some(ProcessOutcome::Unsupported)
+        );
     }
 
     #[test]

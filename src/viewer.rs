@@ -208,6 +208,11 @@ pub fn run(
         projectile_renderer,
     } = feedback;
     let initial_session = session.clone();
+    if let Some(targets) = &session.objects {
+        for (cell, visible) in targets.visibility() {
+            objects.set_visible(cell, visible);
+        }
+    }
     for cell in session.game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
@@ -361,6 +366,12 @@ pub fn run(
         };
         if restart_requested {
             session = initial_session.clone();
+            objects.reset_object_animations();
+            if let Some(targets) = &session.objects {
+                for (cell, visible) in targets.visibility() {
+                    objects.set_visible(cell, visible);
+                }
+            }
             for (cell, visible) in session.game.pickups.visibility() {
                 objects.set_visible(cell, visible);
             }
@@ -417,6 +428,14 @@ pub fn run(
                     MissionEvent::LevelComplete => completed = true,
                 }
             }
+            for effect in events.process_effects {
+                if let openchasm::process_runtime::ProcessEffect::PlayAnimation { object_id } =
+                    effect
+                {
+                    objects.play_object_animation(object_id);
+                }
+            }
+            objects.tick_object_animations(STEP);
             for (cell, destroyed) in events.object_hits {
                 if destroyed {
                     objects.set_visible(cell, false);

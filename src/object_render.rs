@@ -54,6 +54,9 @@ struct Instance {
     angle: f32,
     cell: Option<[usize; 2]>,
     actor_source_index: Option<usize>,
+    object_definition_index: Option<usize>,
+    object_animation_playing: bool,
+    object_animation_seconds: f64,
     animation_mode: ActorAnimationMode,
     animation_seconds: f64,
     visible: bool,
@@ -75,6 +78,18 @@ fn actor_vertices(mesh: &Mesh, mode: ActorAnimationMode, seconds: f64) -> &[Mode
         frame.rem_euclid(count as f64) as usize
     } else {
         frame.min((count - 1) as f64) as usize
+    };
+    &animation.frames[index]
+}
+
+fn object_vertices(mesh: &Mesh, playing: bool, seconds: f64) -> &[ModelVertex] {
+    let Some(animation) = mesh.animations[0].as_ref().filter(|a| !a.frames.is_empty()) else {
+        return &mesh.model.vertices;
+    };
+    let index = if playing {
+        (seconds.max(0.0) * ACTOR_ANIMATION_FPS).rem_euclid(animation.frames.len() as f64) as usize
+    } else {
+        0
     };
     &animation.frames[index]
 }
@@ -246,7 +261,7 @@ impl ObjectScene {
     ) -> Self {
         let mut meshes = Vec::new();
         let mut instances = Vec::new();
-        let mut cache: HashMap<String, Option<usize>> = HashMap::new();
+        let mut cache: HashMap<(String, Option<String>), Option<usize>> = HashMap::new();
         let mut warnings = BTreeSet::new();
         for instance in objects::instances(map) {
             let Some(definition) = definitions.definition(&instance) else {
@@ -260,16 +275,42 @@ impl ObjectScene {
                 warnings.insert(format!("glTF-only model {}", definition.model_name));
                 continue;
             };
-            let mesh_index = *cache.entry(path.clone()).or_insert_with(|| {
+            let animation_path = definition.animation_path();
+            let cache_key = (path.clone(), animation_path.clone());
+            let mesh_index = *cache.entry(cache_key).or_insert_with(|| {
                 match resources.read(&path).and_then(|bytes| Model::parse(&bytes)) {
                     Ok(model) => {
-                        let radius = vertex_radius(&model.vertices);
+                        let mut animations: [Option<Animation>; 20] = std::array::from_fn(|_| None);
+                        if let Some(animation_path) = &animation_path {
+                            match resources
+                                .read(animation_path)
+                                .and_then(|bytes| Animation::parse(&bytes))
+                            {
+                                Ok(animation) if animation.matches_model(&model) => {
+                                    animations[0] = Some(animation)
+                                }
+                                Ok(_) => {
+                                    warnings.insert(format!(
+                                        "{animation_path}: vertex count mismatch for {path}"
+                                    ));
+                                }
+                                Err(error) => {
+                                    warnings.insert(format!("{animation_path}: {error}"));
+                                }
+                            }
+                        }
+                        let mut radius = vertex_radius(&model.vertices);
+                        if let Some(animation) = &animations[0] {
+                            for frame in &animation.frames {
+                                radius = radius.max(vertex_radius(frame));
+                            }
+                        }
                         let index = meshes.len();
                         meshes.push(Mesh {
                             model,
                             radius,
                             car_uv: false,
-                            animations: std::array::from_fn(|_| None),
+                            animations,
                         });
                         Some(index)
                     }
@@ -286,6 +327,13 @@ impl ObjectScene {
                     angle: instance.angle_radians,
                     cell: Some(instance.grid_cell),
                     actor_source_index: None,
+                    object_definition_index: if instance.kind == objects::ObjectKind::LevelObject {
+                        Some(instance.definition_index)
+                    } else {
+                        None
+                    },
+                    object_animation_playing: false,
+                    object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     visible: true,
@@ -362,6 +410,9 @@ impl ObjectScene {
                     angle: actor.angle_radians,
                     cell: None,
                     actor_source_index: Some(actor.source_index),
+                    object_definition_index: None,
+                    object_animation_playing: false,
+                    object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     visible: true,
@@ -425,6 +476,53 @@ impl ObjectScene {
         true
     }
 
+    /// Start the matching level-object animations after a `playani` effect.
+    /// Script values >= 33 identify the `#newobjects` entry `value - 33`;
+    /// unknown lower values and entries without compatible ANI data are no-ops.
+    /// Returns the number of placements restarted.
+    #[allow(dead_code)] // Viewer integrates ProcessEffect separately.
+    pub fn play_object_animation(&mut self, script_id: u16) -> usize {
+        let Some(definition_index) = script_id.checked_sub(33).map(usize::from) else {
+            return 0;
+        };
+        let mut started = 0;
+        for instance in &mut self.instances {
+            if instance.object_definition_index != Some(definition_index)
+                || self.meshes[instance.mesh].animations[0].is_none()
+            {
+                continue;
+            }
+            instance.object_animation_playing = true;
+            instance.object_animation_seconds = 0.0;
+            started += 1;
+        }
+        started
+    }
+
+    /// Advance active object presentation timers once per fixed simulation tick.
+    /// Invalid or negative elapsed time is rejected without changing any state.
+    #[allow(dead_code)] // Viewer integrates fixed-tick presentation separately.
+    pub fn tick_object_animations(&mut self, delta_seconds: f32) -> bool {
+        if !delta_seconds.is_finite() || delta_seconds < 0.0 {
+            return false;
+        }
+        for instance in &mut self.instances {
+            if instance.object_animation_playing {
+                instance.object_animation_seconds += f64::from(delta_seconds);
+            }
+        }
+        true
+    }
+
+    /// Restore the initial stopped object poses when a level is restarted.
+    #[allow(dead_code)] // Viewer integrates restart separately.
+    pub fn reset_object_animations(&mut self) {
+        for instance in &mut self.instances {
+            instance.object_animation_playing = false;
+            instance.object_animation_seconds = 0.0;
+        }
+    }
+
     /// Hide or restore an individual placement without changing shared meshes.
     /// Grid cells are stable identifiers from the source map.
     #[allow(dead_code)] // Used when pickup/game state integration is enabled.
@@ -479,7 +577,11 @@ impl ObjectScene {
             let pose_vertices = if mesh.car_uv {
                 actor_vertices(mesh, instance.animation_mode, instance.animation_seconds)
             } else {
-                &mesh.model.vertices
+                object_vertices(
+                    mesh,
+                    instance.object_animation_playing,
+                    instance.object_animation_seconds,
+                )
             };
             for polygon in &mesh.model.polygons {
                 // The default pose shows intact body/head/hands, excluding
@@ -527,6 +629,81 @@ impl ObjectScene {
 mod tests {
     use super::*;
     #[test]
+    fn playani_targets_all_level_objects_and_preserves_instance_state() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("openchasm-playani-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(dir.join("model")).unwrap();
+        let mut model = vec![0_u8; 0x4806 + 64];
+        for (i, index) in [0_u16, 1, 2, 255].iter().enumerate() {
+            model[i * 2..i * 2 + 2].copy_from_slice(&index.to_le_bytes());
+        }
+        model[0x4800..0x4802].copy_from_slice(&3_u16.to_le_bytes());
+        model[0x4802..0x4804].copy_from_slice(&1_u16.to_le_bytes());
+        model[0x4804..0x4806].copy_from_slice(&1_u16.to_le_bytes());
+        std::fs::write(dir.join("model/a.3o"), model).unwrap();
+        let mut animation = vec![0_u8; 2 + 3 * 6 * 2];
+        animation[..2].copy_from_slice(&3_u16.to_le_bytes());
+        animation[2 + 3 * 6..4 + 3 * 6].copy_from_slice(&512_i16.to_le_bytes());
+        std::fs::write(dir.join("model/a.ani"), animation).unwrap();
+        let mut map_bytes = vec![0; 0x27001 + 4];
+        for (x, y, id) in [(1, 1, 163), (2, 2, 163), (3, 3, 164)] {
+            map_bytes[0x18001 + (x * 64 + y) * 11] = id;
+        }
+        let map = crate::map::Map::parse(&map_bytes).unwrap();
+        let def = |animation_name| crate::objects::ObjectDefinition {
+            collision_radius: 0,
+            shadow: 0,
+            bmp_object: 0,
+            bmp_z: 0,
+            action_code: 0,
+            blow_up: 0,
+            break_limit: 0,
+            ambient_sound: 0,
+            break_sound: 0,
+            model_name: "a.3o".into(),
+            animation_name,
+        };
+        let definitions = crate::objects::ObjectDefinitions {
+            items: vec![],
+            level_objects: vec![def(Some("%a.ani".into())), def(None)],
+        };
+        let palette = Palette::parse(&[0; 768]).unwrap();
+        let mut resources = ResourceSet::open(&dir).unwrap();
+        let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+        assert_eq!(scene.instances.len(), 3);
+        assert_eq!(scene.meshes.len(), 2); // same model, different animation association
+        assert_eq!(scene.play_object_animation(1), 0); // unknown legacy special ID
+        assert_eq!(scene.play_object_animation(34), 0); // no ANI
+        assert_eq!(scene.play_object_animation(33), 2);
+        assert!(scene.tick_object_animations(1.0 / 18.0 + 0.001));
+        for instance in &scene.instances[..2] {
+            assert!(instance.object_animation_playing);
+            assert_eq!(
+                object_vertices(
+                    &scene.meshes[instance.mesh],
+                    true,
+                    instance.object_animation_seconds
+                )[0]
+                .position[0],
+                512
+            );
+        }
+        assert!(!scene.instances[2].object_animation_playing);
+        assert!(!scene.tick_object_animations(f32::NAN));
+        scene.reset_object_animations();
+        assert!(scene
+            .instances
+            .iter()
+            .all(|i| !i.object_animation_playing && i.object_animation_seconds == 0.0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn actor_animation_selects_slots_loops_and_clamps_death() {
         let vertex = |x| ModelVertex {
             position: [x, 0, 0],
@@ -565,6 +742,9 @@ mod tests {
             angle: 0.0,
             cell: None,
             actor_source_index: Some(id),
+            object_definition_index: None,
+            object_animation_playing: false,
+            object_animation_seconds: 0.0,
             animation_mode: ActorAnimationMode::Idle,
             animation_seconds: 0.0,
             visible: true,
@@ -597,6 +777,9 @@ mod tests {
                     angle: 0.0,
                     cell: Some([1, 2]),
                     actor_source_index: None,
+                    object_definition_index: None,
+                    object_animation_playing: false,
+                    object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     visible: true,
@@ -607,6 +790,9 @@ mod tests {
                     angle: 0.0,
                     cell: Some([3, 4]),
                     actor_source_index: None,
+                    object_definition_index: None,
+                    object_animation_playing: false,
+                    object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
                     visible: true,

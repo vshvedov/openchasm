@@ -198,6 +198,16 @@ impl ObjectCombat {
             .map(|target| target.difficulty_enabled && target.enabled && !target.destroyed)
     }
 
+    /// Visibility of each tracked object, for presentation synchronization.
+    pub fn visibility(&self) -> impl Iterator<Item = ([usize; 2], bool)> + '_ {
+        self.targets.iter().map(|target| {
+            (
+                target.cell,
+                target.difficulty_enabled && target.enabled && !target.destroyed,
+            )
+        })
+    }
+
     /// Toggle visibility/collision for script-controlled objects. This does not
     /// resurrect a destroyed object; reconstruction of replacement models is a
     /// future process-system responsibility.

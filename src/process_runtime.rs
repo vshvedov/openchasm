@@ -689,15 +689,22 @@ impl RuntimeProcess {
             let speed_override = if action.arguments.len() == expected_arguments {
                 None
             } else if action.arguments.len() == expected_arguments + 1 {
-                let value = action.arguments[expected_arguments]
-                    .strip_prefix("s:")
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .filter(|value| value.is_finite() && *value > 0.0);
-                if value.is_none() {
-                    supported = false;
-                    break;
+                let suffix = &action.arguments[expected_arguments];
+                // The remaster stores the fifth numeric move argument, but its
+                // opcode-4 motion and lifecycle paths do not read that field.
+                if action.name == "move" && suffix.parse::<i16>().is_ok() {
+                    None
+                } else {
+                    let value = suffix
+                        .strip_prefix("s:")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .filter(|value| value.is_finite() && *value > 0.0);
+                    if value.is_none() {
+                        supported = false;
+                        break;
+                    }
+                    value
                 }
-                value
             } else {
                 supported = false;
                 break;
@@ -2197,7 +2204,17 @@ mod tests {
 
     #[test]
     fn malformed_motion_speed_override_disables_the_whole_process() {
-        for suffix in ["s:0", "s:-1", "s:nan", "s:", "s:8 extra", "8"] {
+        for suffix in [
+            "s:0",
+            "s:-1",
+            "s:nan",
+            "s:",
+            "s:8 extra",
+            "32768",
+            "-32769",
+            "8.0",
+            "8 2",
+        ] {
             let script = Script::parse(&format!(
                 "#proc1\n#action\nmove 1 0 256 0 {suffix}\n#end\n#links\nlink 0 0 1\n#end\n"
             ));
@@ -2211,6 +2228,33 @@ mod tests {
             );
             tick_for(&mut runtime, &mut world, 1.0);
             assert_eq!(world.walls[0].a, original);
+        }
+    }
+
+    #[test]
+    fn numeric_move_suffix_is_preserved_but_does_not_change_motion() {
+        let mut baseline: Option<f32> = None;
+        for suffix in ["", " 64", " -32768", " 32767"] {
+            let script = Script::parse(&format!("#proc1\nSpeed 4\n#action\nmove 1 0 256 0{suffix}\n#end\n#links\nlink 0 0 1\n#end\n"));
+            if !suffix.is_empty() {
+                assert_eq!(script.processes[&1].actions[0].arguments[4], suffix.trim());
+            }
+            let mut world = world();
+            let start = world.walls[0].a;
+            let mut runtime = ProcessRuntime::new(&script, &world);
+            assert_eq!(
+                runtime.activate_at("link", [0, 0])[0].outcome,
+                ProcessOutcome::Accepted
+            );
+            tick_for(&mut runtime, &mut world, 0.1);
+            let partial = world.walls[0].a[0];
+            if let Some(expected) = baseline {
+                assert!((partial - expected).abs() < 0.0001);
+            } else {
+                baseline = Some(partial);
+            }
+            tick_for(&mut runtime, &mut world, 10.0);
+            assert!((world.walls[0].a[0] - start[0] - 1.0).abs() < 0.001);
         }
     }
 

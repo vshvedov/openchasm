@@ -72,7 +72,7 @@ stage duration by process speed divided by command speed. Each motion has its
 own progress, faster commands stop at their endpoint, and reversal moves each
 back from its current position concurrently; the process stays open until the
 slowest command completes. Exact original timing and axis phase proportions
-remain unverified. Bare trailing numeric arguments remain unsupported.
+remain unverified. One signed 16-bit trailing integer on `move` is accepted and retained in the parsed script; it does not alter motion. The bundled manual describes only four move arguments. The remaster parser stores the fifth argument, but its opcode-4 activation, motion and collision paths do not read that field; an unidentified external use remains possible. Other trailing forms fail closed. The installed level 12 process 27 includes `move 29 33 0 -510 64`; an installed-data transaction test validates its object replacement, exit unlock, and wall movement, without claiming a full traversal.
 
 Use interactions select the nearest linked cell using its live process-object
 position when one is represented; otherwise they use the source cell center.

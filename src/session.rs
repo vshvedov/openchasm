@@ -193,21 +193,6 @@ impl Session {
             }
             events.shot = Some(shot);
         }
-        if let Some(mission) = &mut self.mission {
-            for attempt in attempts {
-                match attempt.outcome {
-                    ProcessOutcome::Accepted => events
-                        .mission
-                        .extend(mission.attempt(attempt.process_id, true)),
-                    ProcessOutcome::Locked => events
-                        .mission
-                        .extend(mission.attempt(attempt.process_id, false)),
-                    ProcessOutcome::Unsupported
-                    | ProcessOutcome::Busy
-                    | ProcessOutcome::Missing => {}
-                }
-            }
-        }
         events.enemy_attacks = self.ai.tick_with_collision(
             &mut self.actors,
             &self.actor_definitions,
@@ -245,11 +230,12 @@ impl Session {
                 .damage
                 .saturating_add(self.apply_player_damage(attack.damage));
         }
-        events.projectile_impacts = self.projectiles.tick(
+        events.projectile_impacts = self.projectiles.tick_with_objects(
             DT,
             &self.world,
             &self.actors,
             &self.actor_definitions,
+            self.objects.as_ref(),
             |wall| {
                 self.shot_blocking
                     .get(wall.texture as usize)
@@ -263,6 +249,29 @@ impl Session {
                     events.damage = events.damage.saturating_add(
                         self.apply_player_damage(impact.damage.clamp(0, u16::MAX as i32) as u16),
                     )
+                }
+                ImpactTarget::Object { cell } => {
+                    if let Some(hit) = self
+                        .objects
+                        .as_mut()
+                        .and_then(|objects| objects.apply_hit(cell, impact.damage))
+                    {
+                        events.object_hits.push((cell, hit.destroyed));
+                        if impact.owner == Owner::Player {
+                            if let (Ok(x), Ok(y)) = (u8::try_from(cell[0]), u8::try_from(cell[1])) {
+                                attempts.extend(self.processes.activate_at("shoot", [x, y]));
+                                if hit.destroyed {
+                                    attempts.extend(self.processes.activate_at("destroy", [x, y]));
+                                }
+                            }
+                        }
+                    }
+                }
+                ImpactTarget::Wall { wall_index } if impact.owner == Owner::Player => {
+                    if let Some(cell) = self.world.walls.get(wall_index).and_then(|wall| wall.cell)
+                    {
+                        attempts.extend(self.processes.activate_at("shoot", cell));
+                    }
                 }
                 ImpactTarget::Actor { source_index } => {
                     if let Some(actor) = self
@@ -278,6 +287,21 @@ impl Session {
                     }
                 }
                 _ => {}
+            }
+        }
+        if let Some(mission) = &mut self.mission {
+            for attempt in attempts {
+                match attempt.outcome {
+                    ProcessOutcome::Accepted => events
+                        .mission
+                        .extend(mission.attempt(attempt.process_id, true)),
+                    ProcessOutcome::Locked => events
+                        .mission
+                        .extend(mission.attempt(attempt.process_id, false)),
+                    ProcessOutcome::Unsupported
+                    | ProcessOutcome::Busy
+                    | ProcessOutcome::Missing => {}
+                }
             }
         }
         events
@@ -485,6 +509,32 @@ mod tests {
             &Script::parse(text),
             Difficulty::Normal,
         ));
+        let mut projectile_session = session.clone();
+        projectile_session.game.inventory.weapons[3] = true;
+        projectile_session.game.inventory.ammo[3] = 1;
+        projectile_session.game.weapons.0[3].rocket_type = 1;
+        projectile_session.rockets.0.push(RocketDefinition {
+            model_name: "disk.3o".into(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 20, 10],
+        });
+        let first = projectile_session.step(SessionInput {
+            fire: true,
+            select_weapon: Some(3),
+            ..SessionInput::default()
+        });
+        assert!(matches!(
+            first.shot,
+            Some(FireResult::Fired(ShotImpact::Launch { .. }))
+        ));
+        let mut projectile_destroyed = false;
+        let mut projectile_completed = false;
+        for _ in 0..30 {
+            let event = projectile_session.step(SessionInput::default());
+            projectile_destroyed |= event.object_hits.contains(&([1, 0], true));
+            projectile_completed |= event.mission.contains(&MissionEvent::LevelComplete);
+        }
+        assert!(projectile_destroyed && projectile_completed);
         let events = session.step(SessionInput {
             fire: true,
             ..SessionInput::default()

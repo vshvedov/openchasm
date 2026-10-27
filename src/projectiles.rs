@@ -6,6 +6,7 @@
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::combat::RocketDefinitions;
 use crate::map::UNITS_PER_TILE;
+use crate::object_combat::ObjectCombat;
 use crate::world::{Wall, World};
 
 const DEFAULT_SPEED: f32 = 6.0; // tiles per second: provisional
@@ -58,6 +59,7 @@ pub enum ImpactTarget {
     Wall { wall_index: usize },
     Actor { source_index: usize },
     Player,
+    Object { cell: [usize; 2] },
     Expired,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -225,6 +227,21 @@ impl ProjectileSystem {
     where
         F: Fn(&Wall) -> bool,
     {
+        self.tick_with_objects(dt, world, actors, definitions, None, blocks_shots)
+    }
+    /// Like tick, also colliding with active shootable level objects.
+    pub fn tick_with_objects<F>(
+        &mut self,
+        dt: f32,
+        world: &World,
+        actors: &ActorState,
+        definitions: &ActorDefinitions,
+        objects: Option<&ObjectCombat>,
+        blocks_shots: F,
+    ) -> Vec<Impact>
+    where
+        F: Fn(&Wall) -> bool,
+    {
         if !dt.is_finite() || dt <= 0.0 {
             return Vec::new();
         }
@@ -239,6 +256,11 @@ impl ProjectileSystem {
                 if let Some(t) = sweep_wall(origin, delta, projectile.radius, wall) {
                     if nearest.is_none_or(|(best, _)| t < best) { nearest = Some((t, ImpactTarget::Wall { wall_index: index })); }
                 }
+            }
+            let length = delta[0].hypot(delta[1]);
+            if let Some(hit) = objects.and_then(|objects| objects.raycast(origin, delta, length, projectile.radius)) {
+                let t = if length > 1e-8 { hit.distance / length } else { 0.0 };
+                if nearest.is_none_or(|(best, _)| t < best) { nearest = Some((t, ImpactTarget::Object { cell: hit.cell })); }
             }
             for actor in &actors.actors {
                 if actor.health <= 0 || !actor.position.iter().all(|x| x.is_finite()) { continue; }

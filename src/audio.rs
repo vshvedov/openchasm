@@ -4,7 +4,9 @@
 //! the rocket type, following the independent PanzerChasm reconstruction.
 //! Unmapped or unavailable samples are silent, as are missing output devices.
 //! Mine arming uses ID 72 and detonation ID 40; placement has no mapped sound.
-//! This initial playback is non-spatial and ignores authored volume metadata.
+//! Enemy attack samples use the documented model-name WAV convention and a
+//! provisional distance-based volume; other sounds are non-spatial. Authored
+//! volume metadata and original spatialization are not yet implemented.
 use crate::content::ResourceSet;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::collections::BTreeMap;
@@ -110,9 +112,78 @@ pub fn gameplay_sound_ids(events: &openchasm::session::SessionEvents, rocket_typ
     ids
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnemySound {
+    Melee,
+    Ranged,
+}
+impl EnemySound {
+    fn slot(self) -> usize {
+        match self {
+            Self::Melee => 0,
+            Self::Ranged => 1,
+        }
+    }
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Melee => "attack",
+            Self::Ranged => "shoot",
+        }
+    }
+}
+
+fn enemy_sound_path(model_name: &str, kind: EnemySound) -> Option<String> {
+    if model_name.is_empty()
+        || model_name == "."
+        || model_name == ".."
+        || model_name.contains(['/', '\\'])
+    {
+        return None;
+    }
+    Some(format!("sound/{}_{}.wav", model_name, kind.suffix()))
+}
+
+// Returns only events with a resolvable actor, finite listener/source, and an
+// audible provisional distance. Source indices are stable placement IDs.
+fn enemy_attack_samples(
+    attacks: &[openchasm::ai::EnemyAttack],
+    actors: &openchasm::actors::ActorState,
+    listener: [f32; 2],
+) -> Vec<(usize, EnemySound, f32)> {
+    use openchasm::ai::EnemyAttackKind;
+    if !listener.iter().all(|value| value.is_finite()) {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    for attack in attacks {
+        let Some(actor) = actors
+            .actors
+            .iter()
+            .find(|actor| actor.source_index == attack.source_index)
+        else {
+            continue;
+        };
+        if !actor.position.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        let distance = (actor.position[0] - listener[0]).hypot(actor.position[1] - listener[1]);
+        if !distance.is_finite() || distance >= 24.0 {
+            continue;
+        }
+        let volume = (1.0 - distance / 24.0).clamp(0.0, 1.0);
+        let sound = match attack.kind {
+            EnemyAttackKind::Melee => EnemySound::Melee,
+            EnemyAttackKind::Ranged { .. } => EnemySound::Ranged,
+        };
+        result.push((actor.definition_index, sound, volume));
+    }
+    result
+}
+
 pub struct Audio {
     sink: Option<MixerDeviceSink>,
     sounds: BTreeMap<u8, Arc<[u8]>>,
+    enemy_sounds: Vec<[Option<Arc<[u8]>>; 2]>,
     music: Option<Player>,
 }
 impl Audio {
@@ -125,6 +196,39 @@ impl Audio {
                 }
             }
         }
+        // Resolve case-insensitively while retaining archive spelling, which
+        // matters on Linux and in user-authored loose resource trees.
+        let paths: BTreeMap<String, String> = resources
+            .names()
+            .filter(|name| name.starts_with("sound/"))
+            .map(|name| (name.to_ascii_lowercase(), name.to_owned()))
+            .collect();
+        let mut enemy_sounds = Vec::new();
+        let mut loaded_bytes = 0usize;
+        if let Ok(definitions) = openchasm::actors::ActorDefinitions::parse(inf) {
+            for definition in definitions.entries {
+                let mut slots: [Option<Arc<[u8]>>; 2] = [None, None];
+                for kind in [EnemySound::Melee, EnemySound::Ranged] {
+                    let Some(path) = enemy_sound_path(&definition.model_name, kind)
+                        .and_then(|name| paths.get(&name.to_ascii_lowercase()))
+                    else {
+                        continue;
+                    };
+                    if loaded_bytes >= 32 * 1024 * 1024 {
+                        continue;
+                    }
+                    if let Ok(bytes) = resources.read(path) {
+                        if bytes.len() <= 2 * 1024 * 1024
+                            && loaded_bytes + bytes.len() <= 32 * 1024 * 1024
+                        {
+                            loaded_bytes += bytes.len();
+                            slots[kind.slot()] = Some(Arc::from(bytes));
+                        }
+                    }
+                }
+                enemy_sounds.push(slots);
+            }
+        }
         let sink = match DeviceSinkBuilder::open_default_sink() {
             Ok(sink) => Some(sink),
             Err(error) => {
@@ -135,9 +239,36 @@ impl Audio {
         Self {
             sink,
             sounds,
+            enemy_sounds,
             music: None,
         }
     }
+    /// Play committed attacks using authored model-name samples. Missing
+    /// actors, files, decoders and audio output are silently ignored.
+    pub fn play_enemy_attacks(
+        &self,
+        attacks: &[openchasm::ai::EnemyAttack],
+        actors: &openchasm::actors::ActorState,
+        listener: [f32; 2],
+    ) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        for (index, kind, volume) in enemy_attack_samples(attacks, actors, listener) {
+            let Some(bytes) = self
+                .enemy_sounds
+                .get(index)
+                .and_then(|slots| slots[kind.slot()].as_ref())
+            else {
+                continue;
+            };
+            if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(bytes))) {
+                player.set_volume(volume);
+                player.detach();
+            }
+        }
+    }
+
     /// Start the level's configured music track if available.
     pub fn play_level_music(&mut self, resources: &mut ResourceSet, resource: &[u8]) {
         let Some(sink) = &self.sink else {
@@ -302,5 +433,83 @@ mod tests {
             assert!(decoder.take(1024).count() > 0);
         }
         assert!(!names.contains_key(&33)); // explicitly blank impact slot
+    }
+    #[test]
+    fn enemy_attack_selection_uses_stable_actor_id_kind_and_distance() {
+        use openchasm::actors::{ActorDefinitions, ActorState};
+        use openchasm::ai::{EnemyAttack, EnemyAttackKind};
+        let defs = ActorDefinitions::parse(
+            b"[MONSTERS]\n2\nhero.car 1 1 1 1 1 1 1 1\nan4.car 1 1 1 1 1 1 1 1\n",
+        )
+        .unwrap();
+        let actor = openchasm::map::Monster {
+            position: [256, 0],
+            id: 101,
+            angle: 0,
+            flags: 7,
+        };
+        let actors = ActorState::from_placements(&[actor], &defs);
+        let attacks = [
+            EnemyAttack {
+                source_index: 0,
+                damage: 1,
+                kind: EnemyAttackKind::Melee,
+            },
+            EnemyAttack {
+                source_index: 0,
+                damage: 1,
+                kind: EnemyAttackKind::Ranged {
+                    rocket_id: 1,
+                    instant: false,
+                    origin: [1.0, 0.0],
+                    target: [0.0, 0.0],
+                },
+            },
+            EnemyAttack {
+                source_index: 7,
+                damage: 1,
+                kind: EnemyAttackKind::Melee,
+            },
+        ];
+        let samples = enemy_attack_samples(&attacks, &actors, [0.0, 0.0]);
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].0, samples[0].1), (1, EnemySound::Melee));
+        assert_eq!((samples[1].0, samples[1].1), (1, EnemySound::Ranged));
+        assert!((samples[0].2 - 23.0 / 24.0).abs() < 0.00001);
+        assert!(enemy_attack_samples(&attacks, &actors, [30.0, 0.0]).is_empty());
+        assert!(enemy_attack_samples(&attacks, &actors, [f32::NAN, 0.0]).is_empty());
+        assert_eq!(
+            enemy_sound_path("SFAG.car", EnemySound::Melee).as_deref(),
+            Some("sound/SFAG.car_attack.wav")
+        );
+        assert_eq!(
+            enemy_sound_path("faust", EnemySound::Ranged).as_deref(),
+            Some("sound/faust_shoot.wav")
+        );
+        assert!(enemy_sound_path("../bad", EnemySound::Melee).is_none());
+    }
+
+    #[test]
+    fn installed_enemy_attack_samples_decode_when_available() {
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/csm.bin"));
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        for (model, kind) in [
+            ("an4.car", EnemySound::Melee),
+            ("faust", EnemySound::Ranged),
+            ("SFAG.car", EnemySound::Melee),
+        ] {
+            let bytes = resources
+                .read(&enemy_sound_path(model, kind).unwrap())
+                .unwrap();
+            let decoder = rodio::Decoder::try_from(Cursor::new(bytes)).unwrap();
+            assert!(decoder.take(1024).count() > 0);
+        }
     }
 }

@@ -499,6 +499,11 @@ pub fn run(
                     eprintln!("explosion visuals skipped: {error}");
                 }
             }
+            audio.play_enemy_attacks(
+                &events.enemy_attacks,
+                &session.actors,
+                session.world.player.position,
+            );
             let rocket_type = session.game.weapons.0[session.selected_weapon].rocket_type;
             for id in crate::audio::gameplay_sound_ids(&events, rocket_type) {
                 audio.play(id);

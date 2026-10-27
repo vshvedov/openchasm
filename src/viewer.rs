@@ -14,7 +14,7 @@ use openchasm::session::{Session, SessionInput};
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::Scancode,
-    mouse::MouseButton,
+    mouse::{MouseButton, MouseWheelDirection},
     pixels::PixelFormatEnum,
 };
 use std::collections::{BTreeSet, HashSet};
@@ -52,6 +52,54 @@ impl RelativeLook {
     fn take_yaw(&mut self) -> f32 {
         let dx = std::mem::take(&mut self.pending_dx).clamp(-100_000, 100_000);
         dx as f32 * MOUSE_SENSITIVITY
+    }
+}
+
+/// Return the next owned weapon with ammunition; simulation still validates
+/// the requested selection. Repeated wheel steps wrap through eligible slots.
+fn cycle_weapon(
+    inventory: &openchasm::inventory::Inventory,
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
+    let count = inventory.weapons.len();
+    if current >= count || delta == 0 {
+        return None;
+    }
+    let eligible = inventory
+        .weapons
+        .iter()
+        .zip(inventory.ammo)
+        .filter(|(owned, ammo)| **owned && *ammo > 0)
+        .count();
+    if eligible == 0 {
+        return None;
+    }
+    let steps = (delta.unsigned_abs() - 1) % eligible as u32 + 1;
+    let mut selection = current;
+    for _ in 0..steps {
+        let mut next = None;
+        for offset in 1..=count {
+            let index = if delta > 0 {
+                (selection + offset) % count
+            } else {
+                (selection + count - offset) % count
+            };
+            if inventory.weapons[index] && inventory.ammo[index] > 0 {
+                next = Some(index);
+                break;
+            }
+        }
+        selection = next?;
+    }
+    Some(selection)
+}
+
+fn fire_feedback(result: Option<FireResult>) -> Option<&'static str> {
+    match result {
+        Some(FireResult::OutOfAmmo) => Some("OUT OF AMMO"),
+        Some(FireResult::Unsupported) => Some("WEAPON NOT AVAILABLE"),
+        _ => None,
     }
 }
 
@@ -210,7 +258,7 @@ fn draw_header(frame: &mut [u32], label: &str) {
         frame,
         8,
         20,
-        "WASD MOVE  MOUSE TURN/FIRE  SPACE/RMB JUMP  E USE  1-8  ESC",
+        "WASD MOVE  MOUSE TURN/FIRE  WHEEL/1-8 WEAPON  SPACE JUMP  E USE",
     );
     text(
         frame,
@@ -322,6 +370,7 @@ pub fn run(
     let mut pending_weapon = None;
     let mut shoot_ticks = 0usize;
     let mut current_message: Option<(Vec<String>, f32)> = None;
+    let mut shot_feedback: Option<(&str, f32)> = None;
     let mut completed = false;
     let number_keys = [
         Scancode::Num1,
@@ -417,6 +466,17 @@ pub fn run(
                     mouse_btn: MouseButton::Left,
                     ..
                 } => mouse_fire = false,
+                Event::MouseWheel { y, direction, .. } if look.focused && look.captured => {
+                    let delta = if direction == MouseWheelDirection::Flipped {
+                        y.saturating_neg()
+                    } else {
+                        y
+                    };
+                    let current = pending_weapon.unwrap_or(session.selected_weapon);
+                    if let Some(next) = cycle_weapon(&session.game.inventory, current, delta) {
+                        pending_weapon = Some(next);
+                    }
+                }
                 Event::MouseMotion { xrel, .. } => look.motion(xrel),
                 _ => {}
             }
@@ -470,6 +530,7 @@ pub fn run(
             shoot_ticks = 0;
             animation_tick = 0;
             current_message = None;
+            shot_feedback = None;
             completed = false;
             look.pending_dx = 0;
         }
@@ -482,6 +543,7 @@ pub fn run(
             // Deltas are motion, not velocity: consume exactly once per tick.
             let yaw_delta = look.take_yaw();
             animation_tick = animation_tick.saturating_add(1);
+            let old_weapon = session.selected_weapon;
             let events = session.step(SessionInput {
                 movement,
                 yaw_delta,
@@ -493,6 +555,21 @@ pub fn run(
             pending_interact = false;
             pending_jump = false;
             pending_weapon = None;
+            if session.selected_weapon != old_weapon {
+                shot_feedback = None;
+            }
+            if let Some((_, remaining)) = &mut shot_feedback {
+                *remaining -= STEP;
+            }
+            if shot_feedback.is_some_and(|(_, remaining)| remaining <= 0.0) {
+                shot_feedback = None;
+            }
+            if let Some(message) = fire_feedback(events.shot) {
+                shot_feedback = Some((message, 1.5));
+            }
+            if matches!(events.shot, Some(FireResult::Fired(_))) {
+                shot_feedback = None;
+            }
             if let Some(renderer) = &mut explosion_renderer {
                 renderer.tick();
                 if let Err(error) = renderer.consume(&events) {
@@ -705,9 +782,10 @@ pub fn run(
             8,
             HEIGHT - 18,
             &format!(
-                "HEALTH {}  ARMOR {}  AMMO {}  KEYS {}{}{}",
+                "HEALTH {}  ARMOR {}  WEAPON {}  AMMO {}  KEYS {}{}{}",
                 inventory.health,
                 inventory.armor,
+                session.selected_weapon + 1,
                 inventory.ammo[session.selected_weapon],
                 if inventory.keys[0] { "R" } else { "-" },
                 if inventory.keys[1] { "G" } else { "-" },
@@ -718,6 +796,9 @@ pub fn run(
             for (row, line) in lines.iter().enumerate().take(6) {
                 text(&mut frame, 8, 52 + row * 10, line);
             }
+        }
+        if let Some((message, _)) = shot_feedback {
+            text(&mut frame, 8, HEIGHT - 42, message);
         }
         if completed {
             text(
@@ -997,5 +1078,39 @@ mod tests {
         assert!(scripted_object_visible(7, None));
         assert!(!scripted_object_visible(1, Some(true)));
         assert!(!scripted_object_visible(1, None));
+    }
+    #[test]
+    fn wheel_cycles_owned_nonempty_weapons_and_wraps() {
+        let inventory = openchasm::inventory::Inventory {
+            health: 100,
+            armor: 0,
+            weapons: [true, true, false, true, false, false, false, true],
+            ammo: [3, 0, 9, 2, 0, 0, 0, 1],
+            keys: [false; 3],
+        };
+        assert_eq!(cycle_weapon(&inventory, 0, 1), Some(3));
+        assert_eq!(cycle_weapon(&inventory, 0, -1), Some(7));
+        assert_eq!(cycle_weapon(&inventory, 0, 2), Some(7));
+        assert_eq!(cycle_weapon(&inventory, 7, 1), Some(0));
+        assert_eq!(cycle_weapon(&inventory, 0, 9), Some(0));
+        assert_eq!(cycle_weapon(&inventory, 0, 0), None);
+        assert_eq!(cycle_weapon(&inventory, 8, 1), None);
+        let mut empty = inventory;
+        empty.ammo = [0; 8];
+        assert_eq!(cycle_weapon(&empty, 0, 1), None);
+    }
+
+    #[test]
+    fn feedback_reports_failures_without_treating_cooldown_as_failure() {
+        assert_eq!(
+            fire_feedback(Some(FireResult::OutOfAmmo)),
+            Some("OUT OF AMMO")
+        );
+        assert_eq!(
+            fire_feedback(Some(FireResult::Unsupported)),
+            Some("WEAPON NOT AVAILABLE")
+        );
+        assert_eq!(fire_feedback(Some(FireResult::CoolingDown)), None);
+        assert_eq!(fire_feedback(None), None);
     }
 }

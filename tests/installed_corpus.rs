@@ -27,6 +27,25 @@ fn installed_archive_parses_game_data() {
         return;
     }
     let mut archive = archive::Archive::open(&path).expect("open installed resource archive");
+    let info = archive.read("chasm.inf").expect("read game definitions");
+    let weapons =
+        openchasm::inventory::WeaponDefinitions::parse(&info).expect("parse weapon definitions");
+    let mut inventory = openchasm::inventory::Inventory::new(&weapons);
+    assert_eq!(inventory.ammo[0], weapons.0[0].ammo_limit);
+    let pickup = inventory.pickup(22, &weapons);
+    assert_eq!(
+        pickup,
+        openchasm::inventory::PickupOutcome::Collected(openchasm::inventory::Pickup::Ammo(1))
+    );
+    assert_eq!(
+        inventory.ammo[1],
+        weapons.0[1]
+            .ammo_per_portion
+            .saturating_mul(2)
+            .min(weapons.0[1].ammo_limit)
+    );
+    let definitions =
+        openchasm::actors::ActorDefinitions::parse(&info).expect("parse actor definitions");
     let names: Vec<String> = archive.names().map(str::to_owned).collect();
     let mut maps = 0;
     let mut textures = 0;
@@ -37,6 +56,13 @@ fn installed_archive_parses_game_data() {
         if let Some(id) = name.strip_prefix("map/map.") {
             let bytes = archive.read(&name).unwrap();
             let map = map::Map::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let shared_map = openchasm::map::Map::parse(&bytes).unwrap();
+            let actors =
+                openchasm::actors::ActorState::from_placements(&shared_map.monsters, &definitions);
+            assert!(
+                actors.unresolved.is_empty(),
+                "{name} contains unresolved actor IDs"
+            );
             assert!(
                 map.monsters
                     .iter()

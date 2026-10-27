@@ -123,6 +123,8 @@ pub enum ShotImpact {
         distance: f32,
     },
     Miss,
+    /// A mine placement was requested; the session validates and plants it.
+    MinePlaced,
     /// Spawn a physical projectile with this rocket definition.
     Launch {
         rocket_id: usize,
@@ -172,6 +174,33 @@ impl Combat {
         }
     }
 
+    /// Consume one mine and start its cooldown before session placement. The
+    /// session must refund ammo and cancel cooldown if placement fails.
+    pub fn plant_mine(
+        &mut self,
+        inventory: &mut Inventory,
+        weapons: &WeaponDefinitions,
+        position: [f32; 2],
+    ) -> FireResult {
+        const SLOT: usize = 6;
+        if !inventory.weapons[SLOT] {
+            return FireResult::NotOwned;
+        }
+        if self.cooldown > 0.0 {
+            return FireResult::CoolingDown;
+        }
+        if inventory.ammo[SLOT] == 0 {
+            return FireResult::OutOfAmmo;
+        }
+        if !position.iter().all(|v| v.is_finite()) {
+            return FireResult::InvalidShooter;
+        }
+        inventory.ammo[SLOT] -= 1;
+        self.cooldown =
+            (weapons.0[SLOT].reload_time as f32 / RELOAD_UNITS_PER_SECOND).max(MIN_COOLDOWN);
+        FireResult::Fired(ShotImpact::MinePlaced)
+    }
+
     /// Resolve a first-pass horizontal hitscan shot from the player. The caller
     /// supplies material-specific shot collision rules independently of movement.
     /// A shot consumes one ammo; pellets hit the same ray for now. Cooldown is
@@ -216,6 +245,9 @@ impl Combat {
         }
         if self.cooldown > 0.0 {
             return FireResult::CoolingDown;
+        }
+        if weapon == 6 {
+            return FireResult::Unsupported;
         }
         let Some(rocket) = usize::try_from(spec.rocket_type)
             .ok()

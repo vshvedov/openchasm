@@ -2,7 +2,10 @@
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpact};
-use crate::explosives::{self, Cylinder, DamageEvent, Explosion, ExplosionTarget, TargetId};
+use crate::explosives::{
+    self, Cylinder, DamageEvent, Explosion, ExplosionTarget, Mine, MineEvent, MineSystem,
+    MineTrigger, TargetId,
+};
 use crate::game::GameInventory;
 use crate::hazards::{HazardDamage, HazardTarget, Hazards};
 use crate::mission::{MissionEvent, MissionPlan, MissionState};
@@ -55,6 +58,8 @@ pub struct SessionEvents {
     /// Impact explosions and raw pre-armor damage, in deterministic order.
     pub explosions: Vec<Explosion>,
     pub explosion_damage: Vec<DamageEvent>,
+    /// Stable mine lifecycle events for presentation and networking.
+    pub mine_events: Vec<MineEvent>,
     /// Object cell and whether it was destroyed by this hit.
     pub object_hits: Vec<([usize; 2], bool)>,
     /// Ordered committed model replacements; the host must apply before next tick.
@@ -136,6 +141,8 @@ pub struct Session {
     pub projectiles: ProjectileSystem,
     explosions_enabled: bool,
     projectile_heights: BTreeMap<u64, f32>,
+    mines_enabled: bool,
+    mines: MineSystem,
     pub objects: Option<ObjectCombat>,
     pub scripted_objects: Option<ScriptedObjects>,
     pub mission: Option<MissionState>,
@@ -181,6 +188,8 @@ impl Session {
             projectiles: ProjectileSystem::new(),
             explosions_enabled: false,
             projectile_heights: BTreeMap::new(),
+            mines_enabled: false,
+            mines: MineSystem::new(),
             objects: None,
             scripted_objects: None,
             mission: None,
@@ -196,6 +205,15 @@ impl Session {
     /// must consume explosion events and synchronize resulting object changes.
     pub fn set_explosions_enabled(&mut self, enabled: bool) {
         self.explosions_enabled = enabled;
+    }
+
+    /// Enable provisional slot-6 mine placement. Restart snapshots clone mines.
+    pub fn set_mines_enabled(&mut self, enabled: bool) {
+        self.mines_enabled = enabled;
+    }
+    /// Stable authoritative snapshot for presenting or synchronizing mines.
+    pub fn mines(&self) -> &[Mine] {
+        self.mines.active()
     }
 
     /// Install shootable object state before taking the restart snapshot.
@@ -343,10 +361,10 @@ impl Session {
     fn apply_explosion(
         &mut self,
         explosion: Explosion,
-        impact: Impact,
+        impact: Option<ImpactTarget>,
         events: &mut SessionEvents,
         attempts: &mut Vec<ProcessEvent>,
-    ) {
+    ) -> bool {
         let mut targets = vec![ExplosionTarget {
             id: TargetId::Player,
             cylinder: Cylinder {
@@ -387,7 +405,7 @@ impl Session {
             }));
         }
         let Ok(damage) = explosives::resolve_explosion(explosion, &targets) else {
-            return;
+            return false;
         };
         let before = self.clone();
         let attempt_count = attempts.len();
@@ -396,9 +414,9 @@ impl Session {
         let quake_count = events.quake_changes.len();
         let previous_damage = events.damage;
         // Contact still dispatches shoot links, independently of blast targets.
-        let hit_cell = match impact.target {
-            ImpactTarget::Object { cell } => Some([cell[0] as u8, cell[1] as u8]),
-            ImpactTarget::Wall { wall_index } => {
+        let hit_cell = match impact {
+            Some(ImpactTarget::Object { cell }) => Some([cell[0] as u8, cell[1] as u8]),
+            Some(ImpactTarget::Wall { wall_index }) => {
                 self.world.walls.get(wall_index).and_then(|wall| wall.cell)
             }
             _ => None,
@@ -448,7 +466,7 @@ impl Session {
                             events.object_transitions.truncate(transition_count);
                             events.quake_changes.truncate(quake_count);
                             events.damage = previous_damage;
-                            return;
+                            return false;
                         }
                         attempts.extend(destroy_attempts);
                         if !events.object_transitions[transition_count..]
@@ -464,6 +482,68 @@ impl Session {
         }
         events.explosions.push(explosion);
         events.explosion_damage.extend(damage);
+        true
+    }
+
+    fn tick_mines(&mut self, events: &mut SessionEvents, attempts: &mut Vec<ProcessEvent>) {
+        if !self.mines_enabled || self.mines.active().is_empty() {
+            return;
+        }
+        let mut triggers = Vec::new();
+        if self.game.inventory.health > 0 {
+            triggers.push(MineTrigger {
+                id: TargetId::Player,
+                position: self.world.player.position,
+                radius: 0.18,
+            });
+        }
+        triggers.extend(self.actors.actors.iter().filter_map(|actor| {
+            if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive) {
+                return None;
+            }
+            let definition = self.actor_definitions.entries.get(actor.definition_index)?;
+            Some(MineTrigger {
+                id: TargetId::Actor {
+                    source_index: actor.source_index,
+                },
+                position: actor.position,
+                radius: (definition.wall_radius as f32 / 256.0).clamp(0.05, 2.0),
+            })
+        }));
+        let mut staged = self.mines.clone();
+        let Ok(mine_events) = staged.tick(&triggers) else {
+            return;
+        };
+        if mine_events
+            .iter()
+            .any(|event| matches!(event, MineEvent::Detonated { .. }))
+        {
+            let before = self.clone();
+            let attempt_count = attempts.len();
+            let hit_count = events.object_hits.len();
+            let transition_count = events.object_transitions.len();
+            let quake_count = events.quake_changes.len();
+            let explosions_count = events.explosions.len();
+            let damage_count = events.explosion_damage.len();
+            let previous_damage = events.damage;
+            for event in &mine_events {
+                if let MineEvent::Detonated { explosion, .. } = event {
+                    if !self.apply_explosion(*explosion, None, events, attempts) {
+                        *self = before;
+                        attempts.truncate(attempt_count);
+                        events.object_hits.truncate(hit_count);
+                        events.object_transitions.truncate(transition_count);
+                        events.quake_changes.truncate(quake_count);
+                        events.explosions.truncate(explosions_count);
+                        events.explosion_damage.truncate(damage_count);
+                        events.damage = previous_damage;
+                        return;
+                    }
+                }
+            }
+        }
+        self.mines = staged;
+        events.mine_events.extend(mine_events);
     }
 
     /// Attach a freshly parsed mission before taking the session's restart snapshot.
@@ -808,6 +888,7 @@ impl Session {
         // Process-owned object positions must be applied before this tick's
         // hitscan or projectile queries and before enemy simulation.
         events.process_effects.extend(self.apply_process_effects());
+        self.tick_mines(&mut events, &mut attempts);
         self.combat.tick(DT);
         if input.fire {
             let object_before_hit = self.scripted_objects.as_ref().and(self.objects.clone());
@@ -817,27 +898,51 @@ impl Session {
                 .as_ref()
                 .map(|_| self.processes.clone());
             let attempts_before_hit = attempts.len();
-            let mut shot = self.combat.fire_with_explosions(
-                self.selected_weapon,
-                ShotContext {
-                    inventory: &mut self.game.inventory,
-                    weapons: &self.game.weapons,
-                    rockets: &self.rockets,
-                    actors: &mut self.actors,
-                    definitions: &self.actor_definitions,
-                    world: &self.world,
-                    objects: self.objects.as_mut(),
-                },
-                |wall| {
-                    Self::blocks_shot(
-                        wall,
-                        &self.shot_blocking,
-                        &self.elevation_by_cell,
-                        self.vertical.eye(),
-                    )
-                },
-                self.explosions_enabled,
-            );
+            let mut shot = if self.mines_enabled && self.selected_weapon == 6 {
+                self.combat.plant_mine(
+                    &mut self.game.inventory,
+                    &self.game.weapons,
+                    self.world.player.position,
+                )
+            } else {
+                self.combat.fire_with_explosions(
+                    self.selected_weapon,
+                    ShotContext {
+                        inventory: &mut self.game.inventory,
+                        weapons: &self.game.weapons,
+                        rockets: &self.rockets,
+                        actors: &mut self.actors,
+                        definitions: &self.actor_definitions,
+                        world: &self.world,
+                        objects: self.objects.as_mut(),
+                    },
+                    |wall| {
+                        Self::blocks_shot(
+                            wall,
+                            &self.shot_blocking,
+                            &self.elevation_by_cell,
+                            self.vertical.eye(),
+                        )
+                    },
+                    self.explosions_enabled,
+                )
+            };
+            if matches!(shot, FireResult::Fired(ShotImpact::MinePlaced)) {
+                let floor = self.player_bounds().floor;
+                let position = [
+                    self.world.player.position[0],
+                    self.world.player.position[1],
+                    floor,
+                ];
+                match self.mines.plant(Owner::Player, position) {
+                    Ok(event) => events.mine_events.push(event),
+                    Err(_) => {
+                        self.game.inventory.ammo[6] = self.game.inventory.ammo[6].saturating_add(1);
+                        self.combat.cancel_shot();
+                        shot = FireResult::Unsupported;
+                    }
+                }
+            }
             match shot {
                 FireResult::Fired(ShotImpact::Object {
                     cell,
@@ -979,7 +1084,7 @@ impl Session {
                     radius: radius_raw as f32 / 256.0,
                     damage: impact.damage,
                 };
-                self.apply_explosion(explosion, impact, &mut events, &mut attempts);
+                self.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
                 continue;
             }
             match impact.target {
@@ -2566,7 +2671,7 @@ mod tests {
         };
         let mut events = SessionEvents::default();
         let mut attempts = Vec::new();
-        session.apply_explosion(explosion, impact, &mut events, &mut attempts);
+        session.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
         assert_eq!(session.actors.actors[0].health, 70);
         assert_eq!(
             events
@@ -2655,6 +2760,38 @@ mod tests {
             &script,
             false,
         ));
+        let mut mined = session.clone();
+        mined.set_mines_enabled(true);
+        mined.world.player.position = [1.5, 0.5];
+        mined.mines.plant(Owner::Player, [1.5, 0.5, 0.0]).unwrap();
+        let mut mine_events = SessionEvents::default();
+        let mut mine_attempts = Vec::new();
+        for _ in 0..explosives::MINE_ARM_TICKS {
+            mined.tick_mines(&mut mine_events, &mut mine_attempts);
+        }
+        assert_eq!(mined.mines()[0].age_ticks, explosives::MINE_ARM_TICKS - 1);
+        assert_eq!(mined.game.inventory.health, 100);
+        assert!(mine_events.mine_events.is_empty());
+        assert!(mine_events.explosions.is_empty());
+        assert_eq!(
+            mined.objects.as_ref().unwrap().is_active([1, 0]),
+            Some(true)
+        );
+        mined
+            .scripted_objects
+            .as_mut()
+            .unwrap()
+            .manifest
+            .allow([3, 0], 165);
+        mined.tick_mines(&mut mine_events, &mut mine_attempts);
+        assert!(mined.mines().is_empty());
+        assert_eq!(mine_events.explosions.len(), 1);
+        assert_eq!(mine_events.object_hits, vec![([1, 0], true)]);
+        assert!(!mined
+            .processes
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, ProcessEffect::PlayAnimation { object_id: 99 })));
         let explosion = Explosion {
             owner: Owner::Player,
             center: [1.5, 0.5, 0.75],
@@ -2672,7 +2809,7 @@ mod tests {
         };
         let mut events = SessionEvents::default();
         let mut attempts = Vec::new();
-        session.apply_explosion(explosion, impact, &mut events, &mut attempts);
+        session.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
         assert_eq!(session.game.inventory.health, 100);
         assert_eq!(
             session.objects.as_ref().unwrap().is_active([1, 0]),
@@ -2689,7 +2826,7 @@ mod tests {
             .unwrap()
             .manifest
             .allow([3, 0], 165);
-        session.apply_explosion(explosion, impact, &mut events, &mut attempts);
+        session.apply_explosion(explosion, Some(impact.target), &mut events, &mut attempts);
         assert!(session.game.inventory.health < 100);
         assert_eq!(
             session.objects.as_ref().unwrap().is_active([1, 0]),
@@ -2767,5 +2904,102 @@ mod tests {
             .active()
             .iter()
             .any(|p| p.owner == Owner::Enemy { source_index: 7 }));
+    }
+    #[test]
+    fn opt_in_mine_places_arms_detonates_and_hurts_owner() {
+        let mut session = mission_session("");
+        session.game.inventory.weapons[6] = true;
+        session.game.inventory.ammo[6] = 2;
+        session.game.weapons.0[6].reload_time = 112;
+        session.set_mines_enabled(true);
+        let placed = session.step(SessionInput {
+            fire: true,
+            select_weapon: Some(6),
+            ..Default::default()
+        });
+        assert_eq!(placed.shot, Some(FireResult::Fired(ShotImpact::MinePlaced)));
+        assert!(matches!(
+            &placed.mine_events[..],
+            [MineEvent::Placed(Mine {
+                id: 0,
+                age_ticks: 0,
+                ..
+            })]
+        ));
+        assert_eq!(session.game.inventory.ammo[6], 1);
+        let cooling = session.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert_eq!(cooling.shot, Some(FireResult::CoolingDown));
+        assert_eq!(session.mines()[0].age_ticks, 1);
+        for _ in 1..explosives::MINE_ARM_TICKS - 1 {
+            assert!(session.step(SessionInput::default()).mine_events.is_empty());
+        }
+        let detonation = session.step(SessionInput::default());
+        assert!(matches!(
+            &detonation.mine_events[..],
+            [
+                MineEvent::Armed { id: 0 },
+                MineEvent::Detonated { id: 0, .. }
+            ]
+        ));
+        assert_eq!(detonation.explosions.len(), 1);
+        assert!(detonation.damage > 0 && session.game.inventory.health < 100);
+        assert!(session.mines().is_empty());
+        assert!(session.step(SessionInput::default()).mine_events.is_empty());
+    }
+    #[test]
+    fn rejected_mine_placement_refunds_ammo_and_cooldown() {
+        let mut invalid = mission_session("");
+        invalid.set_mines_enabled(true);
+        invalid.game.inventory.weapons[6] = true;
+        invalid.game.inventory.ammo[6] = 1;
+        invalid.world.player.position = [64.0, 1.0];
+        let event = invalid.step(SessionInput {
+            fire: true,
+            select_weapon: Some(6),
+            ..Default::default()
+        });
+        assert_eq!(event.shot, Some(FireResult::Unsupported));
+        assert_eq!(invalid.game.inventory.ammo[6], 1);
+        assert_eq!(invalid.combat.cooldown(), 0.0);
+        assert!(invalid.mines().is_empty());
+        let mut full = mission_session("");
+        full.set_mines_enabled(true);
+        full.game.inventory.weapons[6] = true;
+        full.game.inventory.ammo[6] = 1;
+        for _ in 0..explosives::MAX_MINES {
+            full.mines.plant(Owner::Player, [0.0, 0.0, 0.0]).unwrap();
+        }
+        let event = full.step(SessionInput {
+            fire: true,
+            select_weapon: Some(6),
+            ..Default::default()
+        });
+        assert_eq!(event.shot, Some(FireResult::Unsupported));
+        assert_eq!(full.game.inventory.ammo[6], 1);
+        assert_eq!(full.combat.cooldown(), 0.0);
+        assert_eq!(full.mines().len(), explosives::MAX_MINES);
+    }
+    #[test]
+    fn mine_expires_without_trigger_and_restart_clone_retains_snapshot() {
+        let mut session = mission_session("");
+        session.set_mines_enabled(true);
+        session
+            .mines
+            .plant(Owner::Player, [10.0, 10.0, 0.0])
+            .unwrap();
+        let snapshot = session.clone();
+        let mut events = SessionEvents::default();
+        let mut attempts = Vec::new();
+        for _ in 0..explosives::MINE_EXPIRE_TICKS {
+            session.tick_mines(&mut events, &mut attempts);
+        }
+        assert_eq!(session.mines()[0].age_ticks, explosives::MINE_EXPIRE_TICKS);
+        session.tick_mines(&mut events, &mut attempts);
+        assert!(events.mine_events.contains(&MineEvent::Expired { id: 0 }));
+        assert!(session.mines().is_empty());
+        assert_eq!(snapshot.mines()[0].age_ticks, 0);
     }
 }

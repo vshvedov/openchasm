@@ -127,6 +127,7 @@ struct RuntimeProcess {
     lock_changes: Vec<(u16, bool)>,
     supported: bool,
     required_keys: [bool; 3],
+    mission_effect: bool,
 }
 
 fn property_float(process: &Process, name: &str, default: f32) -> f32 {
@@ -146,7 +147,30 @@ impl RuntimeProcess {
         let mut waitout = Vec::new();
         let mut lock_changes = Vec::new();
         let mut supported = true;
+        let has_end_delay = process.properties.iter().any(|cmd| {
+            cmd.name == "enddelay"
+                && cmd.arguments.len() == 1
+                && cmd.arguments[0]
+                    .parse::<f32>()
+                    .is_ok_and(|value| value.is_finite() && value > 0.0)
+        });
+        let has_message = process.properties.iter().any(|cmd| {
+            matches!(cmd.name.as_str(), "onmessage" | "firstmessage")
+                && cmd.arguments.len() == 1
+                && cmd.arguments[0]
+                    .parse::<u16>()
+                    .is_ok_and(|value| value != 0)
+        });
         for action in &process.actions {
+            // An exit-only animation is a presentation placeholder. Do not
+            // generalize this to arbitrary state-changing animation scripts.
+            if action.name == "playani"
+                && has_end_delay
+                && action.arguments.len() == 1
+                && action.arguments[0].parse::<u16>().is_ok()
+            {
+                continue;
+            }
             if matches!(action.name.as_str(), "lock" | "unlock") {
                 if action.arguments.len() != 1 {
                     supported = false;
@@ -287,19 +311,23 @@ impl RuntimeProcess {
             lock_changes,
             supported,
             required_keys,
+            mission_effect: has_end_delay || has_message,
         }
     }
-    fn trigger(&mut self, keys: [bool; 3]) -> Option<Vec<(u16, bool)>> {
+    fn trigger(&mut self, keys: [bool; 3]) -> Result<Vec<(u16, bool)>, ProcessOutcome> {
         if self.locked
             || self
                 .required_keys
                 .iter()
                 .zip(keys)
                 .any(|(required, owned)| *required && !owned)
-            || !self.supported
-            || (self.motions.is_empty() && self.lock_changes.is_empty())
         {
-            return None;
+            return Err(ProcessOutcome::Locked);
+        }
+        if !self.supported
+            || (self.motions.is_empty() && self.lock_changes.is_empty() && !self.mission_effect)
+        {
+            return Err(ProcessOutcome::Unsupported);
         }
         match self.phase {
             Phase::Closed => {
@@ -310,14 +338,14 @@ impl RuntimeProcess {
                         Phase::Opening
                     };
                 }
-                Some(self.lock_changes.clone())
+                Ok(self.lock_changes.clone())
             }
             Phase::Open if !self.motions.is_empty() => {
                 self.phase = Phase::Closing;
                 self.open_time = 0.0;
-                Some(Vec::new())
+                Ok(Vec::new())
             }
-            _ => None,
+            _ => Err(ProcessOutcome::Busy),
         }
     }
     fn tick(&mut self, world: &mut World, dt: f32) {
@@ -378,6 +406,22 @@ impl RuntimeProcess {
     }
 }
 
+/// A real activation attempt, classified so callers can distinguish a locked
+/// message from an unsupported script or a process that is still moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutcome {
+    Accepted,
+    Locked,
+    Unsupported,
+    Busy,
+    Missing,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessEvent {
+    pub process_id: u16,
+    pub outcome: ProcessOutcome,
+}
+
 /// Process state can be ticked by a client or a headless authoritative server.
 /// The owning world's wall vector must retain its original order and length.
 #[derive(Clone)]
@@ -415,24 +459,39 @@ impl ProcessRuntime {
         self.keys = keys;
     }
 
-    fn trigger(&mut self, id: u16) {
-        let changes = self
-            .processes
-            .get_mut(&id)
-            .and_then(|process| process.trigger(self.keys))
-            .unwrap_or_default();
-        for (target, locked) in changes {
-            if let Some(process) = self.processes.get_mut(&target) {
-                process.locked = locked;
+    fn trigger(&mut self, id: u16) -> ProcessEvent {
+        let result = match self.processes.get_mut(&id) {
+            Some(process) => process.trigger(self.keys),
+            None => Err(ProcessOutcome::Missing),
+        };
+        let outcome = match result {
+            Ok(changes) => {
+                for (target, locked) in changes {
+                    if let Some(process) = self.processes.get_mut(&target) {
+                        process.locked = locked;
+                    }
+                }
+                ProcessOutcome::Accepted
             }
+            Err(outcome) => outcome,
+        };
+        ProcessEvent {
+            process_id: id,
+            outcome,
         }
     }
     /// Call after movement once per simulation step. `interact_pressed` must be
     /// true on the press edge only, not every frame while the key is held.
-    pub fn tick(&mut self, world: &mut World, dt: f32, interact_pressed: bool) {
+    pub fn tick(
+        &mut self,
+        world: &mut World,
+        dt: f32,
+        interact_pressed: bool,
+    ) -> Vec<ProcessEvent> {
         if !dt.is_finite() || dt <= 0.0 {
-            return;
+            return Vec::new();
         }
+        let mut events = Vec::new();
         let p = world.player.position;
         let floor = if p[0].is_finite()
             && p[1].is_finite()
@@ -454,7 +513,7 @@ impl ProcessRuntime {
                     .map(|trigger| trigger.process)
                     .collect();
                 for id in processes {
-                    self.trigger(id);
+                    events.push(self.trigger(id));
                 }
             }
             self.previous_floor = floor;
@@ -474,12 +533,13 @@ impl ProcessRuntime {
                 .filter(|(_, distance)| *distance <= USE_RANGE * USE_RANGE)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((id, _)) = nearest {
-                self.trigger(id);
+                events.push(self.trigger(id));
             }
         }
         for process in self.processes.values_mut() {
             process.tick(world, dt);
         }
+        events
     }
 }
 
@@ -506,6 +566,61 @@ mod tests {
     fn tick_for(runtime: &mut ProcessRuntime, world: &mut World, time: f32) {
         for _ in 0..(time * 60.0).round() as usize {
             runtime.tick(world, 1.0 / 60.0, false);
+        }
+    }
+    #[test]
+    fn reports_accepted_locked_unsupported_and_busy_attempts() {
+        let script = Script::parse("#proc1\nEndDelay 1\n#end\n#proc2\nLock\nEndDelay 1\n#end\n#proc3\nEndDelay 1\n#action\nrotate 1 0 1 1\n#end\n#proc4\n#action\nmove 1 0 256 0\n#end\n#links\nlink 0 0 1\nlink 1 0 2\nlink 2 0 3\nlink 3 0 4\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        world.player.position = [0.5, 0.5];
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        world.player.position = [1.5, 0.5];
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
+            ProcessOutcome::Locked
+        );
+        world.player.position = [2.5, 0.5];
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
+            ProcessOutcome::Unsupported
+        );
+        world.player.position = [3.5, 0.5];
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
+            ProcessOutcome::Accepted
+        );
+        assert_eq!(
+            runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
+            ProcessOutcome::Busy
+        );
+    }
+    #[test]
+    fn playani_is_accepted_only_for_well_formed_end_process() {
+        for (body, expected) in [
+            ("EndDelay 1\n#action\nplayani 8", ProcessOutcome::Accepted),
+            (
+                "EndDelay 1\n#action\nplayani 8\nchange 1 0 2",
+                ProcessOutcome::Unsupported,
+            ),
+            ("#action\nplayani 8", ProcessOutcome::Unsupported),
+            (
+                "EndDelay 1\n#action\nplayani invalid",
+                ProcessOutcome::Unsupported,
+            ),
+        ] {
+            let script =
+                Script::parse(&format!("#proc1\n{body}\n#end\n#links\nlink 0 0 1\n#end\n"));
+            let mut world = world();
+            let mut runtime = ProcessRuntime::new(&script, &world);
+            assert_eq!(
+                runtime.tick(&mut world, 1.0 / 60.0, true)[0].outcome,
+                expected,
+                "{body}"
+            );
         }
     }
     #[test]

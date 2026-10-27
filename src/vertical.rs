@@ -105,7 +105,68 @@ pub struct VerticalState {
     grounded: bool,
     config: VerticalConfig,
 }
+/// Mutable vertical values. Physics configuration is supplied by the freshly
+/// reconstructed level and deliberately is not stored here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalSnapshot {
+    pub feet: f32,
+    pub velocity: f32,
+    pub grounded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalSnapshotError {
+    InvalidValue,
+    InvalidBounds,
+    OutsideBounds,
+    InvalidGroundedState,
+}
+
 impl VerticalState {
+    pub fn snapshot(&self) -> VerticalSnapshot {
+        VerticalSnapshot {
+            feet: self.feet,
+            velocity: self.velocity,
+            grounded: self.grounded,
+        }
+    }
+    /// Validate against the current physics config and loaded map planes.
+    pub fn restore(
+        &mut self,
+        value: VerticalSnapshot,
+        bounds: VerticalBounds,
+    ) -> Result<(), VerticalSnapshotError> {
+        if !value.feet.is_finite()
+            || !value.velocity.is_finite()
+            || value.velocity.abs() > self.config.max_speed + GROUND_EPSILON
+        {
+            return Err(VerticalSnapshotError::InvalidValue);
+        }
+        if !bounds.floor.is_finite()
+            || bounds
+                .ceiling
+                .is_some_and(|z| !z.is_finite() || z - bounds.floor < self.config.body_height)
+        {
+            return Err(VerticalSnapshotError::InvalidBounds);
+        }
+        if value.feet < bounds.floor - GROUND_EPSILON
+            || bounds
+                .ceiling
+                .is_some_and(|z| value.feet + self.config.body_height > z + GROUND_EPSILON)
+        {
+            return Err(VerticalSnapshotError::OutsideBounds);
+        }
+        if value.grounded
+            && ((value.feet - bounds.floor).abs() > GROUND_EPSILON
+                || value.velocity.abs() > GROUND_EPSILON)
+        {
+            return Err(VerticalSnapshotError::InvalidGroundedState);
+        }
+        self.feet = value.feet;
+        self.velocity = value.velocity;
+        self.grounded = value.grounded;
+        Ok(())
+    }
     pub fn new(floor: f32) -> Result<Self, VerticalError> {
         Self::with_config(floor, VerticalConfig::default())
     }
@@ -235,6 +296,36 @@ impl VerticalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_restores_jump_and_rejects_impossible_state_atomically() {
+        let bounds = VerticalBounds::flat_room();
+        let mut source = VerticalState::new(0.0).unwrap();
+        source.step(1.0 / 60.0, true, bounds).unwrap();
+        let snapshot = source.snapshot();
+        let mut restored = VerticalState::new(0.0).unwrap();
+        restored.restore(snapshot, bounds).unwrap();
+        assert_eq!(restored, source);
+        for _ in 0..20 {
+            source.step(1.0 / 60.0, false, bounds).unwrap();
+            restored.step(1.0 / 60.0, false, bounds).unwrap();
+        }
+        assert_eq!(restored, source);
+        let before = restored;
+        let mut invalid = snapshot;
+        invalid.feet = f32::NAN;
+        assert_eq!(
+            restored.restore(invalid, bounds),
+            Err(VerticalSnapshotError::InvalidValue)
+        );
+        assert_eq!(restored, before);
+        invalid = snapshot;
+        invalid.grounded = true;
+        assert_eq!(
+            restored.restore(invalid, bounds),
+            Err(VerticalSnapshotError::InvalidGroundedState)
+        );
+        assert_eq!(restored, before);
+    }
     #[test]
     fn jump_rises_then_lands_with_reference_scale_and_camera_height() {
         let mut player = VerticalState::new(0.0).unwrap();

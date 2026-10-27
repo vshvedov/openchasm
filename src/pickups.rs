@@ -7,6 +7,7 @@
 //! multiplayer respawns remain to be validated against the original game.
 use crate::inventory::{Inventory, Pickup, PickupOutcome, WeaponDefinitions};
 use crate::objects::{ObjectDefinitions, ObjectInstance, ObjectKind};
+use std::collections::{BTreeMap, BTreeSet};
 
 const ITEM_RADIUS: f32 = 100.0 / 256.0;
 const PLAYER_RADIUS: f32 = 60.0 / 256.0;
@@ -55,7 +56,92 @@ pub struct Pickups {
     candidates: Vec<Candidate>,
 }
 
+/// Only mutable pickup state; action codes, radii and difficulty come from
+/// freshly loaded level content, keyed by the original map cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickupSnapshot {
+    pub cell: [u8; 2],
+    pub position: [f32; 2],
+    pub script_enabled: bool,
+    pub collected: bool,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickupsSnapshot {
+    pub entries: Vec<PickupSnapshot>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickupsSnapshotError {
+    InvalidCell,
+    DuplicateCell,
+    CountMismatch,
+    MissingCell,
+    InvalidPosition,
+}
+
 impl Pickups {
+    pub fn snapshot(&self) -> Result<PickupsSnapshot, PickupsSnapshotError> {
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::with_capacity(self.candidates.len());
+        for candidate in &self.candidates {
+            let [x, y] = candidate.cell;
+            if x >= 64 || y >= 64 {
+                return Err(PickupsSnapshotError::InvalidCell);
+            }
+            let cell = [x as u8, y as u8];
+            if !seen.insert(cell) {
+                return Err(PickupsSnapshotError::DuplicateCell);
+            }
+            if !candidate.position.iter().all(|v| v.is_finite()) {
+                return Err(PickupsSnapshotError::InvalidPosition);
+            }
+            entries.push(PickupSnapshot {
+                cell,
+                position: candidate.position,
+                script_enabled: candidate.script_enabled,
+                collected: candidate.collected,
+            });
+        }
+        Ok(PickupsSnapshot { entries })
+    }
+    /// Validate the entire saved cell set before applying any changes.
+    pub fn restore(&mut self, snapshot: &PickupsSnapshot) -> Result<(), PickupsSnapshotError> {
+        if snapshot.entries.len() != self.candidates.len() {
+            return Err(PickupsSnapshotError::CountMismatch);
+        }
+        let mut saved = BTreeMap::new();
+        for entry in &snapshot.entries {
+            if entry.cell.iter().any(|x| *x >= 64) {
+                return Err(PickupsSnapshotError::InvalidCell);
+            }
+            if !entry.position.iter().all(|v| v.is_finite()) {
+                return Err(PickupsSnapshotError::InvalidPosition);
+            }
+            if saved.insert(entry.cell, entry).is_some() {
+                return Err(PickupsSnapshotError::DuplicateCell);
+            }
+        }
+        let mut known = BTreeSet::new();
+        for candidate in &self.candidates {
+            let [x, y] = candidate.cell;
+            if x >= 64 || y >= 64 {
+                return Err(PickupsSnapshotError::InvalidCell);
+            }
+            let cell = [x as u8, y as u8];
+            if !known.insert(cell) {
+                return Err(PickupsSnapshotError::DuplicateCell);
+            }
+            if !saved.contains_key(&cell) {
+                return Err(PickupsSnapshotError::MissingCell);
+            }
+        }
+        for candidate in &mut self.candidates {
+            let value = saved[&[candidate.cell[0] as u8, candidate.cell[1] as u8]];
+            candidate.position = value.position;
+            candidate.script_enabled = value.script_enabled;
+            candidate.collected = value.collected;
+        }
+        Ok(())
+    }
     /// Construct single-player candidates from level instances. Missing object
     /// definitions, decorations, switches, and level objects other than keys
     /// are ignored. Unsupported item actions remain visible if approached.
@@ -213,6 +299,40 @@ mod tests {
     use super::*;
     use crate::inventory::WeaponDefinition;
     use crate::objects::ObjectDefinition;
+
+    #[test]
+    fn snapshot_restores_by_cell_and_rejects_invalid_set_atomically() {
+        let defs = ObjectDefinitions {
+            items: vec![definition(102, 0)],
+            level_objects: vec![],
+        };
+        let items = [
+            instance(ObjectKind::Item, 0, [1, 1], [1.5, 1.5], 7),
+            instance(ObjectKind::Item, 0, [2, 1], [2.5, 1.5], 7),
+        ];
+        let mut source = Pickups::new(&items, &defs, Difficulty::Normal);
+        source.set_position([1, 1], [4.0, 4.0]);
+        source.set_enabled([2, 1], false);
+        let mut snapshot = source.snapshot().unwrap();
+        snapshot.entries.reverse();
+        let mut target = Pickups::new(&items, &defs, Difficulty::Normal);
+        target.restore(&snapshot).unwrap();
+        assert_eq!(target.snapshot().unwrap(), source.snapshot().unwrap());
+        let before = target.snapshot().unwrap();
+        snapshot.entries[1].cell = snapshot.entries[0].cell;
+        assert_eq!(
+            target.restore(&snapshot),
+            Err(PickupsSnapshotError::DuplicateCell)
+        );
+        assert_eq!(target.snapshot().unwrap(), before);
+        snapshot = before.clone();
+        snapshot.entries[1].position[0] = f32::NAN;
+        assert_eq!(
+            target.restore(&snapshot),
+            Err(PickupsSnapshotError::InvalidPosition)
+        );
+        assert_eq!(target.snapshot().unwrap(), before);
+    }
 
     fn definition(action_code: i32, collision_radius: i32) -> ObjectDefinition {
         ObjectDefinition {

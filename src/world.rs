@@ -64,6 +64,89 @@ pub struct World {
     pub player: Player,
 }
 
+/// Mutable wall geometry is keyed by stable vector index and authored cell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WallSnapshot {
+    pub index: u32,
+    pub cell: Option<[u8; 2]>,
+    pub texture: u8,
+    pub a: [f32; 2],
+    pub b: [f32; 2],
+    pub blocks_movement: bool,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorldSnapshot {
+    pub player_position: [f32; 2],
+    pub player_angle: f32,
+    pub walls: Vec<WallSnapshot>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldSnapshotError {
+    InvalidPlayer,
+    WallCount,
+    WallIdentity { index: usize },
+    InvalidWall { index: usize },
+}
+
+impl World {
+    pub fn snapshot(&self) -> WorldSnapshot {
+        WorldSnapshot {
+            player_position: self.player.position,
+            player_angle: self.player.angle,
+            walls: self
+                .walls
+                .iter()
+                .enumerate()
+                .map(|(index, w)| WallSnapshot {
+                    index: index as u32,
+                    cell: w.cell,
+                    texture: w.texture,
+                    a: w.a,
+                    b: w.b,
+                    blocks_movement: w.blocks_movement,
+                })
+                .collect(),
+        }
+    }
+    /// Restore only into the matching loaded wall layout, without partial edits.
+    pub fn restore(&mut self, value: &WorldSnapshot) -> Result<(), WorldSnapshotError> {
+        let valid_position = |v: f32| v.is_finite() && v.abs() <= 4096.0;
+        if !value.player_angle.is_finite()
+            || !value.player_position.iter().copied().all(valid_position)
+        {
+            return Err(WorldSnapshotError::InvalidPlayer);
+        }
+        if value.walls.len() != self.walls.len() {
+            return Err(WorldSnapshotError::WallCount);
+        }
+        for (index, (saved, wall)) in value.walls.iter().zip(&self.walls).enumerate() {
+            if saved.index as usize != index
+                || saved.cell != wall.cell
+                || saved.texture != wall.texture
+            {
+                return Err(WorldSnapshotError::WallIdentity { index });
+            }
+            if !saved
+                .a
+                .iter()
+                .chain(saved.b.iter())
+                .copied()
+                .all(valid_position)
+            {
+                return Err(WorldSnapshotError::InvalidWall { index });
+            }
+        }
+        self.player.position = value.player_position;
+        self.player.angle = value.player_angle;
+        for (saved, wall) in value.walls.iter().zip(&mut self.walls) {
+            wall.a = saved.a;
+            wall.b = saved.b;
+            wall.blocks_movement = saved.blocks_movement;
+        }
+        Ok(())
+    }
+}
+
 fn cross(a: [f32; 2], b: [f32; 2]) -> f32 {
     a[0] * b[1] - a[1] * b[0]
 }
@@ -556,6 +639,33 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_restores_dynamic_geometry_and_rejects_bad_identity_atomically() {
+        let mut source = test_world();
+        source.player.position = [0.3, 0.4];
+        source.player.angle = 1.2;
+        source.walls[0].a[0] += 0.5;
+        source.walls[0].b[0] += 0.5;
+        source.walls[0].blocks_movement = false;
+        let snapshot = source.snapshot();
+        let mut target = test_world();
+        target.restore(&snapshot).unwrap();
+        assert_eq!(target.snapshot(), snapshot);
+        let mut invalid = snapshot.clone();
+        invalid.walls[0].texture ^= 1;
+        assert_eq!(
+            target.restore(&invalid),
+            Err(WorldSnapshotError::WallIdentity { index: 0 })
+        );
+        assert_eq!(target.snapshot(), snapshot);
+        invalid = snapshot.clone();
+        invalid.walls[0].a[0] = f32::NAN;
+        assert_eq!(
+            target.restore(&invalid),
+            Err(WorldSnapshotError::InvalidWall { index: 0 })
+        );
+        assert_eq!(target.snapshot(), snapshot);
+    }
     fn test_world() -> World {
         World {
             walls: vec![Wall {

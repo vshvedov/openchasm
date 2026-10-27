@@ -186,7 +186,97 @@ pub struct Inventory {
     pub invisibility_ticks_remaining: u32,
 }
 
+/// Version-independent mutable inventory values; weapon definitions stay in
+/// the loaded content and are checked during restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventorySnapshot {
+    pub health: u16,
+    pub armor: u16,
+    pub weapons: [bool; WEAPON_COUNT],
+    pub ammo: [u16; WEAPON_COUNT],
+    pub keys: [bool; 3],
+    pub invisibility_ticks_remaining: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventorySnapshotError {
+    Health,
+    Armor,
+    Ammo { weapon: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectivePowerupsSnapshot {
+    pub enabled: bool,
+    pub reflector_ticks_remaining: u32,
+    pub chojin_ticks_remaining: u32,
+}
+
+impl ProtectivePowerups {
+    pub fn snapshot(&self) -> ProtectivePowerupsSnapshot {
+        ProtectivePowerupsSnapshot {
+            enabled: self.enabled,
+            reflector_ticks_remaining: self.reflector_ticks_remaining,
+            chojin_ticks_remaining: self.chojin_ticks_remaining,
+        }
+    }
+    /// Disabled powerups cannot retain invisible active timers.
+    pub fn restore(&mut self, value: ProtectivePowerupsSnapshot) -> Result<(), &'static str> {
+        if !value.enabled
+            && (value.reflector_ticks_remaining != 0 || value.chojin_ticks_remaining != 0)
+        {
+            return Err("disabled powerup has active timer");
+        }
+        *self = Self {
+            enabled: value.enabled,
+            reflector_ticks_remaining: value.reflector_ticks_remaining,
+            chojin_ticks_remaining: value.chojin_ticks_remaining,
+        };
+        Ok(())
+    }
+}
+
 impl Inventory {
+    pub fn snapshot(&self) -> InventorySnapshot {
+        InventorySnapshot {
+            health: self.health,
+            armor: self.armor,
+            weapons: self.weapons,
+            ammo: self.ammo,
+            keys: self.keys,
+            invisibility_ticks_remaining: self.invisibility_ticks_remaining,
+        }
+    }
+    /// Validate every field before changing the existing inventory.
+    pub fn restore(
+        &mut self,
+        value: &InventorySnapshot,
+        weapons: &WeaponDefinitions,
+    ) -> Result<(), InventorySnapshotError> {
+        if value.health > MAX_HEALTH {
+            return Err(InventorySnapshotError::Health);
+        }
+        if value.armor > MAX_ARMOR {
+            return Err(InventorySnapshotError::Armor);
+        }
+        if let Some(weapon) = value
+            .ammo
+            .iter()
+            .zip(weapons.0.iter())
+            .position(|(ammo, spec)| *ammo > spec.ammo_limit)
+        {
+            return Err(InventorySnapshotError::Ammo { weapon });
+        }
+        *self = Self {
+            health: value.health,
+            armor: value.armor,
+            weapons: value.weapons,
+            ammo: value.ammo,
+            keys: value.keys,
+            invisibility_ticks_remaining: value.invisibility_ticks_remaining,
+        };
+        Ok(())
+    }
     /// Start with the first weapon and its configured ammunition limit.
     /// Respawns and between-level inventory transfer need separate rules.
     pub fn new(weapons: &WeaponDefinitions) -> Self {
@@ -290,6 +380,44 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_restore_validates_before_mutating() {
+        let defs = WeaponDefinitions::parse(weapon_inf().as_bytes()).unwrap();
+        let mut source = Inventory::new(&defs);
+        source.health = 37;
+        source.armor = 19;
+        source.keys[1] = true;
+        source.invisibility_ticks_remaining = 117;
+        let snapshot = source.snapshot();
+        let mut target = Inventory::new(&defs);
+        target.restore(&snapshot, &defs).unwrap();
+        assert_eq!(target, source);
+        let before = target.clone();
+        let mut invalid = snapshot.clone();
+        invalid.ammo[2] = defs.0[2].ammo_limit + 1;
+        assert_eq!(
+            target.restore(&invalid, &defs),
+            Err(InventorySnapshotError::Ammo { weapon: 2 })
+        );
+        assert_eq!(target, before);
+        invalid = snapshot;
+        invalid.health = MAX_HEALTH + 1;
+        assert_eq!(
+            target.restore(&invalid, &defs),
+            Err(InventorySnapshotError::Health)
+        );
+        assert_eq!(target, before);
+        let mut power = ProtectivePowerups::default();
+        let old = power.snapshot();
+        assert!(power
+            .restore(ProtectivePowerupsSnapshot {
+                enabled: false,
+                reflector_ticks_remaining: 1,
+                chojin_ticks_remaining: 0
+            })
+            .is_err());
+        assert_eq!(power.snapshot(), old);
+    }
     fn weapon_inf() -> String {
         let mut s = String::from("[WEAPONS]\n8 ; count\n");
         for i in 0..8 {

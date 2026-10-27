@@ -1,6 +1,6 @@
 //! Client-side sound effects; simulation emits events without an audio dependency.
 use crate::content::ResourceSet;
-use rodio::{DeviceSinkBuilder, MixerDeviceSink};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -43,9 +43,22 @@ fn sound_names(inf: &[u8]) -> BTreeMap<u8, String> {
     names
 }
 
+fn music_track(resource: &[u8]) -> Option<u8> {
+    String::from_utf8_lossy(resource).lines().find_map(|line| {
+        let line = line.trim();
+        let (key, value) = line.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("#cdtrack") {
+            value.trim().parse::<u8>().ok().filter(|id| *id > 0)
+        } else {
+            None
+        }
+    })
+}
+
 pub struct Audio {
     sink: Option<MixerDeviceSink>,
     sounds: BTreeMap<u8, Arc<[u8]>>,
+    music: Option<Player>,
 }
 impl Audio {
     pub fn new(resources: &mut ResourceSet, inf: &[u8]) -> Self {
@@ -64,7 +77,30 @@ impl Audio {
                 None
             }
         };
-        Self { sink, sounds }
+        Self {
+            sink,
+            sounds,
+            music: None,
+        }
+    }
+    /// Start the level's configured music track if available.
+    pub fn play_level_music(&mut self, resources: &mut ResourceSet, resource: &[u8]) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let Some(id) = music_track(resource) else {
+            return;
+        };
+        let Ok(bytes) = resources.read(&format!("music/track{id:02}.flac")) else {
+            return;
+        };
+        let Ok(source) = rodio::Decoder::try_from(Cursor::new(bytes)) else {
+            return;
+        };
+        let player = Player::connect_new(sink.mixer());
+        player.set_volume(0.25);
+        player.append(source.repeat_infinite());
+        self.music = Some(player);
     }
     /// Start a detached one-shot sample if output and the requested asset exist.
     pub fn play(&self, id: u8) {
@@ -93,6 +129,24 @@ mod tests {
         let source = rodio::Decoder::try_from(Cursor::new(bytes)).unwrap();
         assert!(source.sample_rate().get() > 0 && source.channels().get() > 0);
         assert!(source.take(1024).count() > 0);
+    }
+    #[test]
+    fn installed_music_flac_decodes_when_available() {
+        use std::path::Path;
+        let path = Path::new("assets/csm.bin");
+        if !path.exists() {
+            return;
+        }
+        let mut archive = crate::archive::Archive::open(path).unwrap();
+        let bytes = archive.read("music/track03.flac").unwrap();
+        let source = rodio::Decoder::try_from(Cursor::new(bytes)).unwrap();
+        assert!(source.take(1024).count() > 0);
+    }
+    #[test]
+    fn reads_music_track_case_insensitively() {
+        assert_eq!(music_track(b"#name=Level\n#CDTRACK=3\n"), Some(3));
+        assert_eq!(music_track(b"#cdtrack=0"), None);
+        assert_eq!(music_track(b"#cdtrack=wrong"), None);
     }
     #[test]
     fn parses_sound_table_and_rejects_unsafe_paths() {

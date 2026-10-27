@@ -8,4 +8,4 @@ description = "An experimental open-source Chasm: The Rift engine reimplementati
 [dependencies]
 font8x8 = "0.3"
 minifb = "0.29"
-rodio = { version = "0.23", default-features = false, features = ["playback", "wav"] }
+rodio = { version = "0.23", default-features = false, features = ["flac", "playback", "wav"] }

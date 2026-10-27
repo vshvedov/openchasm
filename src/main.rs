@@ -281,7 +281,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
             let info = resources.read("chasm.inf")?;
             let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
-            let audio = audio::Audio::new(&mut resources, &info);
+            let mut audio = audio::Audio::new(&mut resources, &info);
+            audio.play_level_music(&mut resources, &resource);
             let weapon_overlay =
                 weapon_render::WeaponRenderer::load(&mut resources, &info, &palette)?;
             let game = openchasm::game::GameInventory::new(

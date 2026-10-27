@@ -5,6 +5,7 @@
 //! actor animation mode and elapsed fixed time for presentation.
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::content::ResourceSet;
+use crate::gltf_model::{GltfModel, Image as GltfImage};
 use crate::model::{Animation, Model, Vertex as ModelVertex, SKIN_WIDTH};
 use crate::objects::{self, ObjectDefinitions};
 use crate::texture::Palette;
@@ -15,6 +16,7 @@ const MODEL_SCALE: f32 = 1.0 / 2048.0;
 const NEAR: f32 = 0.05;
 const CAMERA_PLANE: f32 = 0.66;
 const ACTOR_ANIMATION_FPS: f64 = 18.0;
+const GLTF_OBJECT_FPS: f64 = 20.0;
 
 /// Shared camera pose for all world-space renderers.
 #[derive(Clone, Copy)]
@@ -52,6 +54,9 @@ struct Mesh {
     /// CAR texture coordinates use 8 fractional bits unlike 3O.
     car_uv: bool,
     animations: [Option<Animation>; 20],
+    /// None for original 3O/CAR geometry; glTF meshes use the original model
+    /// field as an empty placeholder so existing actor behavior is unchanged.
+    gltf: Option<GltfModel>,
 }
 
 struct Instance {
@@ -62,6 +67,7 @@ struct Instance {
     actor_source_index: Option<usize>,
     object_definition_index: Option<usize>,
     object_animation_playing: bool,
+    object_animation_initially_playing: bool,
     object_animation_seconds: f64,
     animation_mode: ActorAnimationMode,
     animation_seconds: f64,
@@ -109,6 +115,30 @@ fn vertex_radius(vertices: &[ModelVertex]) -> f32 {
             (x * x + y * y).sqrt()
         })
         .fold(0.0_f32, f32::max)
+}
+
+fn transform_gltf(matrix: [[f32; 4]; 4], pos: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|row| {
+        matrix[0][row] * pos[0] + matrix[1][row] * pos[1] + matrix[2][row] * pos[2] + matrix[3][row]
+    })
+}
+
+fn gltf_radius(model: &GltfModel) -> f32 {
+    let mut radius = 0.0_f32;
+    for primitive in &model.primitives {
+        for (i, base) in primitive.positions.iter().enumerate() {
+            for delta in
+                std::iter::once([0.0; 3]).chain(primitive.morph_deltas.iter().map(|frame| frame[i]))
+            {
+                let local = transform_gltf(
+                    primitive.node_transform,
+                    [base[0] + delta[0], base[1] + delta[1], base[2] + delta[2]],
+                );
+                radius = radius.max((local[0] * local[0] + local[1] * local[1]).sqrt());
+            }
+        }
+    }
+    radius
 }
 
 /// A deduplicated collection of static object meshes and placements.
@@ -256,6 +286,137 @@ impl Raster<'_> {
     }
 }
 
+impl Raster<'_> {
+    /// Perspective-correct RGBA rasterization into the same depth buffer used
+    /// by 3O models and walls. Partial alpha blending is approximate.
+    fn gltf_triangle(&mut self, triangle: [ScreenVertex; 3], image: Option<&GltfImage>) {
+        let [a, b, c] = triangle;
+        let area = edge(a, b, c.x, c.y);
+        if area.abs() < 0.00001 {
+            return;
+        }
+        let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as usize;
+        let max_x = a.x.max(b.x).max(c.x).ceil().min(self.width as f32) as usize;
+        let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as usize;
+        let max_y = a.y.max(b.y).max(c.y).ceil().min(self.height as f32) as usize;
+        if min_x >= max_x || min_y >= max_y {
+            return;
+        }
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let w0 = edge(b, c, px, py) / area;
+                let w1 = edge(c, a, px, py) / area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 < -0.00001 || w1 < -0.00001 || w2 < -0.00001 {
+                    continue;
+                }
+                let inverse = w0 * a.inv_depth + w1 * b.inv_depth + w2 * c.inv_depth;
+                if inverse <= 0.0 {
+                    continue;
+                }
+                let distance = inverse.recip();
+                let pixel = y * self.width + x;
+                if distance >= self.depth[pixel] {
+                    continue;
+                }
+                let u =
+                    (w0 * a.u_over_depth + w1 * b.u_over_depth + w2 * c.u_over_depth) * distance;
+                let v =
+                    (w0 * a.v_over_depth + w1 * b.v_over_depth + w2 * c.v_over_depth) * distance;
+                let rgba = if let Some(image) = image {
+                    let tx = ((u.rem_euclid(1.0) * image.width as f32) as usize)
+                        .min(image.width as usize - 1);
+                    let ty = ((v.rem_euclid(1.0) * image.height as f32) as usize)
+                        .min(image.height as usize - 1);
+                    let i = (ty * image.width as usize + tx) * 4;
+                    [
+                        image.rgba[i],
+                        image.rgba[i + 1],
+                        image.rgba[i + 2],
+                        image.rgba[i + 3],
+                    ]
+                } else {
+                    [200, 200, 200, 255]
+                };
+                if rgba[3] == 0 {
+                    continue;
+                }
+                let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
+                let background = self.frame[pixel];
+                let blend = |channel: u8, shift: u32| {
+                    let src = (f32::from(channel) * attenuation) as u32;
+                    let dst = (background >> shift) & 255_u32;
+                    (src * u32::from(rgba[3]) + dst * (255 - u32::from(rgba[3]))) / 255
+                };
+                self.frame[pixel] =
+                    (blend(rgba[0], 16) << 16) | (blend(rgba[1], 8) << 8) | blend(rgba[2], 0);
+                self.depth[pixel] = distance;
+            }
+        }
+    }
+}
+
+fn draw_gltf(raster: &mut Raster<'_>, model: &GltfModel, instance: &Instance, camera: CameraView) {
+    let frame = if instance.object_animation_playing {
+        (instance.object_animation_seconds.max(0.0) * GLTF_OBJECT_FPS)
+            .rem_euclid(model.frame_count as f64) as usize
+    } else {
+        0
+    };
+    let (sin, cos) = instance.angle.sin_cos();
+    let (camera_sin, camera_cos) = camera.player.angle.sin_cos();
+    let dx = instance.position[0] - camera.player.position[0];
+    let dy = instance.position[1] - camera.player.position[1];
+    for primitive in &model.primitives {
+        let delta = frame
+            .checked_sub(1)
+            .and_then(|i| primitive.morph_deltas.get(i));
+        let image = primitive.texture.and_then(|i| model.images.get(i));
+        for indices in primitive.indices.chunks(3) {
+            let mut vertices = Vec::with_capacity(3);
+            for &index in indices {
+                let i = index as usize;
+                let base = primitive.positions[i];
+                let d = delta.map(|target| target[i]).unwrap_or([0.0; 3]);
+                let p = transform_gltf(
+                    primitive.node_transform,
+                    [base[0] + d[0], base[1] + d[1], base[2] + d[2]],
+                );
+                if !p.iter().all(|value| value.is_finite()) {
+                    vertices.clear();
+                    break;
+                }
+                // The bundled replacement geometry matches 3O tile-space axes:
+                // X/Y horizontal, Z vertical, with positions already scaled.
+                let wx = dx + p[0] * cos - p[1] * sin;
+                let wy = dy + p[0] * sin + p[1] * cos;
+                vertices.push(Vertex {
+                    side: -wx * camera_sin + wy * camera_cos,
+                    up: p[2] - camera.eye_height,
+                    depth: wx * camera_cos + wy * camera_sin,
+                    uv: primitive.uv[i],
+                });
+            }
+            let clipped = clip_near(&vertices);
+            if clipped.len() < 3 {
+                continue;
+            }
+            let first = project(clipped[0], raster.width, raster.height);
+            for i in 1..clipped.len() - 1 {
+                raster.gltf_triangle(
+                    [
+                        first,
+                        project(clipped[i], raster.width, raster.height),
+                        project(clipped[i + 1], raster.width, raster.height),
+                    ],
+                    image,
+                );
+            }
+        }
+    }
+}
+
 impl ObjectScene {
     /// Load supported original models once, retaining only unique diagnostics.
     /// glTF-only and missing/unreadable objects are skipped for now.
@@ -277,13 +438,41 @@ impl ObjectScene {
                 ));
                 continue;
             };
-            let Some(path) = definition.model_3o_path() else {
-                warnings.insert(format!("glTF-only model {}", definition.model_name));
-                continue;
+            let model_3o = definition.model_3o_path();
+            let gltf_only = model_3o.is_none();
+            let path = model_3o.unwrap_or_else(|| definition.model_gltf_path());
+            let animation_path = if gltf_only {
+                None
+            } else {
+                definition.animation_path()
             };
-            let animation_path = definition.animation_path();
             let cache_key = (path.clone(), animation_path.clone());
             let mesh_index = *cache.entry(cache_key).or_insert_with(|| {
+                if gltf_only {
+                    match GltfModel::load(resources, &path) {
+                        Ok(gltf) => {
+                            let radius = gltf_radius(&gltf);
+                            let index = meshes.len();
+                            meshes.push(Mesh {
+                                model: Model {
+                                    vertices: vec![],
+                                    polygons: vec![],
+                                    skin_height: 0,
+                                    skin_indices: vec![],
+                                },
+                                radius,
+                                car_uv: false,
+                                animations: std::array::from_fn(|_| None),
+                                gltf: Some(gltf),
+                            });
+                            return Some(index);
+                        }
+                        Err(error) => {
+                            warnings.insert(format!("{path}: {error}"));
+                            return None;
+                        }
+                    }
+                }
                 match resources.read(&path).and_then(|bytes| Model::parse(&bytes)) {
                     Ok(model) => {
                         let mut animations: [Option<Animation>; 20] = std::array::from_fn(|_| None);
@@ -317,6 +506,7 @@ impl ObjectScene {
                             radius,
                             car_uv: false,
                             animations,
+                            gltf: None,
                         });
                         Some(index)
                     }
@@ -327,6 +517,11 @@ impl ObjectScene {
                 }
             });
             if let Some(mesh) = mesh_index {
+                let initially_playing = meshes[mesh]
+                    .gltf
+                    .as_ref()
+                    .is_some_and(|gltf| gltf.frame_count > 1)
+                    && definition.action_code != 255;
                 instances.push(Instance {
                     mesh,
                     position: instance.position,
@@ -338,7 +533,8 @@ impl ObjectScene {
                     } else {
                         None
                     },
-                    object_animation_playing: false,
+                    object_animation_playing: initially_playing,
+                    object_animation_initially_playing: initially_playing,
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
@@ -400,6 +596,7 @@ impl ObjectScene {
                             radius,
                             car_uv: true,
                             animations,
+                            gltf: None,
                         });
                         Some(index)
                     }
@@ -418,6 +615,7 @@ impl ObjectScene {
                     actor_source_index: Some(actor.source_index),
                     object_definition_index: None,
                     object_animation_playing: false,
+                    object_animation_initially_playing: false,
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
@@ -494,7 +692,11 @@ impl ObjectScene {
         let mut started = 0;
         for instance in &mut self.instances {
             if instance.object_definition_index != Some(definition_index)
-                || self.meshes[instance.mesh].animations[0].is_none()
+                || (self.meshes[instance.mesh].animations[0].is_none()
+                    && self.meshes[instance.mesh]
+                        .gltf
+                        .as_ref()
+                        .is_none_or(|model| model.frame_count <= 1))
             {
                 continue;
             }
@@ -524,7 +726,7 @@ impl ObjectScene {
     #[allow(dead_code)] // Viewer integrates restart separately.
     pub fn reset_object_animations(&mut self) {
         for instance in &mut self.instances {
-            instance.object_animation_playing = false;
+            instance.object_animation_playing = instance.object_animation_initially_playing;
             instance.object_animation_seconds = 0.0;
         }
     }
@@ -583,6 +785,10 @@ impl ObjectScene {
             {
                 continue;
             }
+            if let Some(gltf) = &mesh.gltf {
+                draw_gltf(&mut raster, gltf, instance, camera);
+                continue;
+            }
             let (sin, cos) = instance.angle.sin_cos();
             let pose_vertices = if mesh.car_uv {
                 actor_vertices(mesh, instance.animation_mode, instance.animation_seconds)
@@ -638,6 +844,134 @@ impl ObjectScene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn gltf_scene(alpha: u8) -> ObjectScene {
+        let image = GltfImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, alpha],
+        };
+        let primitive = crate::gltf_model::Primitive {
+            name: "triangle".into(),
+            positions: vec![[0.0, -0.5, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.5]],
+            uv: vec![[0.0, 0.0]; 3],
+            indices: vec![0, 1, 2],
+            morph_deltas: vec![vec![[0.0, 0.4, 0.0]; 3]],
+            node_transform: [
+                [1., 0., 0., 0.],
+                [0., 1., 0., 0.],
+                [0., 0., 1., 0.],
+                [0., 0., 0., 1.],
+            ],
+            texture: Some(0),
+            transparent: false,
+        };
+        let gltf = GltfModel {
+            primitives: vec![primitive],
+            images: vec![image],
+            frame_count: 2,
+        };
+        let mesh = Mesh {
+            model: Model {
+                vertices: vec![],
+                polygons: vec![],
+                skin_height: 0,
+                skin_indices: vec![],
+            },
+            radius: gltf_radius(&gltf),
+            car_uv: false,
+            animations: std::array::from_fn(|_| None),
+            gltf: Some(gltf),
+        };
+        let instance = Instance {
+            mesh: 0,
+            position: [2.0, 0.0],
+            angle: 0.0,
+            cell: Some([1, 1]),
+            actor_source_index: None,
+            object_definition_index: Some(0),
+            object_animation_playing: false,
+            object_animation_initially_playing: false,
+            object_animation_seconds: 0.0,
+            animation_mode: ActorAnimationMode::Idle,
+            animation_seconds: 0.0,
+            visible: true,
+        };
+        ObjectScene {
+            meshes: vec![mesh],
+            instances: vec![instance],
+            palette: [0; 256],
+        }
+    }
+    #[test]
+    fn gltf_depth_alpha_and_per_instance_animation() {
+        let mut scene = gltf_scene(255);
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+        };
+        let mut frame = vec![0; 64 * 64];
+        let mut depth = vec![1.0; 64 * 64];
+        scene.render(&mut frame, &mut depth, 64, 64, camera);
+        assert!(frame.iter().all(|&p| p == 0));
+        depth.fill(f32::INFINITY);
+        scene.render(&mut frame, &mut depth, 64, 64, camera);
+        assert!(frame.iter().any(|&p| p & 0xff0000 != 0));
+        let base = frame.clone();
+        assert_eq!(scene.play_object_animation(33), 1);
+        assert!(scene.tick_object_animations(0.051));
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        scene.render(&mut frame, &mut depth, 64, 64, camera);
+        assert_ne!(frame, base);
+        let invisible = gltf_scene(0);
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        invisible.render(&mut frame, &mut depth, 64, 64, camera);
+        assert!(frame.iter().all(|&p| p == 0));
+        assert!(depth.iter().all(|&d| d == f32::INFINITY));
+    }
+    #[test]
+    fn installed_modern_only_objects_load_and_render_when_available() {
+        let path = std::path::Path::new("assets/csm.bin");
+        if !path.is_file() {
+            return;
+        }
+        let mut resources = ResourceSet::open(path).unwrap();
+        let inf = resources.read("chasm.inf").unwrap();
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        for (level, index, expected_name) in [("01", 17, "vent1"), ("10", 33, "bridge_2")] {
+            let map = crate::map::Map::parse(&resources.read(&format!("map/map.{level}")).unwrap())
+                .unwrap();
+            let resource = resources.read(&format!("map/resource.{level}")).unwrap();
+            let definitions = ObjectDefinitions::parse(&inf, &resource).unwrap();
+            assert_eq!(definitions.level_objects[index].model_name, expected_name);
+            let mut scene = ObjectScene::load(&mut resources, &map, &definitions, &palette);
+            scene
+                .instances
+                .retain(|instance| instance.object_definition_index == Some(index));
+            assert!(!scene.instances.is_empty());
+            let instance = &scene.instances[0];
+            assert!(scene.meshes[instance.mesh].gltf.is_some());
+            let camera = CameraView {
+                player: Player {
+                    position: [instance.position[0] - 2.0, instance.position[1]],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
+            };
+            let mut frame = vec![0; 160 * 100];
+            let mut depth = vec![f32::INFINITY; frame.len()];
+            scene.render(&mut frame, &mut depth, 160, 100, camera);
+            assert!(
+                frame.iter().any(|&p| p != 0),
+                "{expected_name} produced no pixels"
+            );
+        }
+    }
+
     #[test]
     fn playani_targets_all_level_objects_and_preserves_instance_state() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -736,6 +1070,7 @@ mod tests {
             radius: 1.0,
             car_uv: true,
             animations,
+            gltf: None,
         };
         let x = |mode, time| actor_vertices(&mesh, mode, time)[0].position[0];
         assert_eq!(x(ActorAnimationMode::Idle, 0.0), 10);
@@ -754,6 +1089,7 @@ mod tests {
             actor_source_index: Some(id),
             object_definition_index: None,
             object_animation_playing: false,
+            object_animation_initially_playing: false,
             object_animation_seconds: 0.0,
             animation_mode: ActorAnimationMode::Idle,
             animation_seconds: 0.0,
@@ -789,6 +1125,7 @@ mod tests {
                     actor_source_index: None,
                     object_definition_index: None,
                     object_animation_playing: false,
+                    object_animation_initially_playing: false,
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,
@@ -802,6 +1139,7 @@ mod tests {
                     actor_source_index: None,
                     object_definition_index: None,
                     object_animation_playing: false,
+                    object_animation_initially_playing: false,
                     object_animation_seconds: 0.0,
                     animation_mode: ActorAnimationMode::Idle,
                     animation_seconds: 0.0,

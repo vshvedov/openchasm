@@ -10,7 +10,7 @@ use std::io::{self, Write};
 pub const MAX_SESSION_PAYLOAD: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 65_536;
 const MAX_MAP_CELLS: usize = 4096;
-const SCHEMA_VERSION: u16 = 2;
+const SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug)]
 pub enum SessionCodecError {
@@ -72,6 +72,7 @@ fn validate_shape(s: &SessionSnapshot) -> Result<(), SessionCodecError> {
         s.grid_journal.len(),
         s.projectiles.projectiles.len(),
         s.projectile_heights.len(),
+        s.projectile_vertical_speeds.len(),
         s.mines.mines.len(),
     ]
     .into_iter()
@@ -184,6 +185,12 @@ pub fn decode(bytes: &[u8], expected: ContentDigest) -> Result<SessionSnapshot, 
     }
     let mut payload: Payload =
         serde_json::from_slice(envelope.payload).map_err(|_| SessionCodecError::InvalidPayload)?;
+    if matches!(payload.version, 1 | 2)
+        && (payload.snapshot.pitch != 0.0
+            || !payload.snapshot.projectile_vertical_speeds.is_empty())
+    {
+        return Err(SessionCodecError::InvalidPayload);
+    }
     match payload.version {
         1 => {
             if payload.snapshot.light_tick != 0
@@ -209,7 +216,7 @@ pub fn decode(bytes: &[u8], expected: ContentDigest) -> Result<SessionSnapshot, 
                     Some(crate::light_sources::LightSourcesSnapshot::default());
             }
         }
-        SCHEMA_VERSION => {}
+        2 | SCHEMA_VERSION => {}
         version => return Err(SessionCodecError::UnsupportedVersion(version)),
     }
     if payload.snapshot.content != envelope.content {

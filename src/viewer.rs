@@ -39,6 +39,7 @@ struct RelativeLook {
     focused: bool,
     captured: bool,
     pending_dx: i64,
+    pending_dy: i64,
 }
 impl RelativeLook {
     fn set_focus(&mut self, focused: bool) {
@@ -54,12 +55,14 @@ impl RelativeLook {
             return false;
         }
         self.pending_dx = 0;
+        self.pending_dy = 0;
         self.captured = enable();
         self.captured
     }
     fn release(&mut self) {
         self.captured = false;
         self.pending_dx = 0;
+        self.pending_dy = 0;
     }
     fn motion(&mut self, dx: i32) {
         if self.focused && self.captured {
@@ -69,6 +72,15 @@ impl RelativeLook {
     fn take_yaw(&mut self) -> f32 {
         let dx = std::mem::take(&mut self.pending_dx).clamp(-100_000, 100_000);
         dx as f32 * MOUSE_SENSITIVITY
+    }
+    fn motion_y(&mut self, dy: i32) {
+        if self.focused && self.captured {
+            self.pending_dy = self.pending_dy.saturating_add(i64::from(dy));
+        }
+    }
+    fn take_pitch(&mut self) -> f32 {
+        let dy = std::mem::take(&mut self.pending_dy).clamp(-100_000, 100_000);
+        -(dy as f32) * MOUSE_SENSITIVITY
     }
 }
 
@@ -151,6 +163,7 @@ fn clear_held_controls(
     held.clear();
     *fire = false;
     look.pending_dx = 0;
+    look.pending_dy = 0;
     *accumulator = 0.0;
 }
 
@@ -452,6 +465,7 @@ struct RenderWorld<'a> {
     elevations: &'a [f32],
     eye_height: f32,
     yaw_offset: f32,
+    pitch: f32,
     mines: &'a [openchasm::explosives::Mine],
     lights: Option<&'a openchasm::dynamic_light::DynamicLightSampler>,
 }
@@ -475,6 +489,7 @@ fn quake_camera(
         CameraView {
             player: camera_player,
             eye_height: (eye_height + vertical_offset).max(0.0),
+            pitch: 0.0,
         },
         yaw_offset,
     )
@@ -494,6 +509,7 @@ fn render(
     let camera = CameraView {
         player: camera_player,
         eye_height: scene.eye_height,
+        pitch: scene.pitch,
     };
     if let Some(planes) = planes {
         if scene.lights.is_some() {
@@ -503,7 +519,11 @@ fn render(
         }
     } else {
         for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
-            row.fill(if y < HEIGHT / 2 { 0x303847 } else { 0x38312b });
+            row.fill(if (y as f32 + 0.5) < camera.horizon(HEIGHT) {
+                0x303847
+            } else {
+                0x38312b
+            });
         }
     }
     depth.fill(f32::INFINITY);
@@ -521,7 +541,7 @@ fn render(
             }
             let half = (HEIGHT as f32 * 0.5 / distance).min((HEIGHT * 4) as f32);
             let offset = scene.elevations.get(index).copied().unwrap_or(0.0) / 64.0;
-            let origin = HEIGHT as f32 * 0.5 - (2.0 + offset - camera.eye_height) * half;
+            let origin = camera.horizon(HEIGHT) - (2.0 + offset - camera.eye_height) * half;
             let top = origin.max(0.0).min(HEIGHT as f32) as usize;
             let bottom = (origin + half * 2.0).max(0.0).min(HEIGHT as f32) as usize;
             let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
@@ -717,6 +737,7 @@ pub struct ClientFeedback {
     pub weapon_overlay: WeaponRenderer,
     pub projectile_renderer: ProjectileRenderer,
     pub explosion_renderer: Option<crate::explosion_render::ExplosionRenderer>,
+    pub impact_renderer: Option<crate::impact_render::ImpactRenderer>,
     pub difficulty: openchasm::pickups::Difficulty,
     pub teleport_load_error: Option<String>,
     /// Verified identity of the loaded gameplay inputs, if fingerprinting succeeded.
@@ -736,6 +757,7 @@ pub fn run(
         weapon_overlay,
         projectile_renderer,
         mut explosion_renderer,
+        mut impact_renderer,
         difficulty,
         teleport_load_error,
         content_digest: _content_digest,
@@ -1007,7 +1029,10 @@ pub fn run(
                         pending_weapon = Some(next);
                     }
                 }
-                Event::MouseMotion { xrel, .. } => look.motion(xrel),
+                Event::MouseMotion { xrel, yrel, .. } => {
+                    look.motion(xrel);
+                    look.motion_y(yrel);
+                }
                 _ => {}
             }
         }
@@ -1027,6 +1052,9 @@ pub fn run(
             session = initial_session.clone();
             minimap = minimap::Minimap::new(&session.world);
             if let Some(renderer) = &mut explosion_renderer {
+                renderer.clear();
+            }
+            if let Some(renderer) = &mut impact_renderer {
                 renderer.clear();
             }
             if !objects.restore(&initial_scene) {
@@ -1087,6 +1115,9 @@ pub fn run(
                             if let Some(renderer) = &mut explosion_renderer {
                                 renderer.clear();
                             }
+                            if let Some(renderer) = &mut impact_renderer {
+                                renderer.clear();
+                            }
                             // Leave window focus/capture unchanged; discard all
                             // inputs accumulated before the restored state.
                             clear_held_controls(
@@ -1119,6 +1150,7 @@ pub fn run(
         while accumulator >= STEP {
             // Deltas are motion, not velocity: consume exactly once per tick.
             let yaw_delta = look.take_yaw();
+            let pitch_delta = look.take_pitch();
             animation_tick = animation_tick.saturating_add(1);
             let old_weapon = session.selected_weapon;
             let health_before = session.game.inventory.health;
@@ -1126,6 +1158,7 @@ pub fn run(
             let events = session.step(SessionInput {
                 movement,
                 yaw_delta,
+                pitch_delta,
                 interact: pending_interact,
                 jump: pending_jump,
                 fire: firing,
@@ -1197,6 +1230,20 @@ pub fn run(
                 animation_tick,
             );
             let rocket_type = session.game.weapons.0[session.selected_weapon].rocket_type;
+            if let Some(renderer) = &mut impact_renderer {
+                renderer.tick();
+                if let Ok(rocket_id) = usize::try_from(rocket_type) {
+                    renderer.consume(
+                        &events,
+                        CameraView {
+                            player: session.world.player,
+                            eye_height: session.vertical.eye(),
+                            pitch: session.pitch(),
+                        },
+                        rocket_id,
+                    );
+                }
+            }
             for id in crate::audio::gameplay_sound_ids(&events, rocket_type) {
                 audio.play(id);
             }
@@ -1308,12 +1355,13 @@ pub fn run(
             .as_ref()
             .and_then(|state| state.quake.sample(session.world.player.position))
             .unwrap_or(0);
-        let (camera, yaw_offset) = quake_camera(
+        let (mut camera, yaw_offset) = quake_camera(
             session.world.player,
             session.vertical.eye(),
             quake_power,
             animation_tick,
         );
+        camera.pitch = session.pitch();
         let dynamic_lights = session.light_sources.as_ref().map(|sources| {
             openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&sources.snapshot())
         });
@@ -1325,6 +1373,7 @@ pub fn run(
                 elevations: &session.wall_elevations,
                 eye_height: camera.eye_height,
                 yaw_offset,
+                pitch: camera.pitch,
                 mines: session.mines(),
                 lights: dynamic_lights.as_ref(),
             },
@@ -1338,9 +1387,13 @@ pub fn run(
             .iter()
             .map(|projectile| ProjectileVisual {
                 rocket_type: projectile.rocket_id,
-                position: [projectile.position[0], projectile.position[1], 1.0],
+                position: [
+                    projectile.position[0],
+                    projectile.position[1],
+                    session.projectile_height(projectile.id).unwrap_or(1.0),
+                ],
                 yaw: projectile.velocity[1].atan2(projectile.velocity[0]),
-                pitch: 0.0,
+                pitch: session.projectile_pitch(projectile.id).unwrap_or(0.0),
             })
             .collect();
         projectile_renderer.render(
@@ -1352,6 +1405,9 @@ pub fn run(
             &projectile_visuals,
         );
         if let Some(renderer) = &explosion_renderer {
+            renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
+        }
+        if let Some(renderer) = &impact_renderer {
             renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
         }
         let (pose, frame_index) = weapon_clock
@@ -1612,6 +1668,19 @@ mod tests {
         look.motion(50);
         assert_eq!(look.take_yaw(), 0.0);
     }
+    #[test]
+    fn vertical_mouse_motion_is_up_positive_and_discarded_on_focus_loss() {
+        let mut look = RelativeLook::default();
+        look.set_focus(true);
+        look.captured = true;
+        look.motion_y(-12);
+        look.motion_y(2);
+        assert!((look.take_pitch() - 0.02).abs() < 1e-6);
+        assert_eq!(look.take_pitch(), 0.0);
+        look.motion_y(-30);
+        look.set_focus(false);
+        assert_eq!(look.take_pitch(), 0.0);
+    }
 
     #[test]
     fn composites_masked_walls_over_the_walls_behind_them() {
@@ -1649,6 +1718,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 1.0,
+                pitch: 0.0,
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
@@ -1702,6 +1772,7 @@ mod tests {
             world: &world,
             elevations: &[],
             eye_height: 1.0,
+            pitch: 0.0,
             yaw_offset: 0.0,
             mines: &[],
             lights,
@@ -1719,6 +1790,52 @@ mod tests {
         assert!(lit[pixel] > base[pixel]);
         assert_eq!(lit_depth, base_depth);
         assert_eq!(lit[0], base[0]);
+    }
+    #[test]
+    fn looking_up_shifts_wall_projection_without_changing_distance() {
+        let world = World {
+            walls: vec![Wall {
+                cell: None,
+                a: [4.0, -1.0],
+                b: [4.0, 1.0],
+                texture: 1,
+                blocks_movement: true,
+            }],
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+        };
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        let mut depth = vec![f32::INFINITY; frame.len()];
+        let scene = |pitch| RenderWorld {
+            world: &world,
+            elevations: &[],
+            eye_height: 1.0,
+            yaw_offset: 0.0,
+            pitch,
+            mines: &[],
+            lights: None,
+        };
+        render(&mut frame, &mut depth, scene(0.0), &[], None, None);
+        let top = |depth: &[f32]| {
+            (0..HEIGHT)
+                .find(|&y| depth[y * WIDTH + WIDTH / 2].is_finite())
+                .unwrap()
+        };
+        let level_top = top(&depth);
+        let original_distance = depth[(level_top + 25) * WIDTH + WIDTH / 2];
+        render(
+            &mut frame,
+            &mut depth,
+            scene(0.2_f32.atan()),
+            &[],
+            None,
+            None,
+        );
+        let up_top = top(&depth);
+        assert_eq!(up_top - level_top, 40);
+        assert_eq!(depth[(up_top + 25) * WIDTH + WIDTH / 2], original_distance);
     }
 
     #[test]
@@ -1750,6 +1867,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 0.75,
+                pitch: 0.0,
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
@@ -1766,6 +1884,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 1.15,
+                pitch: 0.0,
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
@@ -1806,6 +1925,7 @@ mod tests {
                 world: &world,
                 elevations: &[80.0],
                 eye_height: 1.0,
+                pitch: 0.0,
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
@@ -1848,6 +1968,7 @@ mod tests {
                 world: &world,
                 elevations: &[],
                 eye_height: 1.0,
+                pitch: 0.0,
                 yaw_offset: 0.0,
                 mines: &[],
                 lights: None,
@@ -2032,6 +2153,7 @@ mod tests {
             focused: true,
             captured: true,
             pending_dx: 42,
+            pending_dy: 0,
         };
         let mut accumulator = 0.1;
         assert_eq!(held_movement(&held).forward, 1.0);
@@ -2061,6 +2183,7 @@ mod tests {
             focused: true,
             captured: false,
             pending_dx: 0,
+            pending_dy: 0,
         };
         assert_eq!(wheel_weapon(&look, &inventory, 0, 1), Some(1));
         look.captured = true;

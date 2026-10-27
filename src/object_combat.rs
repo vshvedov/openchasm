@@ -322,6 +322,26 @@ impl ObjectCombat {
         radius: f32,
         accepts: impl Fn([usize; 2], u8) -> bool,
     ) -> Option<ObjectRayHit> {
+        self.raycast_intervals(
+            origin,
+            direction,
+            max_distance,
+            radius,
+            |cell, raw, near, _| accepts(cell, raw).then_some(near),
+        )
+    }
+
+    /// Select a contact within each horizontal cylinder interval. The callback
+    /// may clip that interval to vertical geometry and returns the first valid
+    /// horizontal distance, or None when the ray misses the cylinder.
+    pub fn raycast_intervals(
+        &self,
+        origin: [f32; 2],
+        direction: [f32; 2],
+        max_distance: f32,
+        radius: f32,
+        contact: impl Fn([usize; 2], u8, f32, f32) -> Option<f32>,
+    ) -> Option<ObjectRayHit> {
         if !origin.iter().chain(direction.iter()).all(|x| x.is_finite())
             || !max_distance.is_finite()
             || max_distance < 0.0
@@ -342,7 +362,6 @@ impl ObjectCombat {
                 || !target.difficulty_enabled
                 || !target.enabled
                 || target.destroyed
-                || !accepts(target.cell, target.raw_type)
                 || !target.position.iter().all(|v| v.is_finite())
             {
                 continue;
@@ -362,8 +381,16 @@ impl ObjectCombat {
             if along + half < 0.0 {
                 continue;
             }
-            let distance = (along - half).max(0.0);
-            if distance > max_distance {
+            let near = (along - half).max(0.0);
+            let far = (along + half).min(max_distance);
+            if near > far {
+                continue;
+            }
+            let Some(distance) = contact(target.cell, target.raw_type, near, far) else {
+                continue;
+            };
+            if !distance.is_finite() || distance < near || distance > far || distance > max_distance
+            {
                 continue;
             }
             if nearest

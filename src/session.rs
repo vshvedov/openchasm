@@ -46,11 +46,16 @@ pub struct LevelSetup {
     pub difficulty: Difficulty,
 }
 
+/// Matches the reconstruction's old-style camera pitch limit.
+pub const MAX_PLAYER_PITCH: f32 = std::f32::consts::FRAC_PI_2 * 0.65;
+
 #[derive(Default)]
 pub struct SessionInput {
     pub movement: Input,
     /// Horizontal look displacement in radians for this tick, independent of frame rate.
     pub yaw_delta: f32,
+    /// Positive radians look upward; applied once per fixed tick.
+    pub pitch_delta: f32,
     pub interact: bool,
     /// One-shot jump press edge; a held button is not automatically repeated.
     pub jump: bool,
@@ -149,6 +154,8 @@ pub struct SessionEvents {
     pub enemy_attacks: Vec<EnemyAttack>,
     pub enemy_hits: Vec<EnemyHitscanEvent>,
     pub projectile_impacts: Vec<Impact>,
+    /// World-space impact heights aligned with `projectile_impacts`.
+    pub projectile_impact_heights: Vec<f32>,
     pub projectile_reflections: Vec<ProjectileReflection>,
     /// Impact explosions and raw pre-armor damage, in deterministic order.
     pub explosions: Vec<Explosion>,
@@ -340,6 +347,7 @@ pub struct Session {
     teleports: Option<(Vec<Teleport>, TeleportState)>,
     object_heights: Option<SessionObjectHeights>,
     pub vertical: VerticalState,
+    pitch: f32,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
     pub actor_definitions: ActorDefinitions,
@@ -350,6 +358,7 @@ pub struct Session {
     explosions_enabled: bool,
     addon_boss_rule: bool,
     projectile_heights: BTreeMap<u64, f32>,
+    projectile_vertical_speeds: BTreeMap<u64, f32>,
     mines_enabled: bool,
     mines: MineSystem,
     pub objects: Option<ObjectCombat>,
@@ -383,6 +392,8 @@ pub struct SessionSnapshot {
     pub capabilities: SessionSnapshotCapabilities,
     pub world: crate::world::WorldSnapshot,
     pub vertical: crate::vertical::VerticalSnapshot,
+    #[serde(default)]
+    pub pitch: f32,
     pub processes: crate::process_runtime::ProcessRuntimeSnapshot,
     pub actors: crate::actors::ActorStateSnapshot,
     pub ai: crate::ai::EnemyAiSnapshot,
@@ -393,6 +404,8 @@ pub struct SessionSnapshot {
     pub combat: crate::combat::CombatSnapshot,
     pub projectiles: crate::projectiles::ProjectileSystemSnapshot,
     pub projectile_heights: Vec<(u64, f32)>,
+    #[serde(default)]
+    pub projectile_vertical_speeds: Vec<(u64, f32)>,
     pub mines: crate::explosives::MineSystemSnapshot,
     pub object_states: Option<crate::object_states::ObjectStatesSnapshot>,
     pub object_combat: Option<crate::object_combat::ObjectCombatSnapshot>,
@@ -491,6 +504,7 @@ impl Session {
             capabilities: self.snapshot_capabilities(),
             world: self.world.snapshot(),
             vertical: self.vertical.snapshot(),
+            pitch: self.pitch,
             processes,
             actors: self
                 .actors
@@ -518,6 +532,11 @@ impl Session {
                 .projectile_heights
                 .iter()
                 .map(|(&id, &height)| (id, height))
+                .collect(),
+            projectile_vertical_speeds: self
+                .projectile_vertical_speeds
+                .iter()
+                .map(|(&id, &speed)| (id, speed))
                 .collect(),
             mines: self
                 .mines
@@ -625,7 +644,11 @@ impl Session {
         {
             return Err(SessionSnapshotError::Inconsistent("selected weapon"));
         }
+        if !snapshot.pitch.is_finite() || snapshot.pitch.abs() > MAX_PLAYER_PITCH {
+            return Err(SessionSnapshotError::Component("pitch"));
+        }
         let mut candidate = self.clone();
+        candidate.pitch = snapshot.pitch;
         candidate.world = replayed_world;
         candidate.base_wall_blocking = replayed_blocking;
         candidate
@@ -730,6 +753,31 @@ impl Session {
             }
         }
         candidate.projectile_heights = heights;
+        let mut speeds = BTreeMap::new();
+        for &(id, speed) in &snapshot.projectile_vertical_speeds {
+            let Some(projectile) = candidate.projectiles.active().iter().find(|p| p.id == id)
+            else {
+                return Err(SessionSnapshotError::Inconsistent(
+                    "projectile vertical speeds",
+                ));
+            };
+            let maximum = projectile.velocity[0].hypot(projectile.velocity[1])
+                * MAX_PLAYER_PITCH.tan()
+                + 0.001;
+            if projectile.owner != Owner::Player
+                || speed.abs() > maximum
+                || !ids.contains(&id)
+                || !speed.is_finite()
+                || speed.abs() > 64.0
+                || speeds.insert(id, speed).is_some()
+                || !candidate.projectile_heights.contains_key(&id)
+            {
+                return Err(SessionSnapshotError::Inconsistent(
+                    "projectile vertical speeds",
+                ));
+            }
+        }
+        candidate.projectile_vertical_speeds = speeds;
         match (
             &mut candidate.scripted_objects,
             &snapshot.object_states,
@@ -944,6 +992,7 @@ impl Session {
             teleports: None,
             object_heights: None,
             vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
+            pitch: 0.0,
             processes: setup.processes,
             actors: setup.actors,
             actor_definitions: setup.actor_definitions,
@@ -954,6 +1003,7 @@ impl Session {
             explosions_enabled: false,
             addon_boss_rule: false,
             projectile_heights: BTreeMap::new(),
+            projectile_vertical_speeds: BTreeMap::new(),
             mines_enabled: false,
             mines: MineSystem::new(),
             objects: None,
@@ -1039,6 +1089,28 @@ impl Session {
         }
         self.wall_materials = Some(catalog);
         true
+    }
+    /// Authoritative view pitch in radians, positive upward.
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+    /// Current projectile height in map tiles, including pitched flight.
+    pub fn projectile_height(&self, id: u64) -> Option<f32> {
+        self.projectile_heights.get(&id).copied()
+    }
+    /// Current flight pitch in radians, positive upward.
+    pub fn projectile_pitch(&self, id: u64) -> Option<f32> {
+        let projectile = self
+            .projectiles
+            .active()
+            .iter()
+            .find(|projectile| projectile.id == id)?;
+        let vertical = self
+            .projectile_vertical_speeds
+            .get(&id)
+            .copied()
+            .unwrap_or(0.0);
+        Some(vertical.atan2(projectile.velocity[0].hypot(projectile.velocity[1])))
     }
     /// Choose the wall policy for player and wind-driven movement. Defaults to
     /// two-sided. Authored sides apply only to walls the process runtime proves
@@ -1366,6 +1438,19 @@ impl Session {
             return Err(invalid());
         }
         Ok((walls, base_blocking))
+    }
+    fn advance_projectile_heights(&mut self, dt: f32, frozen: &BTreeSet<u64>) {
+        for projectile in self.projectiles.active() {
+            if frozen.contains(&projectile.id) {
+                continue;
+            }
+            if let (Some(height), Some(speed)) = (
+                self.projectile_heights.get_mut(&projectile.id),
+                self.projectile_vertical_speeds.get(&projectile.id),
+            ) {
+                *height += *speed * dt;
+            }
+        }
     }
     /// Execute one prepared process. The bool in an error indicates a failure
     /// during external validation, rather than a denied runtime activation.
@@ -2409,6 +2494,13 @@ impl Session {
             self.world.player.angle =
                 (self.world.player.angle + delta).rem_euclid(std::f32::consts::TAU);
         }
+        if input.pitch_delta.is_finite() {
+            self.pitch = (self.pitch
+                + input
+                    .pitch_delta
+                    .clamp(-MAX_PLAYER_PITCH * 2.0, MAX_PLAYER_PITCH * 2.0))
+            .clamp(-MAX_PLAYER_PITCH, MAX_PLAYER_PITCH);
+        }
         let bounds = self.player_bounds();
         // A closing wall can temporarily leave insufficient clearance; retain
         // the last valid vertical state until the player can move clear.
@@ -2775,7 +2867,8 @@ impl Session {
                     self.world.player.position,
                 )
             } else {
-                self.combat.fire_with_explosions_filtered(
+                let room = self.player_bounds();
+                self.combat.fire_with_aim(
                     self.selected_weapon,
                     ShotContext {
                         inventory: &mut self.game.inventory,
@@ -2786,23 +2879,36 @@ impl Session {
                         world: &self.world,
                         objects: self.objects.as_mut(),
                     },
-                    |wall| {
+                    self.explosions_enabled,
+                    combat::ShotAim {
+                        eye: self.vertical.eye(),
+                        pitch: self.pitch,
+                        floor: room.floor,
+                        ceiling: room.ceiling.unwrap_or(2.0),
+                    },
+                    |wall, height| {
+                        let offset = wall
+                            .cell
+                            .and_then(|[x, y]| {
+                                self.elevation_by_cell
+                                    .get(usize::from(x) * 64 + usize::from(y))
+                            })
+                            .copied()
+                            .unwrap_or(0.0)
+                            / 64.0;
                         Self::blocks_shot(
                             wall,
                             &self.shot_blocking,
                             &self.elevation_by_cell,
-                            self.vertical.eye(),
-                        )
+                            height,
+                        ) && height <= offset + 2.0
                     },
-                    self.explosions_enabled,
                     |cell, raw| {
-                        object_combat_overlaps(
+                        object_combat_bounds(
                             self.object_heights.as_ref(),
                             &self.processes,
                             cell,
                             raw,
-                            self.vertical.eye(),
-                            self.vertical.eye(),
                         )
                     },
                 )
@@ -2909,6 +3015,17 @@ impl Session {
                 };
                 if let Ok(id) = spawned {
                     self.projectile_heights.insert(id, self.vertical.eye());
+                    if self.pitch != 0.0 {
+                        if let Some(projectile) =
+                            self.projectiles.active().iter().find(|p| p.id == id)
+                        {
+                            self.projectile_vertical_speeds.insert(
+                                id,
+                                projectile.velocity[0].hypot(projectile.velocity[1])
+                                    * self.pitch.tan(),
+                            );
+                        }
+                    }
                 } else {
                     self.game.inventory.ammo[self.selected_weapon] =
                         self.game.inventory.ammo[self.selected_weapon].saturating_add(1);
@@ -3026,7 +3143,9 @@ impl Session {
         let mut elapsed = 0.0_f32;
         loop {
             let remaining = (DT - elapsed).max(0.0);
-            let candidate = self.projectiles.trace_next_filtered(
+            let mut legacy_frozen = frozen.clone();
+            legacy_frozen.extend(self.projectile_vertical_speeds.keys().copied());
+            let legacy = self.projectiles.trace_next_filtered(
                 remaining,
                 crate::projectiles::TraceContext {
                     world: &self.world,
@@ -3035,7 +3154,7 @@ impl Session {
                     objects: self.objects.as_ref(),
                 },
                 |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
-                &frozen,
+                &legacy_frozen,
                 |projectile, cell, raw| {
                     let height = self
                         .projectile_heights
@@ -3052,13 +3171,77 @@ impl Session {
                     )
                 },
             );
+            let mut pitched_frozen = frozen.clone();
+            pitched_frozen.extend(
+                self.projectiles
+                    .active()
+                    .iter()
+                    .filter(|p| !self.projectile_vertical_speeds.contains_key(&p.id))
+                    .map(|p| p.id),
+            );
+            let aimed = self.projectiles.trace_next_3d(
+                remaining,
+                crate::projectiles::TraceContext {
+                    world: &self.world,
+                    actors: &self.actors,
+                    definitions: &self.actor_definitions,
+                    objects: self.objects.as_ref(),
+                },
+                &pitched_frozen,
+                |id| {
+                    (
+                        self.projectile_heights.get(&id).copied().unwrap_or(0.75),
+                        self.projectile_vertical_speeds
+                            .get(&id)
+                            .copied()
+                            .unwrap_or(0.0),
+                    )
+                },
+                |wall| {
+                    if !self
+                        .shot_blocking
+                        .get(wall.texture as usize)
+                        .copied()
+                        .unwrap_or(true)
+                    {
+                        return None;
+                    }
+                    let offset = wall
+                        .cell
+                        .and_then(|[x, y]| {
+                            self.elevation_by_cell
+                                .get(usize::from(x) * 64 + usize::from(y))
+                        })
+                        .copied()
+                        .unwrap_or(0.0)
+                        / 64.0;
+                    Some((offset, offset + 2.0))
+                },
+                |cell, raw| {
+                    object_combat_bounds(self.object_heights.as_ref(), &self.processes, cell, raw)
+                },
+                (self.vertical.feet(), self.vertical.head()),
+            );
+            let candidate = match (legacy, aimed) {
+                (Some(a), Some(b)) => Some(
+                    if a.time < b.time || (a.time == b.time && a.projectile_id < b.projectile_id) {
+                        a
+                    } else {
+                        b
+                    },
+                ),
+                (a, b) => a.or(b),
+            };
             let Some(mut impact) = candidate else {
-                self.projectiles.advance_traced(remaining, &frozen);
+                if self.projectiles.advance_traced(remaining, &frozen) {
+                    self.advance_projectile_heights(remaining, &frozen);
+                }
                 break;
             };
             if !self.projectiles.advance_traced(impact.time, &frozen) {
                 break;
             }
+            self.advance_projectile_heights(impact.time, &frozen);
             elapsed = (elapsed + impact.time).min(DT);
             impact.time = elapsed;
             let Some(projectile) = self.projectiles.take(impact.projectile_id) else {
@@ -3069,6 +3252,10 @@ impl Session {
                 .projectile_heights
                 .remove(&impact.projectile_id)
                 .unwrap_or(0.75);
+            events.projectile_impact_heights.push(height);
+            let vertical_speed = self
+                .projectile_vertical_speeds
+                .remove(&impact.projectile_id);
             if impact.target == ImpactTarget::Player
                 && self.game.protective_powerups.reflector_ticks_remaining > 0
             {
@@ -3077,7 +3264,12 @@ impl Session {
                     .reflect_from_player(projectile, self.world.player.position)
                 {
                     self.projectile_heights.insert(impact.projectile_id, height);
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_vertical_speeds
+                            .insert(impact.projectile_id, speed);
+                    }
                     events.projectile_impacts.pop();
+                    events.projectile_impact_heights.pop();
                     events.projectile_reflections.push(ProjectileReflection {
                         projectile_id: impact.projectile_id,
                         rocket_id: impact.rocket_id,
@@ -3090,7 +3282,16 @@ impl Session {
                         .restore_impact(snapshot, impact.projectile_id)
                 }) {
                     self.projectile_heights.insert(impact.projectile_id, height);
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_vertical_speeds
+                            .insert(impact.projectile_id, speed);
+                    }
                     events.projectile_impacts.pop();
+                    events.projectile_impact_heights.pop();
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_heights
+                            .insert(impact.projectile_id, height - speed * elapsed);
+                    }
                     frozen.insert(impact.projectile_id);
                 }
                 continue;
@@ -3137,10 +3338,19 @@ impl Session {
                         .restore_impact(snapshot, impact.projectile_id)
                 }) {
                     self.projectile_heights.insert(impact.projectile_id, height);
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_vertical_speeds
+                            .insert(impact.projectile_id, speed);
+                    }
                     events.projectile_impacts.pop();
+                    events.projectile_impact_heights.pop();
                     events
                         .projectile_reflections
                         .retain(|event| event.projectile_id != impact.projectile_id);
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_heights
+                            .insert(impact.projectile_id, height - speed * elapsed);
+                    }
                     frozen.insert(impact.projectile_id);
                 }
                 continue;
@@ -3174,7 +3384,16 @@ impl Session {
                         .restore_impact(snapshot, impact.projectile_id)
                 }) {
                     self.projectile_heights.insert(impact.projectile_id, height);
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_vertical_speeds
+                            .insert(impact.projectile_id, speed);
+                    }
                     events.projectile_impacts.pop();
+                    events.projectile_impact_heights.pop();
+                    if let Some(speed) = vertical_speed {
+                        self.projectile_heights
+                            .insert(impact.projectile_id, height - speed * elapsed);
+                    }
                     frozen.insert(impact.projectile_id);
                 }
                 continue;
@@ -3521,11 +3740,11 @@ mod tests {
         let envelope = save_format::decode(&encoded).unwrap();
         let original: serde_json::Value = serde_json::from_slice(envelope.payload).unwrap();
         let mut future = original.clone();
-        future["version"] = 3.into();
+        future["version"] = 4.into();
         let envelope = save_format::encode(digest, &serde_json::to_vec(&future).unwrap()).unwrap();
         assert!(matches!(
             session_codec::decode(&envelope, digest),
-            Err(session_codec::SessionCodecError::UnsupportedVersion(3))
+            Err(session_codec::SessionCodecError::UnsupportedVersion(4))
         ));
         let mut legacy = original.clone();
         legacy["version"] = 1.into();
@@ -3544,6 +3763,19 @@ mod tests {
             process.as_object_mut().unwrap().remove("source_active");
         }
         let envelope = save_format::encode(digest, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(session_codec::decode(&envelope, digest).unwrap(), snapshot);
+        let mut legacy_v2 = original.clone();
+        legacy_v2["version"] = 2.into();
+        legacy_v2["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pitch");
+        legacy_v2["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("projectile_vertical_speeds");
+        let envelope =
+            save_format::encode(digest, &serde_json::to_vec(&legacy_v2).unwrap()).unwrap();
         assert_eq!(session_codec::decode(&envelope, digest).unwrap(), snapshot);
         let mut unknown = original.clone();
         unknown["snapshot"]["world"]["future"] = true.into();
@@ -4391,6 +4623,111 @@ mod tests {
         session.game.inventory.weapons[0] = true;
         session.game.inventory.ammo[0] = 5;
         session
+    }
+
+    #[test]
+    fn pitched_hitscan_respects_model_heights_and_room_planes() {
+        let mut straight = height_combat_fixture();
+        let hit = straight.step(SessionInput {
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            hit.shot,
+            Some(FireResult::Fired(ShotImpact::Object { cell: [3, 0], .. }))
+        ));
+        let mut upward = height_combat_fixture();
+        let miss = upward.step(SessionInput {
+            pitch_delta: 0.3,
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            miss.shot,
+            Some(FireResult::Fired(ShotImpact::Miss))
+        ));
+        assert!((upward.pitch() - 0.3).abs() < 1e-6);
+        let mut down = height_combat_fixture();
+        let miss = down.step(SessionInput {
+            pitch_delta: -0.5,
+            fire: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            miss.shot,
+            Some(FireResult::Fired(ShotImpact::Miss))
+        ));
+    }
+
+    #[test]
+    fn pitched_projectile_hits_ceiling_and_preserves_height_in_event() {
+        let mut session = mission_session("");
+        session.game.inventory.weapons[3] = true;
+        session.game.inventory.ammo[3] = 1;
+        session.game.weapons.0[3].rocket_type = 0;
+        session.rockets.0.push(RocketDefinition {
+            model_name: "rocket.3o".into(),
+            power: 10,
+            raw_fields: vec![0, 0, 0, 20, 10],
+        });
+        let baseline = session.clone();
+        session.step(SessionInput {
+            pitch_delta: 0.4,
+            fire: true,
+            select_weapon: Some(3),
+            ..Default::default()
+        });
+        let id = session.projectiles.active()[0].id;
+        assert!(session.projectile_height(id).unwrap() > session.vertical.eye());
+        assert!((session.projectile_pitch(id).unwrap() - 0.4).abs() < 1e-5);
+        let digest = crate::save_format::ContentDigest([17; 32]);
+        let snapshot = session.snapshot(digest).unwrap();
+        let encoded = crate::session_codec::encode(&snapshot).unwrap();
+        let decoded = crate::session_codec::decode(&encoded, digest).unwrap();
+        let mut restored = baseline.restore_from_baseline(&decoded, digest).unwrap();
+        let mut ceiling = None;
+        for _ in 0..60 {
+            let left = session.step(SessionInput::default());
+            let right = restored.step(SessionInput::default());
+            assert_eq!(left.projectile_impacts, right.projectile_impacts);
+            assert_eq!(
+                left.projectile_impact_heights,
+                right.projectile_impact_heights
+            );
+            if !left.projectile_impacts.is_empty() {
+                ceiling = Some((
+                    left.projectile_impacts[0].target,
+                    left.projectile_impact_heights[0],
+                ));
+                break;
+            }
+        }
+        let (target, height) = ceiling.unwrap();
+        assert_eq!(target, ImpactTarget::Plane);
+        assert!((height - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pitch_clamps_and_snapshot_rejects_invalid_values() {
+        let baseline = mission_session("");
+        let mut session = baseline.clone();
+        session.step(SessionInput {
+            pitch_delta: 100.0,
+            ..Default::default()
+        });
+        assert_eq!(session.pitch(), MAX_PLAYER_PITCH);
+        session.step(SessionInput {
+            pitch_delta: f32::NAN,
+            ..Default::default()
+        });
+        assert_eq!(session.pitch(), MAX_PLAYER_PITCH);
+        let digest = crate::save_format::ContentDigest([22; 32]);
+        let snapshot = session.snapshot(digest).unwrap();
+        let restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
+        assert_eq!(restored.pitch(), MAX_PLAYER_PITCH);
+        let mut invalid = snapshot;
+        invalid.pitch = MAX_PLAYER_PITCH + 0.1;
+        assert!(baseline.restore_from_baseline(&invalid, digest).is_err());
     }
 
     #[test]

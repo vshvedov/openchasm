@@ -287,6 +287,39 @@ pub struct ShotContext<'a> {
     pub objects: Option<&'a mut ObjectCombat>,
 }
 
+/// Camera ray in map tiles; pitch is positive upward. Room planes are the
+/// current provisional flat floor/ceiling used by the session.
+#[derive(Debug, Clone, Copy)]
+pub struct ShotAim {
+    pub eye: f32,
+    pub pitch: f32,
+    pub floor: f32,
+    pub ceiling: f32,
+}
+
+/// Clip an XY intersection interval against a vertical cylinder slab.
+pub fn clip_aim_interval(
+    near: f32,
+    far: f32,
+    eye: f32,
+    slope: f32,
+    bounds: Option<(f32, f32)>,
+) -> Option<f32> {
+    let Some((bottom, top)) = bounds else {
+        return Some(near);
+    }; // unknown stays blocking
+    if !bottom.is_finite() || !top.is_finite() || bottom > top {
+        return Some(near);
+    }
+    if slope.abs() < 1e-7 {
+        return (eye >= bottom && eye <= top).then_some(near);
+    }
+    let a = (bottom - eye) / slope;
+    let b = (top - eye) / slope;
+    let enter = near.max(a.min(b));
+    (enter <= far.min(a.max(b))).then_some(enter)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Combat {
     cooldown: f32,
@@ -404,6 +437,58 @@ impl Combat {
     where
         F: Fn(&Wall) -> bool,
     {
+        self.fire_impl(
+            weapon,
+            context,
+            |wall, _| blocks_shots(wall),
+            explosions,
+            None,
+            |cell, raw, near, _| accepts_object(cell, raw).then_some(near),
+        )
+    }
+
+    /// Resolve a pitched hitscan; physical launches are returned to the host.
+    pub fn fire_with_aim(
+        &mut self,
+        weapon: usize,
+        context: ShotContext<'_>,
+        explosions: bool,
+        aim: ShotAim,
+        blocks_shots: impl Fn(&Wall, f32) -> bool,
+        object_bounds: impl Fn([usize; 2], u8) -> Option<(f32, f32)>,
+    ) -> FireResult {
+        if !aim.eye.is_finite()
+            || !aim.pitch.is_finite()
+            || !aim.floor.is_finite()
+            || !aim.ceiling.is_finite()
+            || aim.floor > aim.ceiling
+            || aim.pitch.abs() >= std::f32::consts::FRAC_PI_2
+        {
+            return FireResult::InvalidShooter;
+        }
+        let slope = aim.pitch.tan();
+        self.fire_impl(
+            weapon,
+            context,
+            blocks_shots,
+            explosions,
+            Some(aim),
+            |cell, raw, near, far| {
+                clip_aim_interval(near, far, aim.eye, slope, object_bounds(cell, raw))
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fire_impl(
+        &mut self,
+        weapon: usize,
+        context: ShotContext<'_>,
+        blocks_shots: impl Fn(&Wall, f32) -> bool,
+        explosions: bool,
+        aim: Option<ShotAim>,
+        contact_object: impl Fn([usize; 2], u8, f32, f32) -> Option<f32>,
+    ) -> FireResult {
         let ShotContext {
             inventory,
             weapons,
@@ -459,13 +544,28 @@ impl Combat {
         world.ray_hits(direction, &mut hits);
         let wall_hit = hits
             .into_iter()
-            .filter(|(_, index, _)| blocks_shots(&world.walls[*index]))
+            .filter(|(distance, index, _)| {
+                blocks_shots(
+                    &world.walls[*index],
+                    aim.map_or(1.0, |a| a.eye + distance * a.pitch.tan()),
+                )
+            })
             .map(|(distance, index, _)| (distance, index))
             .min_by(|a, b| a.0.total_cmp(&b.0));
-        let mut nearest = wall_hit.map_or(MAX_RANGE, |(distance, _)| distance.min(MAX_RANGE));
+        let room_limit = aim.map_or(MAX_RANGE, |a| {
+            let slope = a.pitch.tan();
+            if slope > 1e-7 {
+                ((a.ceiling - a.eye) / slope).clamp(0.0, MAX_RANGE)
+            } else if slope < -1e-7 {
+                ((a.floor - a.eye) / slope).clamp(0.0, MAX_RANGE)
+            } else {
+                MAX_RANGE
+            }
+        });
+        let mut nearest = wall_hit.map_or(room_limit, |(distance, _)| distance.min(room_limit));
         let mut selected = None;
         let mut object_hit = objects.as_deref().and_then(|objects| {
-            objects.raycast_filtered(player.position, direction, nearest, 0.0, accepts_object)
+            objects.raycast_intervals(player.position, direction, nearest, 0.0, contact_object)
         });
         if let Some(hit) = object_hit {
             nearest = hit.distance;
@@ -497,7 +597,17 @@ impl Combat {
             if far < 0.0 {
                 continue;
             }
-            let distance = near.max(0.0);
+            let Some(distance) = aim.map_or(Some(near.max(0.0)), |a| {
+                clip_aim_interval(
+                    near.max(0.0),
+                    far.min(nearest),
+                    a.eye,
+                    a.pitch.tan(),
+                    Some((0.0, 2.0)),
+                )
+            }) else {
+                continue;
+            };
             if distance < nearest {
                 nearest = distance;
                 selected = Some(index);
@@ -530,7 +640,7 @@ impl Combat {
                 distance: nearest,
             })
         } else if let Some((distance, index)) =
-            wall_hit.filter(|(distance, _)| *distance <= MAX_RANGE)
+            wall_hit.filter(|(distance, _)| *distance <= nearest)
         {
             FireResult::Fired(ShotImpact::Wall {
                 wall_index: index,

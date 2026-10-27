@@ -1,7 +1,7 @@
 //! Client-only explosion sprites. No simulation, network, or audio state.
 //!
 //! The original indexed OBJ sprite is played at a provisional 15 frames/s.
-//! One billboard per event approximates the original's multi-particle burst.
+//! One billboard per explosion event approximates the original's burst.
 //! Palette index 255 is transparent; depth testing uses the supplied world
 //! buffer, which is never modified. Fullbright, light flashes, particles and
 //! sprite-to-translucent-object ordering are not reconstructed here.
@@ -103,7 +103,11 @@ impl Sprite {
 #[derive(Clone, Copy)]
 struct Effect {
     position: [f32; 3],
+    velocity: [f32; 3],
     age_ticks: u32,
+    gravity: bool,
+    bounce: bool,
+    looping: bool,
 }
 
 pub struct ExplosionRenderer {
@@ -111,16 +115,21 @@ pub struct ExplosionRenderer {
     palette: [u32; 256],
     effects: Vec<Effect>,
     projectile_explosions: Vec<bool>,
+    half_size: bool,
 }
 impl ExplosionRenderer {
-    /// Load the original effect; unavailable or malformed content returns an
-    /// error so callers can disable presentation without affecting gameplay.
-    pub fn load(
+    #[cfg(test)]
+    pub(crate) fn effect_count(&self) -> usize {
+        self.effects.len()
+    }
+    /// Load an indexed world-effect sprite with the shared palette and depth
+    /// renderer. Other effect kinds provide their own event selection.
+    pub fn load_sprite(
         resources: &mut ResourceSet,
         palette: &Palette,
-        rockets: &openchasm::combat::RocketDefinitions,
+        path: &str,
     ) -> io::Result<Self> {
-        let sprite = Sprite::parse(&resources.read("sprite_effects/exp.obj")?)?;
+        let sprite = Sprite::parse(&resources.read(path)?)?;
         Ok(Self {
             sprite,
             palette: std::array::from_fn(|index| {
@@ -128,24 +137,57 @@ impl ExplosionRenderer {
                 (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
             }),
             effects: Vec::new(),
-            projectile_explosions: rockets
-                .0
-                .iter()
-                .map(|rocket| {
-                    !rocket.model_name.is_empty() && rocket.raw_fields.first() == Some(&2)
-                })
-                .collect(),
+            projectile_explosions: Vec::new(),
+            half_size: false,
         })
+    }
+    /// Load the original effect; unavailable or malformed content returns an
+    /// error so callers can disable presentation without affecting gameplay.
+    pub fn load(
+        resources: &mut ResourceSet,
+        palette: &Palette,
+        rockets: &openchasm::combat::RocketDefinitions,
+    ) -> io::Result<Self> {
+        let mut renderer = Self::load_sprite(resources, palette, "sprite_effects/exp.obj")?;
+        renderer.projectile_explosions = rockets
+            .0
+            .iter()
+            .map(|rocket| !rocket.model_name.is_empty() && rocket.raw_fields.first() == Some(&2))
+            .collect();
+        Ok(renderer)
     }
     /// Add a committed visual event in map tiles. Reject invalid positions and
     /// capacity overflow, leaving all existing effects untouched.
     pub fn spawn(&mut self, position: [f32; 3]) -> bool {
-        if !position.iter().all(|x| x.is_finite()) || self.effects.len() >= MAX_EFFECTS {
+        self.spawn_particle(position, [0.0; 3], false, false, false)
+    }
+    /// Configure authored HalfSize for the sprite before spawning particles.
+    pub fn set_half_size(&mut self, half_size: bool) {
+        self.half_size = half_size;
+    }
+    pub fn spawn_particle(
+        &mut self,
+        position: [f32; 3],
+        velocity: [f32; 3],
+        gravity: bool,
+        bounce: bool,
+        looping: bool,
+    ) -> bool {
+        if !position
+            .iter()
+            .chain(velocity.iter())
+            .all(|x| x.is_finite())
+            || self.effects.len() >= MAX_EFFECTS
+        {
             return false;
         }
         self.effects.push(Effect {
             position,
+            velocity,
             age_ticks: 0,
+            gravity,
+            bounce,
+            looping,
         });
         true
     }
@@ -182,8 +224,27 @@ impl ExplosionRenderer {
         let duration = self.sprite.frames.len() as u32 * TICKS_PER_FRAME;
         for effect in &mut self.effects {
             effect.age_ticks += 1;
+            if effect.gravity {
+                effect.velocity[2] -= 5.0 / 60.0;
+            }
+            for (position, velocity) in effect.position.iter_mut().zip(effect.velocity) {
+                *position += velocity / 60.0;
+            }
+            if effect.position[2] < 0.0 {
+                if effect.bounce {
+                    effect.position[2] = 0.0;
+                    effect.velocity[0] *= 0.5;
+                    effect.velocity[1] *= 0.5;
+                    effect.velocity[2] *= -0.5;
+                }
+                if !effect.looping || effect.velocity[2].abs() < 0.2 {
+                    effect.age_ticks = 601;
+                }
+            }
         }
-        self.effects.retain(|effect| effect.age_ticks < duration);
+        self.effects.retain(|effect| {
+            effect.age_ticks <= 600 && (effect.looping || effect.age_ticks < duration)
+        });
     }
     pub fn clear(&mut self) {
         self.effects.clear();
@@ -203,6 +264,7 @@ impl ExplosionRenderer {
             || width.checked_mul(height) != Some(frame.len())
             || frame.len() != depth.len()
             || !camera.eye_height.is_finite()
+            || !camera.pitch.is_finite()
             || !camera.player.angle.is_finite()
             || !camera.player.position.iter().all(|x| x.is_finite())
         {
@@ -220,12 +282,14 @@ impl ExplosionRenderer {
         }
         sorted.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         for (distance, side, effect) in sorted {
-            let image = &self.sprite.frames[(effect.age_ticks / TICKS_PER_FRAME) as usize];
-            let scale_x = width as f32 * 0.5 / (distance * CAMERA_PLANE * 64.0);
-            let scale_y = height as f32 * 0.5 / (distance * 64.0);
+            let image = &self.sprite.frames
+                [(effect.age_ticks / TICKS_PER_FRAME) as usize % self.sprite.frames.len()];
+            let size_factor = if self.half_size { 0.5 } else { 1.0 };
+            let scale_x = width as f32 * 0.5 * size_factor / (distance * CAMERA_PLANE * 64.0);
+            let scale_y = height as f32 * 0.5 * size_factor / (distance * 64.0);
             let center_x = width as f32 * 0.5 * (1.0 + side / (distance * CAMERA_PLANE));
-            let center_y =
-                height as f32 * 0.5 * (1.0 - (effect.position[2] - camera.eye_height) / distance);
+            let center_y = camera.horizon(height)
+                - height as f32 * 0.5 * (effect.position[2] - camera.eye_height) / distance;
             let left = center_x - image.center as f32 * scale_x;
             let top = center_y - self.sprite.height as f32 * 0.5 * scale_y;
             let right = left + image.width as f32 * scale_x;
@@ -275,6 +339,7 @@ mod tests {
             palette,
             effects: Vec::new(),
             projectile_explosions: vec![true, false],
+            half_size: false,
         }
     }
     #[test]
@@ -296,6 +361,7 @@ mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let mut frame = vec![0; 64 * 64];
         let depth = vec![f32::INFINITY; frame.len()];
@@ -316,6 +382,22 @@ mod tests {
         assert!(renderer.effects.is_empty());
     }
     #[test]
+    fn moving_particles_apply_gravity_floor_bounce_and_expiry() {
+        let mut renderer = renderer();
+        assert!(renderer.spawn_particle([0.0, 0.0, 0.001], [0.6, 0.0, -0.5], true, true, true));
+        renderer.tick();
+        let particle = renderer.effects[0];
+        assert_eq!(particle.position[2], 0.0);
+        assert!((particle.position[0] - 0.01).abs() < 0.00001);
+        assert!((particle.velocity[0] - 0.3).abs() < 0.00001);
+        assert!((particle.velocity[2] - (0.5 + 5.0 / 60.0) / 2.0).abs() < 0.00001);
+        for _ in 0..100 {
+            renderer.tick();
+        }
+        assert!(renderer.effects.is_empty());
+        assert!(!renderer.spawn_particle([0.0; 3], [f32::NAN, 0.0, 0.0], true, true, true));
+    }
+    #[test]
     fn installed_explosion_sprite_decodes_when_available() {
         let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
         let path = explicit
@@ -326,12 +408,22 @@ mod tests {
             return;
         }
         let mut resources = ResourceSet::open(&path).unwrap();
-        let sprite = Sprite::parse(&resources.read("sprite_effects/exp.obj").unwrap()).unwrap();
-        assert!(sprite.frames.len() > 1);
-        assert!(sprite
-            .frames
-            .iter()
-            .any(|frame| frame.pixels.iter().any(|&pixel| pixel != 255)));
+        for name in ["exp", "bullet", "blood", "s"] {
+            let sprite = Sprite::parse(
+                &resources
+                    .read(&format!("sprite_effects/{name}.obj"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(sprite.frames.len() > 1, "{name}");
+            assert!(
+                sprite
+                    .frames
+                    .iter()
+                    .any(|frame| frame.pixels.iter().any(|&pixel| pixel != 255)),
+                "{name}"
+            );
+        }
     }
     #[test]
     fn consumes_only_typed_supported_committed_explosions_in_order() {

@@ -90,10 +90,18 @@ pub enum SpawnError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImpactTarget {
-    Wall { wall_index: usize },
-    Actor { source_index: usize },
+    Wall {
+        wall_index: usize,
+    },
+    Actor {
+        source_index: usize,
+    },
     Player,
-    Object { cell: [usize; 2] },
+    Object {
+        cell: [usize; 2],
+    },
+    /// Provisional flat floor or ceiling contact.
+    Plane,
     Expired,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -359,6 +367,162 @@ impl ProjectileSystem {
         };
         self.projectiles.push(projectile.clone());
         true
+    }
+
+    /// Chronological 3D trace using host-owned heights and vertical speeds.
+    /// Horizontal cylinders and 2-tile walls/room planes are provisional.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_next_3d(
+        &self,
+        horizon: f32,
+        context: TraceContext<'_>,
+        frozen: &BTreeSet<u64>,
+        vertical: impl Fn(u64) -> (f32, f32),
+        wall_bounds: impl Fn(&Wall) -> Option<(f32, f32)>,
+        object_bounds: impl Fn([usize; 2], u8) -> Option<(f32, f32)>,
+        player_bounds: (f32, f32),
+    ) -> Option<Impact> {
+        if !horizon.is_finite() || horizon < 0.0 {
+            return None;
+        }
+        let mut nearest: Option<Impact> = None;
+        for p in self.projectiles.iter().filter(|p| !frozen.contains(&p.id)) {
+            let duration = horizon.min(p.remaining);
+            let delta = [p.velocity[0] * duration, p.velocity[1] * duration];
+            let (height, speed_z) = vertical(p.id);
+            if !height.is_finite() || !speed_z.is_finite() {
+                continue;
+            }
+            let dz = speed_z * duration;
+            let mut chosen: Option<(f32, ImpactTarget)> = None;
+            let mut consider = |t: f32, target| {
+                if (0.0..=1.0).contains(&t) && chosen.is_none_or(|(best, _)| t < best) {
+                    chosen = Some((t, target));
+                }
+            };
+            let clip = |entry: f32, exit: f32, bounds: Option<(f32, f32)>| {
+                let expanded = bounds.map(|(bottom, top)| (bottom - p.radius, top + p.radius));
+                crate::combat::clip_aim_interval(entry, exit, height, dz, expanded)
+            };
+            for (index, wall) in context.world.walls.iter().enumerate() {
+                let Some(bounds) = wall_bounds(wall) else {
+                    continue;
+                };
+                if let Some(entry) = sweep_wall(p.position, delta, p.radius, wall) {
+                    let end = add_scaled(p.position, delta, 1.0);
+                    let reverse = [-delta[0], -delta[1]];
+                    let exit = sweep_wall(end, reverse, p.radius, wall).map_or(1.0, |t| 1.0 - t);
+                    if let Some(t) = clip(entry, exit, Some(bounds)) {
+                        consider(t, ImpactTarget::Wall { wall_index: index });
+                    }
+                }
+            }
+            let length = delta[0].hypot(delta[1]);
+            if length > 1e-8 {
+                if let Some(hit) = context.objects.and_then(|objects| {
+                    objects.raycast_intervals(
+                        p.position,
+                        p.velocity,
+                        length,
+                        p.radius,
+                        |cell, raw, near, far| {
+                            clip(near / length, far / length, object_bounds(cell, raw))
+                                .map(|t| t * length)
+                        },
+                    )
+                }) {
+                    consider(
+                        hit.distance / length,
+                        ImpactTarget::Object { cell: hit.cell },
+                    );
+                }
+            }
+            for actor in &context.actors.actors {
+                if actor.health <= 0
+                    || matches!(p.owner, Owner::Enemy { source_index } if source_index == actor.source_index)
+                {
+                    continue;
+                }
+                let Some(def) = context.definitions.entries.get(actor.definition_index) else {
+                    continue;
+                };
+                let radius = (def.wall_radius as f32 / UNITS_PER_TILE).clamp(0.05, 2.0) + p.radius;
+                if let Some(entry) = sweep_circle(p.position, delta, actor.position, radius) {
+                    let end = add_scaled(p.position, delta, 1.0);
+                    let exit = sweep_circle(end, [-delta[0], -delta[1]], actor.position, radius)
+                        .map_or(1.0, |t| 1.0 - t);
+                    if let Some(t) = clip(entry, exit, Some((0.0, 2.0))) {
+                        consider(
+                            t,
+                            ImpactTarget::Actor {
+                                source_index: actor.source_index,
+                            },
+                        );
+                    }
+                }
+            }
+            if matches!(p.owner, Owner::Enemy { .. }) {
+                if let Some(entry) = sweep_circle(
+                    p.position,
+                    delta,
+                    context.world.player.position,
+                    PLAYER_RADIUS + p.radius,
+                ) {
+                    let end = add_scaled(p.position, delta, 1.0);
+                    let exit = sweep_circle(
+                        end,
+                        [-delta[0], -delta[1]],
+                        context.world.player.position,
+                        PLAYER_RADIUS + p.radius,
+                    )
+                    .map_or(1.0, |t| 1.0 - t);
+                    if let Some(t) = clip(entry, exit, Some(player_bounds)) {
+                        consider(t, ImpactTarget::Player);
+                    }
+                }
+            }
+            // The current maps use a provisional flat room. Plane hits are
+            // centered on the projectile rather than introducing unknown bounce.
+            if dz > 1e-8 {
+                consider((2.0 - height) / dz, ImpactTarget::Plane);
+            } else if dz < -1e-8 {
+                consider(-height / dz, ImpactTarget::Plane);
+            }
+            if let Some((t, target)) = chosen {
+                let hit = Impact {
+                    projectile_id: p.id,
+                    owner: p.owner,
+                    rocket_id: p.rocket_id,
+                    target,
+                    position: add_scaled(p.position, delta, t),
+                    damage: p.damage,
+                    time: duration * t,
+                };
+                if nearest.is_none_or(|best| {
+                    hit.time < best.time
+                        || (hit.time == best.time && hit.projectile_id < best.projectile_id)
+                }) {
+                    nearest = Some(hit);
+                }
+            } else if p.remaining <= horizon {
+                let hit = Impact {
+                    projectile_id: p.id,
+                    owner: p.owner,
+                    rocket_id: p.rocket_id,
+                    target: ImpactTarget::Expired,
+                    position: add_scaled(p.position, delta, 1.0),
+                    damage: 0,
+                    time: duration,
+                };
+                if nearest.is_none_or(|best| {
+                    hit.time < best.time
+                        || (hit.time == best.time && hit.projectile_id < best.projectile_id)
+                }) {
+                    nearest = Some(hit);
+                }
+            }
+        }
+        nearest
     }
 
     /// Predict the next impact from current state without changing it. The
@@ -859,6 +1023,47 @@ mod tests {
         assert_eq!(actors.actors[0].health, 100, "caller applies event damage");
         assert!(system.active().is_empty());
     }
+    #[test]
+    fn pitched_trace_skips_low_wall_and_hits_actor_in_chronological_order() {
+        let (rockets, defs, actors, mut world) = setup();
+        world.walls.push(wall(1.0));
+        let mut system = ProjectileSystem::new();
+        system
+            .spawn(launch(Owner::Player, [0.0, 0.0], [1.0, 0.0]), &rockets)
+            .unwrap();
+        let context = || TraceContext {
+            world: &world,
+            actors: &actors,
+            definitions: &defs,
+            objects: None,
+        };
+        let hit = system
+            .trace_next_3d(
+                0.5,
+                context(),
+                &BTreeSet::new(),
+                |_| (0.5, 5.0),
+                |_| Some((0.0, 0.5)),
+                |_, _| None,
+                (0.0, 1.0),
+            )
+            .unwrap();
+        assert_eq!(hit.target, ImpactTarget::Actor { source_index: 0 });
+        let blocked = system
+            .trace_next_3d(
+                0.5,
+                context(),
+                &BTreeSet::new(),
+                |_| (0.5, 5.0),
+                |_| Some((0.0, 2.0)),
+                |_, _| None,
+                (0.0, 1.0),
+            )
+            .unwrap();
+        assert_eq!(blocked.target, ImpactTarget::Wall { wall_index: 0 });
+        assert!(blocked.time < hit.time);
+    }
+
     #[test]
     fn long_tick_does_not_tunnel_through_wall_and_respects_shot_material() {
         let (rockets, defs, actors, mut world) = setup();

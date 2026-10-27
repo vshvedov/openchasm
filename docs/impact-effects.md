@@ -1,0 +1,5 @@
+# Impact effects
+
+Committed impacts spawn bounded, presentation-only particles using the installed indexed sprites. Bullet impacts show `bullet.obj` and three rising `sm3.obj` puffs; blood impacts produce twelve `blood.obj`/`bloodb.obj` droplets; physical spark impacts use 48 `s.obj` sparks and five `sm3.obj` puffs. Selection follows the projectile's authored blow-effect field and hit target; explosive impacts use the separate explosion renderer. Particle randomness is deterministic and never changes simulation or network state.
+
+The implementation follows the independent PanzerChasm reference's 15 frames per second, half-size particle scale, initial velocities, gravity, floor bounce and looping lifetime. Palette index 255 is transparent; sprites are depth tested against the world. Positions, lighting, floor height, exact projectile impact height, particle ordering across different sprite types, and the original game's precise visuals remain approximate. The reference's dynamic impact light flash is not yet rendered. Missing particle resources disable only their visual component.

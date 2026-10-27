@@ -3,6 +3,7 @@ mod audio;
 mod content;
 mod explosion_render;
 mod gltf_model;
+mod impact_render;
 mod launcher;
 mod object_height_loader;
 mod object_render;
@@ -345,7 +346,7 @@ fn parse_options(
 }
 
 /// Increment whenever simulation rules or startup interpretation changes.
-const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v1";
+const SAVE_RULES_ID: &[u8] = b"openchasm-gameplay-rules-v2";
 
 fn finish_level_fingerprint(
     mut trace: content::ResourceTrace,
@@ -596,6 +597,7 @@ fn play(
         let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
         let projectile_renderer =
             projectile_render::ProjectileRenderer::load(resources, &rockets, &palette);
+        let impact_renderer = impact_render::ImpactRenderer::load(resources, &palette, &rockets);
         let explosion_renderer =
             match explosion_render::ExplosionRenderer::load(resources, &palette, &rockets) {
                 Ok(renderer) => Some(renderer),
@@ -690,6 +692,7 @@ fn play(
                 weapon_overlay,
                 projectile_renderer,
                 explosion_renderer,
+                impact_renderer: Some(impact_renderer),
                 difficulty,
                 teleport_load_error,
                 content_digest,

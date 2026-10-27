@@ -259,6 +259,7 @@ mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
         );
         image

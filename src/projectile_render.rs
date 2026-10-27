@@ -163,13 +163,13 @@ impl ProjectileRenderer {
                 if clipped.len() < 3 {
                     continue;
                 }
-                let first = project(clipped[0], width, height);
+                let first = project(clipped[0], width, height, camera.horizon(height));
                 for i in 1..clipped.len() - 1 {
                     raster.triangle(
                         [
                             first,
-                            project(clipped[i], width, height),
-                            project(clipped[i + 1], width, height),
+                            project(clipped[i], width, height, camera.horizon(height)),
+                            project(clipped[i + 1], width, height, camera.horizon(height)),
                         ],
                         mesh,
                         polygon.flags,
@@ -226,11 +226,11 @@ struct Projected {
     u_inverse: f32,
     v_inverse: f32,
 }
-fn project(vertex: Vertex, width: usize, height: usize) -> Projected {
+fn project(vertex: Vertex, width: usize, height: usize, horizon: f32) -> Projected {
     let inverse = vertex.depth.recip();
     Projected {
         x: width as f32 * 0.5 * (1.0 + vertex.side * inverse / CAMERA_PLANE),
-        y: height as f32 * 0.5 * (1.0 - vertex.up * inverse),
+        y: horizon - height as f32 * 0.5 * vertex.up * inverse,
         inverse,
         u_inverse: vertex.uv[0] * inverse,
         v_inverse: vertex.uv[1] * inverse,
@@ -298,6 +298,26 @@ impl Raster<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pitched_projectile_uses_shared_world_horizon() {
+        let point = Vertex {
+            side: 0.0,
+            up: 2.0,
+            depth: 4.0,
+            uv: [0.0, 0.0],
+        };
+        let camera = CameraView {
+            player: crate::world::Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.5_f32.atan(),
+        };
+        let result = project(point, 640, 400, camera.horizon(400));
+        assert!((result.y - 200.0).abs() < 0.001);
+        assert_eq!(result.inverse, 0.25);
+    }
     use openchasm::model::{Polygon, Vertex as ModelVertex};
     use openchasm::world::Player;
 
@@ -350,6 +370,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.0,
+                pitch: 0.0,
             },
             &[shot],
         );
@@ -363,6 +384,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.0,
+                pitch: 0.0,
             },
             &[shot],
         );
@@ -378,6 +400,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.0,
+                pitch: 0.0,
             },
             &[shot],
         );
@@ -390,6 +413,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.0,
+                pitch: 0.0,
             },
             &[shot],
         );
@@ -423,6 +447,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 0.75,
+                pitch: 0.0,
             },
             &[shot],
         );
@@ -437,6 +462,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.15,
+                pitch: 0.0,
             },
             &[shot],
         );
@@ -467,6 +493,7 @@ mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
             &[shot],
         );

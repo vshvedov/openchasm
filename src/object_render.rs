@@ -64,6 +64,19 @@ fn intact_actor_primitive(name: &str, mode: ActorAnimationMode) -> bool {
 pub struct CameraView {
     pub player: Player,
     pub eye_height: f32,
+    /// Positive radians look upward; projection uses a provisional horizon shift.
+    pub pitch: f32,
+}
+impl CameraView {
+    pub fn horizon(self, height: usize) -> f32 {
+        let limit = std::f32::consts::FRAC_PI_2 * 0.65;
+        let pitch = if self.pitch.is_finite() {
+            self.pitch.clamp(-limit, limit)
+        } else {
+            0.0
+        };
+        height as f32 * 0.5 * (1.0 + pitch.tan())
+    }
 }
 
 /// Provisional mapping from simulation behavior to CAR animation slots.
@@ -285,11 +298,11 @@ struct ScreenVertex {
     u_over_depth: f32,
     v_over_depth: f32,
 }
-fn project(v: Vertex, width: usize, height: usize) -> ScreenVertex {
+fn project(v: Vertex, width: usize, height: usize, horizon: f32) -> ScreenVertex {
     let inv_depth = v.depth.recip();
     ScreenVertex {
         x: width as f32 * 0.5 * (1.0 + v.side * inv_depth / CAMERA_PLANE),
-        y: height as f32 * 0.5 * (1.0 - v.up * inv_depth),
+        y: horizon - height as f32 * 0.5 * v.up * inv_depth,
         inv_depth,
         u_over_depth: v.uv[0] * inv_depth,
         v_over_depth: v.uv[1] * inv_depth,
@@ -636,13 +649,28 @@ fn draw_gltf(raster: &mut Raster<'_>, mesh: &Mesh, instance: &Instance, camera: 
             if clipped.len() < 3 {
                 continue;
             }
-            let first = project(clipped[0], raster.width, raster.height);
+            let first = project(
+                clipped[0],
+                raster.width,
+                raster.height,
+                camera.horizon(raster.height),
+            );
             for i in 1..clipped.len() - 1 {
                 raster.gltf_triangle(
                     [
                         first,
-                        project(clipped[i], raster.width, raster.height),
-                        project(clipped[i + 1], raster.width, raster.height),
+                        project(
+                            clipped[i],
+                            raster.width,
+                            raster.height,
+                            camera.horizon(raster.height),
+                        ),
+                        project(
+                            clipped[i + 1],
+                            raster.width,
+                            raster.height,
+                            camera.horizon(raster.height),
+                        ),
                     ],
                     image,
                 );
@@ -1472,13 +1500,13 @@ impl ObjectScene {
                 if clipped.len() < 3 {
                     continue;
                 }
-                let first = project(clipped[0], width, height);
+                let first = project(clipped[0], width, height, camera.horizon(height));
                 for i in 1..clipped.len() - 1 {
                     raster.triangle(
                         [
                             first,
-                            project(clipped[i], width, height),
-                            project(clipped[i + 1], width, height),
+                            project(clipped[i], width, height, camera.horizon(height)),
+                            project(clipped[i + 1], width, height, camera.horizon(height)),
                         ],
                         &mesh.model,
                         polygon.flags,
@@ -1493,6 +1521,32 @@ impl ObjectScene {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn pitched_projection_matches_center_aim_slope() {
+        let camera = CameraView {
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+            eye_height: 1.0,
+            pitch: 0.5_f32.atan(),
+        };
+        let point = Vertex {
+            side: 0.0,
+            up: 2.0,
+            depth: 4.0,
+            uv: [0.0, 0.0],
+        };
+        let projected = project(point, 640, 400, camera.horizon(400));
+        assert!((projected.y - 200.0).abs() < 0.001);
+        assert!((projected.x - 320.0).abs() < 0.001);
+        assert_eq!(projected.inv_depth, 0.25);
+        let invalid = CameraView {
+            pitch: f32::NAN,
+            ..camera
+        };
+        assert_eq!(invalid.horizon(400), 200.0);
+    }
     pub(crate) type RestoreTestEntry = (Option<[usize; 2]>, Option<usize>, [f32; 2], bool);
     pub(crate) fn restore_test_state(scene: &ObjectScene) -> Vec<RestoreTestEntry> {
         scene
@@ -1513,6 +1567,7 @@ pub(crate) mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let lights =
             openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&LightSourcesSnapshot {
@@ -1697,6 +1752,7 @@ pub(crate) mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let mut frame = vec![0; 160 * 100];
         let mut depth = vec![f32::INFINITY; frame.len()];
@@ -1837,6 +1893,7 @@ pub(crate) mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let mut frame = vec![0; 64 * 64];
         let mut depth = vec![f32::INFINITY; frame.len()];
@@ -1902,6 +1959,7 @@ pub(crate) mod tests {
                 angle: 0.0,
             },
             eye_height: 0.75,
+            pitch: 0.0,
         };
         let mut frame = vec![0; 160 * 100];
         let mut depth = vec![f32::INFINITY; frame.len()];
@@ -1933,6 +1991,7 @@ pub(crate) mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let mut frame = vec![0; 64 * 64];
         let mut depth = vec![1.0; 64 * 64];
@@ -1983,6 +2042,7 @@ pub(crate) mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             };
             let mut frame = vec![0; 160 * 100];
             let mut depth = vec![f32::INFINITY; frame.len()];
@@ -2448,6 +2508,7 @@ pub(crate) mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
         );
         assert!(frame.iter().any(|&pixel| pixel != 0));
@@ -2470,6 +2531,7 @@ pub(crate) mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.2,
+                pitch: 0.0,
             },
         );
         assert!(top(&frame) > low_eye_top + 2);

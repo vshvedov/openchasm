@@ -78,10 +78,11 @@ impl PlaneRenderer {
             return;
         }
         let (sin, cos) = angle.sin_cos();
-        let horizon = height as f32 / 2.0;
+        let projection = height as f32 / 2.0;
+        let horizon = camera.horizon(height);
         let camera_plane = [-sin * 0.66, cos * 0.66];
         for (y, row) in frame.chunks_mut(width).enumerate() {
-            let ceiling = y < height / 2;
+            let ceiling = (y as f32 + 0.5) < horizon;
             let background = if ceiling {
                 SKY_BACKGROUND
             } else {
@@ -94,7 +95,7 @@ impl PlaneRenderer {
                     *pixel = sky.sample([
                         cos + camera_plane[0] * camera_x,
                         sin + camera_plane[1] * camera_x,
-                        (horizon - (y as f32 + 0.5)) / horizon,
+                        (horizon - (y as f32 + 0.5)) / projection,
                     ]);
                 }
             }
@@ -111,7 +112,7 @@ impl PlaneRenderer {
             if plane_height <= 0.0 {
                 continue;
             }
-            let distance = horizon * plane_height / delta;
+            let distance = projection * plane_height / delta;
             let start = [
                 position[0] + distance * (cos - camera_plane[0]),
                 position[1] + distance * (sin - camera_plane[1]),
@@ -190,6 +191,7 @@ mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let mut frame = vec![0; 64];
         renderer.render(&mut frame, 8, 8, camera);
@@ -217,12 +219,49 @@ mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
         );
         assert!(image[4] & 0x00ff00 > 0);
         assert_eq!(image[4] & 0xff00ff, 0);
         assert!(image[7 * 8 + 4] & 0xff0000 > 0);
         assert_eq!(image[7 * 8 + 4] & 0x00ffff, 0);
+    }
+    #[test]
+    fn looking_up_moves_horizon_down_with_floor_depth_preserved() {
+        let (map, floors, palette) = fixtures(0, 1);
+        let renderer = PlaneRenderer::new(&map, &floors, &palette);
+        let player = crate::world::Player {
+            position: [16.5, 16.5],
+            angle: 0.0,
+        };
+        let mut level = vec![0; 64];
+        let mut up = level.clone();
+        renderer.render(
+            &mut level,
+            8,
+            8,
+            CameraView {
+                player,
+                eye_height: 1.0,
+                pitch: 0.0,
+            },
+        );
+        renderer.render(
+            &mut up,
+            8,
+            8,
+            CameraView {
+                player,
+                eye_height: 1.0,
+                pitch: 0.5_f32.atan(),
+            },
+        );
+        // The center row changes from floor (red) to ceiling (green).
+        assert_ne!(level[4 * 8 + 4] & 0xff0000, 0);
+        assert_ne!(up[4 * 8 + 4] & 0x00ff00, 0);
+        // The same distance from the shifted horizon has the same shade.
+        assert_eq!(level[5 * 8 + 4], (up[4 * 8 + 4] << 8) & 0xff0000);
     }
 
     #[test]
@@ -238,6 +277,7 @@ mod tests {
                 angle: 0.0,
             },
             eye_height: 1.0,
+            pitch: 0.0,
         };
         let light =
             openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&LightSourcesSnapshot {
@@ -280,6 +320,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 0.75,
+                pitch: 0.0,
             },
         );
         renderer.render(
@@ -289,6 +330,7 @@ mod tests {
             CameraView {
                 player,
                 eye_height: 1.25,
+                pitch: 0.0,
             },
         );
         // Higher camera sees a more distant floor and a closer ceiling.
@@ -310,6 +352,7 @@ mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
         );
         assert_eq!(image[4], SKY_BACKGROUND);
@@ -331,6 +374,7 @@ mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
         );
         assert_eq!(image[4], SKY_BACKGROUND);
@@ -346,6 +390,7 @@ mod tests {
                     angle: 0.0,
                 },
                 eye_height: 1.0,
+                pitch: 0.0,
             },
         );
         assert_eq!(short, [42; 3]);

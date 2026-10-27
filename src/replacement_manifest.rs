@@ -263,6 +263,7 @@ mod tests {
                     angle: player.direction_radians(),
                 },
                 eye_height: 0.75,
+                pitch: 0.0,
             };
             let mut frame = vec![0; 640 * 400];
             let mut depth = vec![f32::INFINITY; 640 * 400];

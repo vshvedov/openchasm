@@ -2,6 +2,7 @@
 use crate::audio::Audio;
 use crate::object_render::{ActorAnimationMode, ObjectScene};
 use crate::planes::PlaneRenderer;
+use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
 use crate::texture::CelImage;
 use crate::weapon_render::{WeaponPose, WeaponRenderer};
 use crate::world::{Input, World};
@@ -146,6 +147,7 @@ pub struct ClientFeedback {
     pub session: Session,
     pub audio: Audio,
     pub weapon_overlay: WeaponRenderer,
+    pub projectile_renderer: ProjectileRenderer,
 }
 
 pub fn run(
@@ -159,6 +161,7 @@ pub fn run(
         mut session,
         audio,
         weapon_overlay,
+        projectile_renderer,
     } = feedback;
     let initial_session = session.clone();
     for cell in session.game.pickups.hidden_cells() {
@@ -279,6 +282,25 @@ pub fn run(
             Some(&planes),
             Some(&objects),
             label,
+        );
+        let projectile_visuals: Vec<_> = session
+            .projectiles
+            .active()
+            .iter()
+            .map(|projectile| ProjectileVisual {
+                rocket_type: projectile.rocket_id,
+                position: [projectile.position[0], projectile.position[1], 1.0],
+                yaw: projectile.velocity[1].atan2(projectile.velocity[0]),
+                pitch: 0.0,
+            })
+            .collect();
+        projectile_renderer.render(
+            &mut frame,
+            &mut depth,
+            WIDTH,
+            HEIGHT,
+            session.world.player,
+            &projectile_visuals,
         );
         let pose = if shoot_ticks > 0 {
             WeaponPose::Shoot

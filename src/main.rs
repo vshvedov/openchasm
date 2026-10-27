@@ -3,6 +3,7 @@ mod audio;
 mod content;
 mod object_render;
 mod planes;
+mod projectile_render;
 mod texture;
 mod viewer;
 mod weapon_render;
@@ -292,6 +293,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 openchasm::pickups::Difficulty::Normal,
             );
             let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
+            let projectile_renderer =
+                projectile_render::ProjectileRenderer::load(&mut resources, &rockets, &palette);
             let shot_blocking =
                 std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
             let session = openchasm::session::Session::new(openchasm::session::LevelSetup {
@@ -312,6 +315,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     session,
                     audio,
                     weapon_overlay,
+                    projectile_renderer,
                 },
                 &format!("{id}: {name}"),
             )?;

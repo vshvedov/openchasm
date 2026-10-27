@@ -58,6 +58,7 @@ fn neutral_table(tone_mapping: bool) -> &'static [f32] {
             .collect()
     })
 }
+#[inline(always)]
 fn sample_lut(table: &[f32], value: f32) -> f32 {
     let value = finite_nonnegative(value);
     if value >= 16.0 {
@@ -68,6 +69,7 @@ fn sample_lut(table: &[f32], value: f32) -> f32 {
     let fraction = index - lower as f32;
     table[lower] + (table[lower + 1] - table[lower]) * fraction
 }
+#[inline(always)]
 fn byte(value: f32) -> u32 {
     let scaled = value.clamp(0.0, 1.0) * 255.0;
     let whole = scaled as u32;
@@ -216,13 +218,13 @@ impl ColorPipeline {
                 input.map(|channel| (channel / y).powf(self.settings.saturation) * luminance)
             }
         };
-        let output = adjusted.map(|v| {
+        let channel = |v| {
             byte(sample_lut(
                 self.table,
                 finite_nonnegative(v * self.exposure),
             ))
-        });
-        output[0] << 16 | output[1] << 8 | output[2]
+        };
+        channel(adjusted[0]) << 16 | channel(adjusted[1]) << 8 | channel(adjusted[2])
     }
     /// Reject unequal buffers without modifying either one.
     pub fn encode_frame(

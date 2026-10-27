@@ -30,3 +30,19 @@ averages. The live SDL console was exercised through actual window input: typing
 moved 0.875 tiles at the 2.5 tile/s movement speed, confirming rendering waits no
 longer slow the fixed simulation. FPS/sensitivity controls and a clean console
 `quit` were also exercised. This does not substitute for macOS/Windows input tests.
+
+## Verified FOV, depth ordering and HDR
+
+At the verified 75-degree vertical FOV and corrected world orientation, near-first wall rasterization reduced the wall pass from about 11.8 to 4.4 ms in the spawn view, raising the earlier RGB preview from about 36 to 50 FPS. Differential tests preserve exact frame/depth output across masked, tied and elevated walls. Removing redundant `floor()` operations for already-bounded plane coordinates also preserves exact RGB/HDR and depth output.
+
+A subsequent native Wayland run at 640×400 measured these presets with the same spawn, uncapped rendering, and no concurrent builds. The table averages the first six regular samples before console interaction. Presentation was approximately 3.2–3.5 ms; desktop/window configuration can affect it.
+
+| Preset | FPS | Render | Plane | Post-process |
+| --- | ---: | ---: | ---: | ---: |
+| Legacy RGB preview | 50.7 | 16.4 ms | 8.0 ms | 0.0 ms |
+| Remaster linear HDR, neutral colour, bloom off | 39.9 | 21.7 ms | 7.9 ms | 6.0 ms |
+| Enhanced linear HDR, bloom 0.35 | 30.6 | 28.9 ms | 7.9 ms | 12.9 ms |
+
+The default HDR pipeline improves colour correctness at a measurable CPU cost. Enhanced bloom is optional; these numbers do not establish 60 FPS or native runtime performance on macOS/Windows. Non-neutral gamma/saturation are more expensive because their luminance/chroma powers are evaluated in the software post-process.
+
+Live Linux checks exercised all three presets, individual colour controls, console queries and `options`, menu closing and mouse recapture, persisted cap changes, and clean console exits. A temporary SDL preference directory isolated these checks from the user's settings. Launching with `OPENCHASM_UNCAPPED=1` keeps the override in memory; unrelated graphics changes preserve the stored cap.

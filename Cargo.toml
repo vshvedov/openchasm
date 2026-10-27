@@ -21,3 +21,4 @@ gltf = { version = "1.4.1", default-features = false, features = ["utils", "name
 png = { version = "0.18", optional = true }
 rodio = { version = "0.23", optional = true, default-features = false, features = ["flac", "playback", "wav"] }
 sdl2 = { version = "0.38", optional = true, features = ["bundled", "static-link"] }
+sha2 = "0.10"

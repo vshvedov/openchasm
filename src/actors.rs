@@ -3,7 +3,46 @@
 //! No AI, difficulty filtering or damage rules are implemented. Raw map data
 //! and unknown definition columns are preserved for later simulation work.
 use crate::map::{Monster as MapActor, UNITS_PER_TILE};
+use sha2::{Digest, Sha256};
 use std::io::{self, ErrorKind};
+
+/// How authored map actor IDs resolve into a definition table.
+/// The default preserves the normal ID 100+n -> definition n convention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActorMapping {
+    #[default]
+    Identity,
+    /// Original addon IDs interpreted with the remaster's merged table.
+    AddonToRemaster,
+}
+
+impl ActorMapping {
+    /// Recognize the three installed remaster addon maps and their exact merged
+    /// table. Modified or independently authored data remains identity; callers
+    /// may explicitly select `AddonToRemaster` for compatible custom content.
+    pub fn recognize_shipped_addon(map: &[u8], inf: &[u8]) -> Self {
+        const INF: &str = "89c16e848597ae0432bc2875b2a377153fb56a5d7e403f959b71445558bd0198";
+        const MAPS: [&str; 3] = [
+            "d5f42f358b06b7a59da0970db1b056953ad9110d6bf77acfc238e01b71c09e71",
+            "831ad13955ca4413aa03ff6da925852d270e2578fa44e62858b66f3731f0416c",
+            "436ca88bf5b7577b46f427a3d6217b43aea1ea65460a4bf54e21852695663bff",
+        ];
+        let hash = |data: &[u8]| format!("{:x}", Sha256::digest(data));
+        if hash(inf) == INF && MAPS.contains(&hash(map).as_str()) {
+            Self::AddonToRemaster
+        } else {
+            Self::Identity
+        }
+    }
+
+    pub fn definition_index(self, map_id: u16) -> Option<usize> {
+        let index = usize::from(map_id.checked_sub(100)?);
+        Some(match (self, index) {
+            (Self::AddonToRemaster, 16..=18) => index + 5,
+            _ => index,
+        })
+    }
+}
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message.into())
@@ -157,6 +196,16 @@ pub struct ActorState {
 }
 impl ActorState {
     pub fn from_placements(placements: &[MapActor], definitions: &ActorDefinitions) -> Self {
+        Self::from_placements_with_mapping(placements, definitions, ActorMapping::Identity)
+    }
+
+    /// Resolve definitions in the given context while retaining each original
+    /// placement and its authored ID, flags, coordinates, and source index.
+    pub fn from_placements_with_mapping(
+        placements: &[MapActor],
+        definitions: &ActorDefinitions,
+        mapping: ActorMapping,
+    ) -> Self {
         let mut result = Self {
             player_spawns: Vec::new(),
             actors: Vec::new(),
@@ -165,8 +214,10 @@ impl ActorState {
         for (source_index, &placement) in placements.iter().enumerate() {
             if placement.is_player_spawn() {
                 result.player_spawns.push((source_index, placement));
-            } else if let Some(definition) = definitions.for_map_id(placement.id) {
-                let definition_index = usize::from(placement.id - 100);
+            } else if let Some((definition_index, definition)) = mapping
+                .definition_index(placement.id)
+                .and_then(|index| definitions.entries.get(index).map(|def| (index, def)))
+            {
                 result.actors.push(Actor {
                     source_index,
                     definition_index,
@@ -193,6 +244,42 @@ impl ActorState {
 mod tests {
     use super::*;
     const TABLE: &str = "[MONSTERS]\n2 labels\nhero.car 100 100 10 5 100 0 0 0\njoker.car 52 190 10 5 100 20 -1 16 extra ; comment\n[OTHER]\n";
+    #[test]
+    fn addon_mapping_is_explicit_and_retains_raw_placements() {
+        let mut defs = ActorDefinitions::parse(TABLE.as_bytes()).unwrap();
+        let template = defs.entries[1].clone();
+        defs.entries.resize(24, template);
+        defs.entries[23].health = 73;
+        let placement = MapActor {
+            position: [128, 256],
+            id: 118,
+            angle: 3,
+            flags: 4,
+        };
+        let identity = ActorState::from_placements(&[placement], &defs);
+        let addon = ActorState::from_placements_with_mapping(
+            &[placement],
+            &defs,
+            ActorMapping::AddonToRemaster,
+        );
+        assert_eq!(identity.actors[0].definition_index, 18);
+        assert_eq!(addon.actors[0].definition_index, 23);
+        assert_eq!(addon.actors[0].health, 73);
+        assert_eq!(addon.actors[0].placement, placement);
+        assert_eq!(
+            ActorMapping::AddonToRemaster.definition_index(119),
+            Some(19)
+        );
+        assert_eq!(ActorMapping::AddonToRemaster.definition_index(99), None);
+        defs.entries.truncate(23);
+        let unresolved = ActorState::from_placements_with_mapping(
+            &[placement],
+            &defs,
+            ActorMapping::AddonToRemaster,
+        );
+        assert!(unresolved.actors.is_empty());
+        assert_eq!(unresolved.unresolved[0].placement, placement);
+    }
     #[test]
     fn preserves_definitions_and_source_fields() {
         let defs = ActorDefinitions::parse(TABLE.as_bytes()).unwrap();

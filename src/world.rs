@@ -12,6 +12,14 @@ pub struct Wall {
     pub cell: Option<[u8; 2]>,
 }
 
+/// A horizontal collision circle provided by the authoritative session.
+/// The caller filters dead, inactive and vertically separated entities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CollisionCircle {
+    pub center: [f32; 2],
+    pub radius: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Player {
     pub position: [f32; 2],
@@ -127,7 +135,60 @@ fn sweep_wall(origin: [f32; 2], delta: [f32; 2], wall: &Wall) -> Option<(f32, [f
     best
 }
 
-fn move_and_slide(mut position: [f32; 2], mut displacement: [f32; 2], walls: &[Wall]) -> [f32; 2] {
+/// Earliest contact of a swept player disc with one stationary actor circle.
+fn sweep_circle(
+    origin: [f32; 2],
+    delta: [f32; 2],
+    circle: &CollisionCircle,
+) -> Option<(f32, [f32; 2])> {
+    if !circle.radius.is_finite()
+        || circle.radius < 0.0
+        || !circle.center.iter().all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let combined = PLAYER_RADIUS + circle.radius;
+    let combined_sq = combined * combined;
+    let offset = sub(origin, circle.center);
+    let distance_sq = dot(offset, offset);
+    let travel_sq = dot(delta, delta);
+    if !combined_sq.is_finite() || !distance_sq.is_finite() || travel_sq < 1e-12 {
+        return None;
+    }
+    if distance_sq < combined_sq {
+        // An existing overlap must not trap the player: only motion further
+        // inward is blocked. Exactly coincident centers may move out freely.
+        if distance_sq < 1e-12 {
+            return None;
+        }
+        let normal = scale(offset, 1.0 / distance_sq.sqrt());
+        return (dot(delta, normal) < -1e-7).then_some((0.0, normal));
+    }
+    let b = dot(offset, delta);
+    let c = distance_sq - combined_sq;
+    let discriminant = b * b - travel_sq * c;
+    if discriminant < 0.0 {
+        return None;
+    }
+    let time = (-b - discriminant.sqrt()) / travel_sq;
+    if !(0.0..=1.0).contains(&time) {
+        return None;
+    }
+    let at_contact = add(offset, scale(delta, time));
+    let length_sq = dot(at_contact, at_contact);
+    if length_sq < 1e-12 {
+        return None;
+    }
+    let normal = scale(at_contact, 1.0 / length_sq.sqrt());
+    (dot(delta, normal) < -1e-7).then_some((time, normal))
+}
+
+fn move_and_slide(
+    mut position: [f32; 2],
+    mut displacement: [f32; 2],
+    walls: &[Wall],
+    circles: &[CollisionCircle],
+) -> [f32; 2] {
     // Multiple contacts let the player slide along walls and stop at corners.
     for _ in 0..4 {
         let travel_sq = dot(displacement, displacement);
@@ -138,6 +199,11 @@ fn move_and_slide(mut position: [f32; 2], mut displacement: [f32; 2], walls: &[W
             .iter()
             .filter(|wall| wall.blocks_movement)
             .filter_map(|wall| sweep_wall(position, displacement, wall))
+            .chain(
+                circles
+                    .iter()
+                    .filter_map(|circle| sweep_circle(position, displacement, circle)),
+            )
             .min_by(|a, b| a.0.total_cmp(&b.0));
         let Some((time, normal)) = hit else {
             position = add(position, displacement);
@@ -176,7 +242,16 @@ impl World {
     /// Advance a bounded time step using a swept circular player and wall sliding.
     /// Gameplay values and material rules remain provisional pending comparison.
     pub fn step(&mut self, input: Input, dt: f32) {
-        if !dt.is_finite()
+        self.step_with_circles(input, dt, &[]);
+    }
+
+    /// Advance with walls and caller-selected stationary actor circles. This is
+    /// a 2D approximation; circles should include only live, vertically
+    /// overlapping actors. The input time cap and movement constants match step.
+    pub fn step_with_circles(&mut self, input: Input, dt: f32, circles: &[CollisionCircle]) {
+        if !self.player.angle.is_finite()
+            || !self.player.position.iter().all(|value| value.is_finite())
+            || !dt.is_finite()
             || dt <= 0.0
             || !input.forward.is_finite()
             || !input.strafe.is_finite()
@@ -198,7 +273,8 @@ impl World {
             (cos * forward - sin * strafe) * 2.5 * dt,
             (sin * forward + cos * strafe) * 2.5 * dt,
         ];
-        self.player.position = move_and_slide(self.player.position, displacement, &self.walls);
+        self.player.position =
+            move_and_slide(self.player.position, displacement, &self.walls, circles);
     }
 }
 
@@ -236,10 +312,13 @@ mod tests {
         let mut w = test_world();
         w.walls[0].texture = 87;
         w.walls[0].blocks_movement = false;
-        assert_eq!(move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls), [2.0, 0.0]);
+        assert_eq!(
+            move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls, &[]),
+            [2.0, 0.0]
+        );
         w.walls[0].texture = 120;
         w.walls[0].blocks_movement = true;
-        let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls);
+        let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &w.walls, &[]);
         assert!(end[0] < 0.83);
     }
     #[test]
@@ -259,7 +338,7 @@ mod tests {
     #[test]
     fn swept_motion_cannot_tunnel_through_a_wall() {
         let w = test_world();
-        let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &w.walls);
+        let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &w.walls, &[]);
         assert!(end[0] > 0.81 && end[0] < 0.821, "{end:?}");
     }
     #[test]
@@ -271,7 +350,7 @@ mod tests {
             blocks_movement: true,
             cell: None,
         };
-        let end = move_and_slide([1.0, 0.5], [0.0, 1.0], &[wall]);
+        let end = move_and_slide([1.0, 0.5], [0.0, 1.0], &[wall], &[]);
         assert!(end[0] > 1.2 && end[1] > 0.7, "{end:?}");
         assert!(
             end[0] - end[1] >= PLAYER_RADIUS * 2.0_f32.sqrt() - 0.001,
@@ -287,7 +366,7 @@ mod tests {
             blocks_movement: true,
             cell: None,
         };
-        let end = move_and_slide([0.0, -0.1], [2.0, 0.0], &[wall]);
+        let end = move_and_slide([0.0, -0.1], [2.0, 0.0], &[wall], &[]);
         assert!(end[1] < -0.18, "{end:?}");
         assert!(end[0] < 1.9, "{end:?}");
     }
@@ -300,8 +379,101 @@ mod tests {
             blocks_movement: true,
             cell: None,
         };
-        let end = move_and_slide([0.9, 0.0], [-0.5, 0.0], &[wall]);
+        let end = move_and_slide([0.9, 0.0], [-0.5, 0.0], &[wall], &[]);
         assert!((end[0] - 0.4).abs() < 1e-6, "{end:?}");
+    }
+    #[test]
+    fn swept_player_cannot_tunnel_through_an_actor_circle() {
+        let circle = CollisionCircle {
+            center: [1.0, 0.0],
+            radius: 0.2,
+        };
+        let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &[], &[circle]);
+        assert!((end[0] - 0.62).abs() < 0.001, "{end:?}");
+    }
+    #[test]
+    fn sliding_around_actor_preserves_clearance() {
+        let circle = CollisionCircle {
+            center: [1.0, 0.15],
+            radius: 0.2,
+        };
+        let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &[], &[circle]);
+        assert!(end[0] > 0.8 && end[1] < -0.15, "{end:?}");
+        let distance = (end[0] - circle.center[0]).hypot(end[1] - circle.center[1]);
+        assert!(distance >= PLAYER_RADIUS + circle.radius - 1e-4, "{end:?}");
+    }
+    #[test]
+    fn nearest_wall_or_actor_blocks_regardless_of_list_order() {
+        let wall = Wall {
+            a: [1.0, -1.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: true,
+            cell: None,
+        };
+        let behind = CollisionCircle {
+            center: [2.0, 0.0],
+            radius: 0.2,
+        };
+        let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &[wall], &[behind]);
+        assert!((end[0] - 0.82).abs() < 0.001, "{end:?}");
+        let in_front = CollisionCircle {
+            center: [0.8, 0.0],
+            radius: 0.2,
+        };
+        let end = move_and_slide([0.0, 0.0], [4.0, 0.0], &[wall], &[behind, in_front]);
+        assert!((end[0] - 0.42).abs() < 0.001, "{end:?}");
+    }
+    #[test]
+    fn actor_overlap_allows_escape_but_blocks_deeper_motion() {
+        let circle = CollisionCircle {
+            center: [1.0, 0.0],
+            radius: 0.2,
+        };
+        let escape = move_and_slide([0.8, 0.0], [-0.5, 0.0], &[], &[circle]);
+        assert!((escape[0] - 0.3).abs() < 1e-5, "{escape:?}");
+        let inward = move_and_slide([0.8, 0.0], [0.5, 0.0], &[], &[circle]);
+        assert!((inward[0] - 0.8).abs() < 1e-5, "{inward:?}");
+        let coincident = move_and_slide([1.0, 0.0], [0.5, 0.0], &[], &[circle]);
+        assert!((coincident[0] - 1.5).abs() < 1e-5, "{coincident:?}");
+    }
+    #[test]
+    fn invalid_actor_circles_cannot_corrupt_player_state() {
+        let circles = [
+            CollisionCircle {
+                center: [f32::NAN, 0.0],
+                radius: 0.2,
+            },
+            CollisionCircle {
+                center: [1.0, 0.0],
+                radius: -1.0,
+            },
+            CollisionCircle {
+                center: [1.0, 0.0],
+                radius: f32::INFINITY,
+            },
+        ];
+        let end = move_and_slide([0.0, 0.0], [2.0, 0.0], &[], &circles);
+        assert_eq!(end, [2.0, 0.0]);
+    }
+    #[test]
+    fn public_actor_step_filters_only_the_supplied_circles() {
+        let mut w = test_world();
+        w.walls.clear();
+        let circle = CollisionCircle {
+            center: [1.0, 0.0],
+            radius: 0.2,
+        };
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        for _ in 0..60 {
+            w.step_with_circles(input, 1.0 / 60.0, &[circle]);
+        }
+        assert!((w.player.position[0] - 0.62).abs() < 0.001);
+        w.step(input, 1.0 / 60.0);
+        assert!(w.player.position[0] > 0.62);
     }
     #[test]
     fn invalid_input_does_not_corrupt_player_state() {

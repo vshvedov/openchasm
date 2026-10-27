@@ -231,7 +231,23 @@ impl Session {
             .step(DT, input.jump, bounds)
             .unwrap_or_default();
         self.sync_wall_blocking();
-        self.world.step(input.movement, DT);
+        // Actors currently use a provisional full-room vertical extent.
+        let circles: Vec<_> = self
+            .actors
+            .actors
+            .iter()
+            .filter_map(|actor| {
+                if actor.health <= 0 || self.ai.mode(actor.source_index) == Some(Mode::Inactive) {
+                    return None;
+                }
+                let definition = self.actor_definitions.entries.get(actor.definition_index)?;
+                Some(crate::world::CollisionCircle {
+                    center: actor.position,
+                    radius: (definition.wall_radius as f32 / 256.0).clamp(0.05, 2.0),
+                })
+            })
+            .collect();
+        self.world.step_with_circles(input.movement, DT, &circles);
         events.pickups = self.game.collect_near(self.world.player.position);
         self.processes.set_keys(self.game.inventory.keys);
         let mut attempts = Vec::new();
@@ -876,6 +892,20 @@ mod tests {
             difficulty: Difficulty::Normal,
         });
         let initial = session.clone();
+        let mut collision_session = initial.clone();
+        for _ in 0..120 {
+            collision_session.step(SessionInput {
+                movement: Input {
+                    forward: 1.0,
+                    ..Input::default()
+                },
+                ..SessionInput::default()
+            });
+        }
+        assert!(
+            collision_session.world.player.position[0] < 1.6,
+            "player should not pass through the living enemy"
+        );
         let events = session.step(SessionInput {
             fire: true,
             ..SessionInput::default()

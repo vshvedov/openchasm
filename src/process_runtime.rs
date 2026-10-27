@@ -1747,9 +1747,17 @@ impl ProcessRuntime {
                 .iter()
                 .filter(|link| matches!(link.kind.as_str(), "link" | "return"))
                 .map(|link| {
-                    let dx = f32::from(link.x) + 0.5 - p[0];
-                    let dy = f32::from(link.y) + 0.5 - p[1];
-                    ([link.x, link.y], dx * dx + dy * dy)
+                    let cell = [link.x, link.y];
+                    // A switch's rendered pose can be far from its source map
+                    // cell, and it may itself move during a process.
+                    let target = self
+                        .objects
+                        .get(&cell)
+                        .map(|object| object.position)
+                        .unwrap_or([f32::from(link.x) + 0.5, f32::from(link.y) + 0.5]);
+                    let dx = target[0] - p[0];
+                    let dy = target[1] - p[1];
+                    (cell, dx * dx + dy * dy)
                 })
                 .filter(|(_, distance)| *distance <= USE_RANGE * USE_RANGE)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
@@ -2403,6 +2411,54 @@ mod tests {
             .all(|event| event.outcome == ProcessOutcome::Accepted));
         assert!(runtime.processes[&3].locked);
     }
+    #[test]
+    fn use_tracks_live_object_pose_and_falls_back_to_cell_center() {
+        let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\n#end\n#proc2\n#action\nmove 2 0 256 0\n#end\n#links\nlink 10 10 1\nlink 0 1 2\n#end\n");
+        let mut world = world();
+        let mut cells = [0u8; 4096];
+        cells[10 * 64 + 10] = 163;
+        let pose = ProcessObject {
+            cell: [10, 10],
+            position: [2.0, 2.0],
+            angle_radians: 0.0,
+            elevation_raw: 0.0,
+            blocking_radius: 0.0,
+        };
+        let mut runtime = ProcessRuntime::with_wind(
+            &script,
+            &world,
+            ProcessCapabilities::default(),
+            &cells,
+            &[pose],
+        )
+        .unwrap();
+        let chosen = runtime.collect_tick_commands([2.0, 2.0], true);
+        assert!(chosen
+            .iter()
+            .any(|c| c.kind == "link" && c.cell == [10, 10]));
+        assert!(!runtime
+            .collect_tick_commands([10.5, 10.5], true)
+            .iter()
+            .any(|c| c.cell == [10, 10]));
+        runtime.objects.get_mut(&[10, 10]).unwrap().position = [5.0, 5.0];
+        assert!(runtime
+            .collect_tick_commands([5.0, 5.0], true)
+            .iter()
+            .any(|c| c.cell == [10, 10]));
+        assert!(!runtime
+            .collect_tick_commands([2.0, 2.0], true)
+            .iter()
+            .any(|c| c.cell == [10, 10]));
+        assert!(runtime
+            .collect_tick_commands([0.5, 1.5], true)
+            .iter()
+            .any(|c| c.cell == [0, 1]));
+        world.player.position = [f32::NAN, 0.0];
+        assert!(runtime
+            .collect_tick_commands(world.player.position, true)
+            .is_empty());
+    }
+
     #[test]
     fn use_chooses_nearest_link() {
         let script = Script::parse("#proc1\n#action\nmove 1 0 256 0\n#end\n#proc2\n#action\nmove 1 0 512 0\n#end\n#links\nlink 1 0 1\nlink 0 1 2\n#end\n");

@@ -73,3 +73,10 @@ own progress, faster commands stop at their endpoint, and reversal moves each
 back from its current position concurrently; the process stays open until the
 slowest command completes. Exact original timing and axis phase proportions
 remain unverified. Bare trailing numeric arguments remain unsupported.
+
+Use interactions select the nearest linked cell using its live process-object
+position when one is represented; otherwise they use the source cell center.
+Ties retain the existing authored-link order. This accounts for switches whose
+models are offset from their map cells and switches moved by processes. The
+1.25-tile reach and cell-center fallback remain provisional; line of sight and
+facing are not yet checked.

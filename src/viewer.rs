@@ -2,12 +2,14 @@
 use crate::audio::Audio;
 use crate::object_render::ObjectScene;
 use crate::planes::PlaneRenderer;
-use crate::process_runtime::ProcessRuntime;
 use crate::texture::CelImage;
+use crate::weapon_render::{WeaponPose, WeaponRenderer};
 use crate::world::{Input, World};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
-use minifb::{Key, KeyRepeat, ScaleMode, Window, WindowOptions};
-use openchasm::game::GameInventory;
+use minifb::{Key, KeyRepeat, MouseButton, ScaleMode, Window, WindowOptions};
+use openchasm::ai::Mode;
+use openchasm::combat::FireResult;
+use openchasm::session::{Session, SessionInput};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
@@ -130,27 +132,35 @@ fn render(
         frame,
         8,
         20,
-        "WASD: MOVE   LEFT/RIGHT: TURN   E: USE   ESC: QUIT",
+        "WASD MOVE  ARROWS TURN  E USE  SPACE FIRE  1-8 WEAPONS  ESC QUIT",
     );
-    text(frame, 8, 32, "GEOMETRY PREVIEW - GAMEPLAY NOT IMPLEMENTED");
+    text(
+        frame,
+        8,
+        32,
+        "EARLY GAMEPLAY PREVIEW - BEHAVIOR IS PROVISIONAL",
+    );
 }
 
 pub struct ClientFeedback {
-    pub game: GameInventory,
+    pub session: Session,
     pub audio: Audio,
+    pub weapon_overlay: WeaponRenderer,
 }
 
 pub fn run(
-    mut world: World,
     textures: Vec<Option<CelImage>>,
     planes: PlaneRenderer,
-    mut processes: ProcessRuntime,
     mut objects: ObjectScene,
     feedback: ClientFeedback,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let ClientFeedback { mut game, audio } = feedback;
-    for cell in game.pickups.hidden_cells() {
+    let ClientFeedback {
+        mut session,
+        audio,
+        weapon_overlay,
+    } = feedback;
+    for cell in session.game.pickups.hidden_cells() {
         objects.set_visible(cell, false);
     }
     let textures: Vec<Option<ViewerTexture>> = textures
@@ -158,7 +168,7 @@ pub fn run(
         .map(|item| item.map(ViewerTexture::from))
         .collect();
     let mut window = Window::new(
-        "OpenChasm - geometry preview",
+        "OpenChasm - early gameplay preview",
         WIDTH,
         HEIGHT,
         WindowOptions {
@@ -170,9 +180,22 @@ pub fn run(
     window.set_target_fps(60);
     let mut frame = vec![0; WIDTH * HEIGHT];
     let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
-    let mut last = Instant::now();
+    let started = Instant::now();
+    let mut last = started;
     let mut accumulator = 0.0f32;
     let mut pending_interact = false;
+    let mut pending_weapon = None;
+    let mut shoot_ticks = 0usize;
+    let number_keys = [
+        Key::Key1,
+        Key::Key2,
+        Key::Key3,
+        Key::Key4,
+        Key::Key5,
+        Key::Key6,
+        Key::Key7,
+        Key::Key8,
+    ];
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
         accumulator += now
@@ -181,15 +204,28 @@ pub fn run(
             .as_secs_f32();
         last = now;
         let key = |k| if window.is_key_down(k) { 1.0 } else { 0.0 };
-        let input = Input {
+        let movement = Input {
             forward: key(Key::W) - key(Key::S),
             strafe: key(Key::D) - key(Key::A),
             turn: key(Key::Right) - key(Key::Left),
         };
         pending_interact |= window.is_key_pressed(Key::E, KeyRepeat::No);
+        for (index, key) in number_keys.iter().enumerate() {
+            if window.is_key_pressed(*key, KeyRepeat::No) {
+                pending_weapon = Some(index);
+            }
+        }
+        let firing = window.is_key_down(Key::Space) || window.get_mouse_down(MouseButton::Left);
         while accumulator >= STEP {
-            world.step(input, STEP);
-            for event in game.collect_near(world.player.position) {
+            let events = session.step(SessionInput {
+                movement,
+                interact: pending_interact,
+                fire: firing,
+                select_weapon: pending_weapon,
+            });
+            pending_interact = false;
+            pending_weapon = None;
+            for event in events.pickups {
                 objects.set_visible(event.cell, false);
                 let sound = match event.pickup {
                     openchasm::inventory::Pickup::Weapon(index) => 51 + index as u8,
@@ -199,34 +235,85 @@ pub fn run(
                 };
                 audio.play(sound);
             }
-            processes.set_keys(game.inventory.keys);
-            processes.tick(&mut world, STEP, pending_interact);
-            pending_interact = false;
+            shoot_ticks = shoot_ticks.saturating_sub(1);
+            if matches!(events.shot, Some(FireResult::Fired(_))) {
+                shoot_ticks = 12;
+                audio.play(21 + session.selected_weapon as u8);
+            }
+            for actor in &session.actors.actors {
+                let visible = !matches!(
+                    session.ai.mode(actor.source_index),
+                    Some(Mode::Inactive | Mode::Dead)
+                );
+                objects.set_actor_pose(
+                    actor.source_index,
+                    actor.position,
+                    actor.angle_radians,
+                    visible,
+                );
+            }
             accumulator -= STEP;
         }
         render(
             &mut frame,
             &mut depth,
-            &world,
+            &session.world,
             &textures,
             Some(&planes),
             Some(&objects),
             label,
         );
+        let pose = if shoot_ticks > 0 {
+            WeaponPose::Shoot
+        } else {
+            WeaponPose::Idle
+        };
+        let count = weapon_overlay
+            .frame_count(session.selected_weapon, pose)
+            .unwrap_or(1)
+            .max(1);
+        let frame_index = if shoot_ticks > 0 {
+            (12 - shoot_ticks) * count / 12
+        } else {
+            (started.elapsed().as_millis() as usize / 100) % count
+        };
+        weapon_overlay.render(
+            &mut frame,
+            WIDTH,
+            HEIGHT,
+            session.selected_weapon,
+            pose,
+            frame_index,
+        );
+        let cx = WIDTH / 2;
+        let cy = HEIGHT / 2;
+        for offset in -3isize..=3 {
+            frame[cy * WIDTH + (cx as isize + offset) as usize] = 0xffffff;
+            frame[(cy as isize + offset) as usize * WIDTH + cx] = 0xffffff;
+        }
+        let inventory = &session.game.inventory;
         text(
             &mut frame,
             8,
             HEIGHT - 18,
             &format!(
                 "HEALTH {}  ARMOR {}  AMMO {}  KEYS {}{}{}",
-                game.inventory.health,
-                game.inventory.armor,
-                game.inventory.ammo[0],
-                if game.inventory.keys[0] { "R" } else { "-" },
-                if game.inventory.keys[1] { "G" } else { "-" },
-                if game.inventory.keys[2] { "B" } else { "-" }
+                inventory.health,
+                inventory.armor,
+                inventory.ammo[session.selected_weapon],
+                if inventory.keys[0] { "R" } else { "-" },
+                if inventory.keys[1] { "G" } else { "-" },
+                if inventory.keys[2] { "B" } else { "-" }
             ),
         );
+        if inventory.health == 0 {
+            text(
+                &mut frame,
+                WIDTH / 2 - 80,
+                HEIGHT / 2 + 35,
+                "YOU DIED - ESC TO EXIT",
+            );
+        }
         window.update_with_buffer(&frame, WIDTH, HEIGHT)?;
     }
     Ok(())

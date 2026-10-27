@@ -5,6 +5,7 @@ mod object_render;
 mod planes;
 mod texture;
 mod viewer;
+mod weapon_render;
 
 use content::{ResourceSet, SourceKind};
 use map::{Map, MAP_SIDE, UNITS_PER_TILE};
@@ -52,6 +53,7 @@ fn select_source(selection: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
 struct WallGraphic {
     filename: Option<String>,
     disable_walk_collision: bool,
+    disable_shoot_collision: bool,
 }
 
 /// Decode level-specific #GFX rows. Flag slots are g/s/o; only g has
@@ -89,9 +91,11 @@ fn parse_wall_graphics(resource: &[u8]) -> Vec<WallGraphic> {
         }
         graphic.filename = Some(name.to_ascii_lowercase());
         if (87..=119).contains(&id) {
-            graphic.disable_walk_collision = fields
-                .next()
-                .is_some_and(|flags| flags.starts_with('g') || flags.starts_with('G'));
+            if let Some(flags) = fields.next() {
+                let flags = flags.to_ascii_lowercase();
+                graphic.disable_walk_collision = flags.starts_with('g');
+                graphic.disable_shoot_collision = flags.as_bytes().get(1) == Some(&b's');
+            }
         }
     }
     graphics
@@ -278,19 +282,36 @@ fn run() -> Result<(), Box<dyn Error>> {
             let info = resources.read("chasm.inf")?;
             let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
             let audio = audio::Audio::new(&mut resources, &info);
+            let weapon_overlay =
+                weapon_render::WeaponRenderer::load(&mut resources, &info, &palette)?;
             let game = openchasm::game::GameInventory::new(
                 weapons,
                 &objects::instances(&map),
                 &definitions,
                 openchasm::pickups::Difficulty::Normal,
             );
-            viewer::run(
+            let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
+            let shot_blocking =
+                std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
+            let session = openchasm::session::Session::new(openchasm::session::LevelSetup {
                 world,
+                processes,
+                actors: actor_state,
+                actor_definitions,
+                game,
+                rockets,
+                shot_blocking,
+                difficulty: openchasm::pickups::Difficulty::Normal,
+            });
+            viewer::run(
                 textures,
                 planes,
-                processes,
                 object_scene,
-                viewer::ClientFeedback { game, audio },
+                viewer::ClientFeedback {
+                    session,
+                    audio,
+                    weapon_overlay,
+                },
                 &format!("{id}: {name}"),
             )?;
         }

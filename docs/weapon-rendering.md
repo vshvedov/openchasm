@@ -1,0 +1,9 @@
+# First-person weapon preview
+
+The `[WEAPONS]` section of `chasm.inf` supplies eight ordered `MODEL`, `STAT` and `SHOOT` paths. The renderer uses each original `.3o` weapon mesh and its `.ani` idle/fire vertex animations from the archive's `model/` directory. An animation must have the same vertex count as its mesh; unavailable or incompatible animations fall back to the static model. Missing meshes are skipped with a diagnostic. Indexed skins use `chasm2.pal`. glTF and PNG weapon replacements are not yet supported.
+
+`WeaponRenderer::load` prepares assets; `render` takes a zero-based weapon index, idle/shoot pose and explicit frame index. It clamps the frame index, draws over the world into a separate depth buffer, clips polygons at the near plane and uses perspective-correct UVs. It does not select weapons, advance animations, calculate firing, or process input: those are responsibilities of simulation and the caller. `frame_count` reports the available frames for scheduling.
+
+The initial camera-local offset `(0.2, 0.7, -0.45)` and vertex scale `1/2048` follow the published [PanzerChasm renderer](https://github.com/Panzerschrek/Chasm-Reverse/blob/master/src/client/map_drawers_common.hpp) and [software weapon drawer](https://github.com/Panzerschrek/Chasm-Reverse/blob/master/src/client/map_drawer_soft.cpp), then use this project's current camera projection. They have not yet been compared against the installed 2022 release. Polygon rendering is two-sided and semi-transparent materials are approximated by indexed alpha tests; gun bobbing, lighting, motion interpolation and frame timing remain unimplemented.
+
+Synthetic tests cover resource path parsing, bounds on path names, near-plane clipping, per-pixel depth and masked pixels. The eight mesh/idle/fire asset groups from the local Steam release loaded successfully. The first weapon's original idle and shooting poses and the second weapon's idle pose were rendered for visual inspection.

@@ -5,7 +5,16 @@ edition = "2021"
 license = "MIT"
 description = "An experimental open-source Chasm: The Rift engine reimplementation"
 
+[features]
+default = ["client"]
+client = ["dep:font8x8", "dep:rodio", "dep:sdl2"]
+
+[[bin]]
+name = "openchasm"
+path = "src/main.rs"
+required-features = ["client"]
+
 [dependencies]
-font8x8 = "0.3"
-rodio = { version = "0.23", default-features = false, features = ["flac", "playback", "wav"] }
-sdl2 = { version = "0.38", features = ["bundled", "static-link"] }
+font8x8 = { version = "0.3", optional = true }
+rodio = { version = "0.23", optional = true, default-features = false, features = ["flac", "playback", "wav"] }
+sdl2 = { version = "0.38", optional = true, features = ["bundled", "static-link"] }

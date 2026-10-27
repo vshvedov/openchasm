@@ -1040,6 +1040,7 @@ pub fn run(
             animation_tick = animation_tick.saturating_add(1);
             let old_weapon = session.selected_weapon;
             let health_before = session.game.inventory.health;
+            let enemy_health = crate::audio::enemy_health_before(&session);
             let events = session.step(SessionInput {
                 movement,
                 yaw_delta,
@@ -1105,6 +1106,12 @@ pub fn run(
                 &events.enemy_attacks,
                 &session.actors,
                 session.world.player.position,
+            );
+            audio.play_enemy_reactions(
+                &enemy_health,
+                &session.actors,
+                session.world.player.position,
+                animation_tick,
             );
             let rocket_type = session.game.weapons.0[session.selected_weapon].rocket_type;
             for id in crate::audio::gameplay_sound_ids(&events, rocket_type) {

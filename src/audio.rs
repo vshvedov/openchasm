@@ -8,6 +8,8 @@
 //! provisional distance-based volume; other sounds are non-spatial. Authored
 //! volume metadata and original spatialization are not yet implemented.
 //! Player damage uses the first monster definition's documented pain/death WAVs.
+//! Enemy reactions compare committed health once per tick: multiple hits merge,
+//! death replaces pain, and variants are chosen deterministically.
 //! Ambient cell ID zero is provisionally silent, as in PanzerChasm; the
 //! remaster's behavior is unverified. Loops crossfade over 0.5 simulation
 //! seconds at authored volume / 128. Random `b:` cues are not implemented.
@@ -124,20 +126,85 @@ pub fn gameplay_sound_ids(events: &openchasm::session::SessionEvents, rocket_typ
 enum EnemySound {
     Melee,
     Ranged,
+    Pain0,
+    Pain1,
+    Death,
 }
 impl EnemySound {
     fn slot(self) -> usize {
         match self {
             Self::Melee => 0,
             Self::Ranged => 1,
+            Self::Pain0 => 2,
+            Self::Pain1 => 3,
+            Self::Death => 4,
         }
     }
     fn suffix(self) -> &'static str {
         match self {
             Self::Melee => "attack",
             Self::Ranged => "shoot",
+            Self::Pain0 => "pain0",
+            Self::Pain1 => "pain1",
+            Self::Death => "death",
         }
     }
+}
+
+/// Capture only live, active actors before a simulation tick. This temporary
+/// snapshot is never persisted and cannot produce sounds on checkpoint restore.
+pub fn enemy_health_before(session: &openchasm::session::Session) -> Vec<Option<(usize, i32)>> {
+    session
+        .actors
+        .actors
+        .iter()
+        .map(|actor| {
+            (actor.health > 0
+                && session.ai.mode(actor.source_index) != Some(openchasm::ai::Mode::Inactive))
+            .then_some((actor.source_index, actor.health))
+        })
+        .collect()
+}
+
+fn enemy_reaction_samples(
+    before: &[Option<(usize, i32)>],
+    actors: &openchasm::actors::ActorState,
+    listener: [f32; 2],
+    tick: u64,
+) -> Vec<(usize, EnemySound, f32)> {
+    if !listener.iter().all(|v| v.is_finite()) {
+        return Vec::new();
+    }
+    before
+        .iter()
+        .zip(&actors.actors)
+        .filter_map(|(before, actor)| {
+            let (index, health) = (*before)?;
+            if actor.source_index != index
+                || actor.health >= health
+                || health <= 0
+                || !actor.position.iter().all(|v| v.is_finite())
+            {
+                return None;
+            }
+            let distance = (actor.position[0] - listener[0]).hypot(actor.position[1] - listener[1]);
+            if !distance.is_finite() || distance >= 24.0 {
+                return None;
+            }
+            let sound = if actor.health <= 0 {
+                EnemySound::Death
+            } else if (tick ^ index as u64) & 1 == 0 {
+                EnemySound::Pain0
+            } else {
+                EnemySound::Pain1
+            };
+            Some((
+                actor.definition_index,
+                sound,
+                (1.0 - distance / 24.0).clamp(0.0, 1.0),
+            ))
+        })
+        .collect()
 }
 
 fn enemy_sound_path(model_name: &str, kind: EnemySound) -> Option<String> {
@@ -214,7 +281,7 @@ impl PlayerSound {
 pub struct Audio {
     sink: Option<MixerDeviceSink>,
     sounds: BTreeMap<u8, Arc<[u8]>>,
-    enemy_sounds: Vec<[Option<Arc<[u8]>>; 2]>,
+    enemy_sounds: Vec<[Option<Arc<[u8]>>; 5]>,
     player_sounds: [Option<Arc<[u8]>>; 3],
     music: Option<Player>,
     one_shots: Vec<Player>,
@@ -339,8 +406,14 @@ impl Audio {
                 }
             }
             for definition in definitions.entries {
-                let mut slots: [Option<Arc<[u8]>>; 2] = [None, None];
-                for kind in [EnemySound::Melee, EnemySound::Ranged] {
+                let mut slots: [Option<Arc<[u8]>>; 5] = std::array::from_fn(|_| None);
+                for kind in [
+                    EnemySound::Melee,
+                    EnemySound::Ranged,
+                    EnemySound::Pain0,
+                    EnemySound::Pain1,
+                    EnemySound::Death,
+                ] {
                     let Some(path) = enemy_sound_path(&definition.model_name, kind)
                         .and_then(|name| paths.get(&name.to_ascii_lowercase()))
                     else {
@@ -415,6 +488,37 @@ impl Audio {
                 .enemy_sounds
                 .get(index)
                 .and_then(|slots| slots[kind.slot()].as_ref())
+            else {
+                continue;
+            };
+            if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(bytes))) {
+                player.set_volume(volume);
+                track_one_shot(&mut self.one_shots, player);
+            }
+        }
+    }
+
+    /// Compare the committed post-tick state to its pre-tick snapshot.
+    pub fn play_enemy_reactions(
+        &mut self,
+        before: &[Option<(usize, i32)>],
+        actors: &openchasm::actors::ActorState,
+        listener: [f32; 2],
+        tick: u64,
+    ) {
+        let Some(sink) = &self.sink else { return };
+        for (index, kind, volume) in enemy_reaction_samples(before, actors, listener, tick) {
+            let Some(slots) = self.enemy_sounds.get(index) else {
+                continue;
+            };
+            let fallback = match kind {
+                EnemySound::Pain0 => Some(EnemySound::Pain1),
+                EnemySound::Pain1 => Some(EnemySound::Pain0),
+                _ => None,
+            };
+            let Some(bytes) = slots[kind.slot()]
+                .as_ref()
+                .or_else(|| fallback.and_then(|kind| slots[kind.slot()].as_ref()))
             else {
                 continue;
             };
@@ -830,6 +934,40 @@ mod tests {
     }
 
     #[test]
+    fn enemy_reactions_merge_hits_and_emit_death_once() {
+        use openchasm::actors::{ActorDefinitions, ActorState};
+        let defs = ActorDefinitions::parse(
+            b"[MONSTERS]\n2\nhero.car 1 1 1 1 1 1 1 1\nan4.car 1 1 1 1 100 1 1 1\n",
+        )
+        .unwrap();
+        let placement = openchasm::map::Monster {
+            position: [256, 0],
+            id: 101,
+            angle: 0,
+            flags: 7,
+        };
+        let mut actors = ActorState::from_placements(&[placement], &defs);
+        let before = vec![Some((0, 100))];
+        actors.actors[0].health = 40;
+        let pain = enemy_reaction_samples(&before, &actors, [0.0, 0.0], 0);
+        assert_eq!(pain.len(), 1);
+        assert_eq!(pain[0].1, EnemySound::Pain0);
+        assert_eq!(
+            enemy_reaction_samples(&before, &actors, [0.0, 0.0], 1)[0].1,
+            EnemySound::Pain1
+        );
+        actors.actors[0].health = 0;
+        assert_eq!(
+            enemy_reaction_samples(&before, &actors, [0.0, 0.0], 0)[0].1,
+            EnemySound::Death
+        );
+        assert!(enemy_reaction_samples(&[Some((0, 0))], &actors, [0.0, 0.0], 0).is_empty());
+        assert!(enemy_reaction_samples(&[None], &actors, [0.0, 0.0], 0).is_empty());
+        assert!(enemy_reaction_samples(&[Some((1, 100))], &actors, [0.0, 0.0], 0).is_empty());
+        assert!(enemy_reaction_samples(&before, &actors, [30.0, 0.0], 0).is_empty());
+    }
+
+    #[test]
     fn installed_enemy_attack_samples_decode_when_available() {
         let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
         let path = explicit
@@ -844,6 +982,8 @@ mod tests {
             ("an4.car", EnemySound::Melee),
             ("faust", EnemySound::Ranged),
             ("SFAG.car", EnemySound::Melee),
+            ("an4.car", EnemySound::Pain0),
+            ("faust", EnemySound::Death),
         ] {
             let bytes = resources
                 .read(&enemy_sound_path(model, kind).unwrap())

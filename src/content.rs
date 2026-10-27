@@ -6,7 +6,8 @@ use crate::archive::Archive;
 #[allow(dead_code)] // Fingerprinting is wired by the future save host.
 #[path = "content_trace.rs"]
 mod content_trace;
-pub use content_trace::{ResourceTrace, TraceError};
+use content_trace::ReadVerification;
+pub use content_trace::{ResourceTrace, TraceError, VerifiedResources};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -160,6 +161,7 @@ fn vdf_values(text: &str, wanted: &str) -> Vec<String> {
 pub struct ResourceSet {
     source: ResourceSource,
     trace: Option<ResourceTrace>,
+    verification: Option<ReadVerification>,
 }
 enum ResourceSource {
     Archive {
@@ -181,6 +183,7 @@ impl ResourceSet {
             Ok(Self {
                 source: ResourceSource::Directory { root, entries },
                 trace: None,
+                verification: None,
             })
         } else {
             Archive::open(path).map(|archive| {
@@ -188,6 +191,7 @@ impl ResourceSet {
                 Self {
                     source: ResourceSource::Archive { archive, names },
                     trace: None,
+                    verification: None,
                 }
             })
         }
@@ -205,7 +209,7 @@ impl ResourceSet {
     /// Start a separate trace for the next level; never silently discard one.
     #[allow(dead_code)]
     pub fn begin_trace(&mut self) -> Result<(), TraceError> {
-        if self.trace.is_some() {
+        if self.trace.is_some() || self.verification.is_some() {
             return Err(TraceError::AlreadyStarted);
         }
         self.trace = Some(ResourceTrace::default());
@@ -221,8 +225,34 @@ impl ResourceSet {
     pub fn take_trace(&mut self) -> Result<ResourceTrace, TraceError> {
         self.trace.take().ok_or(TraceError::NotStarted)
     }
+    /// Run a bounded checked-read scope. Use a newly opened ResourceSet so
+    /// loose-file names are re-indexed. Even if the closure ignores a read
+    /// failure, this method rejects the entire scope. Callers must roll back
+    /// any staged presentation changes on Err before publishing a restore.
+    #[allow(dead_code)]
+    pub fn with_verified_reads<T>(
+        &mut self,
+        ledger: &VerifiedResources,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, TraceError> {
+        if self.trace.is_some() || self.verification.is_some() {
+            return Err(TraceError::AlreadyStarted);
+        }
+        self.verification = Some(ReadVerification::new(ledger));
+        let result = operation(self);
+        self.verification
+            .take()
+            .expect("verification scope installed")
+            .finish()?;
+        Ok(result)
+    }
     pub fn read(&mut self, name: &str) -> io::Result<Vec<u8>> {
-        let absent = self.trace.is_some()
+        if let Some(verification) = &mut self.verification {
+            verification
+                .check_name(name)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        }
+        let absent = (self.trace.is_some() || self.verification.is_some())
             && match &self.source {
                 ResourceSource::Archive { names, .. } => !names.contains(name),
                 ResourceSource::Directory { entries, .. } => !entries.contains_key(name),
@@ -230,6 +260,11 @@ impl ResourceSet {
         let result = self.read_inner(name);
         if let Some(trace) = &mut self.trace {
             trace.record_read(name, &result, absent);
+        }
+        if let Some(verification) = &mut self.verification {
+            verification
+                .check_result(name, &result, absent)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         }
         result
     }
@@ -478,6 +513,99 @@ mod tests {
             .add_metadata("difficulty", b"hard")
             .unwrap();
         assert_ne!(a, source.take_trace().unwrap().finish().unwrap());
+        fs::remove_dir_all(temp).unwrap();
+    }
+    #[test]
+    fn verified_reads_detect_changed_missing_and_unrecorded_resources() {
+        let temp = temp();
+        fs::write(temp.join("model"), b"original").unwrap();
+        let mut source = ResourceSet::open(&temp).unwrap();
+        source.begin_trace().unwrap();
+        source.read("model").unwrap();
+        assert_eq!(
+            source.read("fallback").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let ledger = source.take_trace().unwrap().finish_verified().unwrap();
+        let mut reopened = ResourceSet::open(&temp).unwrap();
+        let result = reopened
+            .with_verified_reads(&ledger, |resource| {
+                assert_eq!(resource.read("model").unwrap(), b"original");
+                assert_eq!(
+                    resource.read("fallback").unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                );
+                7
+            })
+            .unwrap();
+        assert_eq!(result, 7);
+        fs::write(temp.join("model"), b"modified").unwrap();
+        let mut reopened = ResourceSet::open(&temp).unwrap();
+        let result = reopened.with_verified_reads(&ledger, |resource| {
+            // A loader may ignore this error and appear to succeed.
+            assert!(resource.read("model").is_err());
+            assert!(resource.read("model").is_err());
+            7
+        });
+        assert_eq!(result, Err(TraceError::ResourceChanged));
+        fs::write(temp.join("model"), b"original").unwrap();
+        fs::write(temp.join("fallback"), b"now present").unwrap();
+        let mut reopened = ResourceSet::open(&temp).unwrap();
+        assert_eq!(
+            reopened.with_verified_reads(&ledger, |r| {
+                let _ = r.read("fallback");
+            }),
+            Err(TraceError::ResourceChanged)
+        );
+        let mut reopened = ResourceSet::open(&temp).unwrap();
+        assert_eq!(
+            reopened.with_verified_reads(&ledger, |r| {
+                let _ = r.read("MODEL");
+            }),
+            Err(TraceError::UnrecordedResource)
+        );
+        let mut reopened = ResourceSet::open(&temp).unwrap();
+        fs::remove_file(temp.join("model")).unwrap();
+        assert_eq!(
+            reopened.with_verified_reads(&ledger, |r| {
+                let _ = r.read("model");
+            }),
+            Err(TraceError::ResourceIo)
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn verified_reads_match_equivalent_archives_and_loose_files() {
+        let temp = temp();
+        let dir = temp.join("loose");
+        fs::create_dir_all(dir.join("map")).unwrap();
+        fs::write(dir.join("map/map.01"), b"owned").unwrap();
+        let tar = temp.join("data.tar");
+        write_tar(&tar, "map/map.01", b"owned");
+        let mut loose = ResourceSet::open(&dir).unwrap();
+        loose.begin_trace().unwrap();
+        loose.read("map/map.01").unwrap();
+        let ledger = loose.take_trace().unwrap().finish_verified().unwrap();
+        let mut archived = ResourceSet::open(&tar).unwrap();
+        let bytes = archived
+            .with_verified_reads(&ledger, |r| r.read("map/map.01"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"owned");
+        let mut truncated = ResourceSet::open(&tar).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&tar)
+            .unwrap()
+            .set_len(512)
+            .unwrap();
+        assert_eq!(
+            truncated.with_verified_reads(&ledger, |r| {
+                let _ = r.read("map/map.01");
+            }),
+            Err(TraceError::ResourceIo)
+        );
         fs::remove_dir_all(temp).unwrap();
     }
 }

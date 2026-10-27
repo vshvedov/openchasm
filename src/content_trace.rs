@@ -19,6 +19,7 @@ pub enum TraceError {
     ResourceChanged,
     ResourceIo,
     HashCollision,
+    UnrecordedResource,
 }
 impl std::fmt::Display for TraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,7 +33,7 @@ enum Outcome {
     Missing,
     Present { length: u64, digest: [u8; 32] },
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Record {
     name: String,
     outcome: Outcome,
@@ -164,19 +165,130 @@ impl ResourceTrace {
         }
         self.record("metadata", label, Some(bytes))
     }
-    pub fn finish(self) -> Result<ContentDigest, TraceError> {
+    /// Freeze exactly the successful startup trace for later checked reads.
+    /// The ledger retains names and hashes only, never resource bytes.
+    pub fn finish_verified(self) -> Result<VerifiedResources, TraceError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         let mut manifest = ContentManifest::new();
+        let mut records = BTreeMap::new();
         for (key, record) in self.entries {
             match record.outcome {
                 Outcome::Missing => manifest.add_missing(&key),
                 Outcome::Present { length, digest } => manifest.add_digest(&key, length, digest),
             }
             .map_err(|_| TraceError::LimitExceeded)?;
+            if key.starts_with("resource/") {
+                records.insert(record.name, record.outcome);
+            }
         }
-        Ok(manifest.finish())
+        Ok(VerifiedResources {
+            digest: manifest.finish(),
+            records,
+        })
+    }
+    pub fn finish(self) -> Result<ContentDigest, TraceError> {
+        Ok(self.finish_verified()?.digest)
+    }
+}
+
+/// Immutable successful startup ledger. Keep it only in memory and compare
+/// `digest()` with the saved content digest before allowing a restore.
+#[derive(Clone, Debug)]
+pub struct VerifiedResources {
+    digest: ContentDigest,
+    records: BTreeMap<String, Outcome>,
+}
+impl VerifiedResources {
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+}
+
+pub(crate) struct ReadVerification {
+    ledger: VerifiedResources,
+    reads: usize,
+    hashed_bytes: u64,
+    failure: Option<TraceError>,
+}
+impl ReadVerification {
+    pub(crate) fn new(ledger: &VerifiedResources) -> Self {
+        Self {
+            ledger: ledger.clone(),
+            reads: 0,
+            hashed_bytes: 0,
+            failure: None,
+        }
+    }
+    pub(crate) fn check_name(&mut self, name: &str) -> Result<(), TraceError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = if name.is_empty() || name.len() > MAX_PATH || name.contains('\0') {
+            Err(TraceError::InvalidName)
+        } else if self.reads >= MAX_READS {
+            Err(TraceError::LimitExceeded)
+        } else if !self.ledger.records.contains_key(name) {
+            Err(TraceError::UnrecordedResource)
+        } else {
+            self.reads += 1;
+            Ok(())
+        };
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
+    pub(crate) fn check_result(
+        &mut self,
+        name: &str,
+        result: &std::io::Result<Vec<u8>>,
+        absent: bool,
+    ) -> Result<(), TraceError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let expected = self
+            .ledger
+            .records
+            .get(name)
+            .ok_or(TraceError::UnrecordedResource)?;
+        let outcome = match result {
+            Ok(bytes) => {
+                let len = bytes.len() as u64;
+                match self
+                    .hashed_bytes
+                    .checked_add(len)
+                    .filter(|n| *n <= MAX_HASHED_BYTES)
+                {
+                    Some(total) => self.hashed_bytes = total,
+                    None => {
+                        self.failure = Some(TraceError::LimitExceeded);
+                        return Err(TraceError::LimitExceeded);
+                    }
+                }
+                Outcome::Present {
+                    length: len,
+                    digest: Sha256::digest(bytes).into(),
+                }
+            }
+            Err(error) if absent && error.kind() == std::io::ErrorKind::NotFound => {
+                Outcome::Missing
+            }
+            Err(_) => {
+                self.failure = Some(TraceError::ResourceIo);
+                return Err(TraceError::ResourceIo);
+            }
+        };
+        if &outcome != expected {
+            self.failure = Some(TraceError::ResourceChanged);
+            return Err(TraceError::ResourceChanged);
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> Result<(), TraceError> {
+        self.failure.map_or(Ok(()), Err)
     }
 }
 
@@ -208,5 +320,32 @@ mod tests {
             trace.add_metadata("v", b"x"),
             Err(TraceError::LimitExceeded)
         );
+    }
+    #[test]
+    fn verification_limits_are_sticky_and_do_not_read_unrecorded_names() {
+        let mut trace = ResourceTrace::default();
+        trace.record_preloaded("path", b"content").unwrap();
+        let ledger = trace.finish_verified().unwrap();
+        let mut verification = ReadVerification::new(&ledger);
+        verification.reads = MAX_READS;
+        assert_eq!(
+            verification.check_name("path"),
+            Err(TraceError::LimitExceeded)
+        );
+        assert_eq!(verification.finish(), Err(TraceError::LimitExceeded));
+        let mut verification = ReadVerification::new(&ledger);
+        verification.hashed_bytes = MAX_HASHED_BYTES;
+        verification.check_name("path").unwrap();
+        assert_eq!(
+            verification.check_result("path", &Ok(vec![1]), false),
+            Err(TraceError::LimitExceeded)
+        );
+        assert_eq!(verification.finish(), Err(TraceError::LimitExceeded));
+        let mut verification = ReadVerification::new(&ledger);
+        assert_eq!(
+            verification.check_name("PATH"),
+            Err(TraceError::UnrecordedResource)
+        );
+        assert_eq!(verification.finish(), Err(TraceError::UnrecordedResource));
     }
 }

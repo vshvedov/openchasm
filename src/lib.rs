@@ -14,4 +14,5 @@ pub mod ai;
 pub mod combat;
 pub mod game;
 pub mod pickups;
+pub mod projectiles;
 pub mod session;

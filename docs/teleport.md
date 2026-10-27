@@ -1,49 +1,41 @@
-# Teleport definitions and state
+# Teleports
 
 `teleport::parse` reads ordered `#teleports` / `tcenter` rows atomically,
 rejecting malformed coordinates, directions, unknown records and unterminated
-sections. It retains the five authored values and the expansion's sixth field.
-Six-field rows parse but `TeleportState::tick` returns `UnsupportedExtra` if
-one triggers: that field's meaning is unverified, and it is not silently lost.
+sections. It retains the authored values and optional sixth numeric field. The
+installed 2022 executable reads the first five numeric fields and ignores the
+rest of the row; the six level-17 rows therefore execute normally while their
+extra values remain available for diagnostics.
 
-Each coordinate component in 0–63 denotes its cell center; 64–16383 denotes
-1/256-tile position units, following the bundled 2022 modding manual. Source
-and destination are independently converted. The manual documents directions
-0–3, but installed levels also use 4; conversion follows PanzerChasm's
-`-direction * pi/2 - pi/2`, normalized to a turn. PanzerChasm uses a different
-interpretation for small destinations (integer tile corners), so the correct
-original behavior remains an explicit open question.
+The installed executable converts each source cell to its center; source
+coordinates outside 0–63 are rejected. Each destination component in 0–63
+names a cell center, and 64–16383 names a position in 1/256-tile units. The
+manual describes mixed coordinates for both ends, but the remaster parser
+always treats source coordinates as cell indices. The remaster computes yaw as
+`direction * pi/2 - pi/2`; direction 4 occurs in the installed campaign. Its
+parser starts at virtual address 0x140096c20 in the installed Windows binary:
+the four coordinate reads are at 0x140097072–0x1400970a1 and the direction
+read/conversion at 0x14009710b–0x140097133. Independently reconstructed
+PanzerChasm differs in destination centering and yaw sign.
 
 `TeleportState` is per entity. Each tick selects the first source whose center
-is strictly within 0.5 tiles and requests a destination-clearance decision from
-the host. Blocked destinations do not consume a trigger. A successful event
-includes source, destination and yaw; the host must atomically update position,
-vertical floor/velocity, view, collision, sound, rendering, and network state.
-It must not continue using stale pre-teleport floor or proximity triggers.
-This subsystem does not currently alter session movement or any entity.
+is strictly within 0.5 tiles and asks the host to validate destination
+clearance. Blocked destinations do not consume the trigger. The reference checks
+once per tick without a cooldown (`ReferenceContinuous`); optional
+`AfterLeavingSources` rearm is a provisional loop-prevention approximation.
+Trigger radius, clearance, direction and rearm still need original-game tests.
 
-`ReferenceContinuous` reproduces PanzerChasm's per-tick triggering and has no
-cooldown; paired/nearby sources may cause repeated teleports. The optional
-`AfterLeavingSources` policy prevents loops until an entity leaves every source
-circle; it is a provisional safety approximation, not evidence of the original
-cooldown. Original trigger radius, collision, direction and rearm behavior need
-comparison against the game. Each entity requires its own state, and a restart
-must restore its corresponding snapshot.
+`Session::set_teleports` opts the player in; fresh sessions remain disabled.
+After movement, a successful teleport updates position and yaw, resets vertical
+velocity at the provisional flat floor, then runs destination pickups and floor
+links in that tick. It emits `SessionEvents::teleport`; blocked destinations
+are reported as `teleport_failure`. The host presents sound and networking.
+AI and other entities do not teleport yet; wind currently applies before the
+teleport. Session clones retain the teleport state.
 
-The optional installed-corpus test checks 76 rows in maps 01–19, including all
-six level-17 rows with the extra field. It does not establish map traversal or
-prove that flagged expansion teleports work.
-
-`Session::set_teleports` opts the player into this behavior and selects a rearm
-policy; fresh sessions remain disabled. After movement, a successful teleport
-updates position and yaw, resets vertical velocity at the provisional flat
-floor, then runs destination pickups and floor links in that tick. It emits
-`SessionEvents::teleport`; blocked destinations and unsupported extra fields
-are reported as `teleport_failure`. Clearance checks represented live actor
-and object circles plus blocking walls, map edges and the provisional ceiling.
-Source floor triggers are not fired on a successful teleport. Destination
-floor entry is reset even when source and destination share a cell. AI and
-other entities do not teleport yet; wind currently applies before teleport,
-unlike the reference's provisional order.
-
-The preview parses teleports from each level's `map/process.xx` and enables player teleportation when the section is valid. It uses the provisional `AfterLeavingSources` rearm policy to avoid immediate loops. A committed teleport plays one of sound IDs 17–19, chosen deterministically by authored row index. Invalid data is reported during level loading; blocked destinations and unknown extra flags produce an on-screen diagnostic only when triggered, without logging on every tick. Teleport rearm state and the notification are included in the in-memory quicksave. Teleports for monsters and exact original rearm behavior remain unimplemented.
+Clearance currently assumes represented objects extend upward from the floor.
+That blocks level 17's first portal at (41,53): the landing overlaps the 2D
+radius of roof object `18_cl2.3o`, despite its mesh being above the player.
+The other five level-17 landings were clear in the installed-data fixture. This
+conservative false positive needs model-height-aware collision before that
+portal can be enabled correctly. Tests do not establish whole-map traversal.

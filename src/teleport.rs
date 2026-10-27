@@ -13,7 +13,7 @@ pub struct Teleport {
     pub from_raw: [u16; 2],
     pub to_raw: [u16; 2],
     pub direction: u8,
-    /// The installed expansion uses this sixth field; its meaning is unknown.
+    /// Extra numeric token, preserved for round trips and ignored by the remaster.
     pub extra: Option<u16>,
 }
 impl Teleport {
@@ -27,15 +27,15 @@ impl Teleport {
         }
     }
     pub fn source(&self) -> [f32; 2] {
-        self.from_raw.map(Self::coordinate)
+        self.from_raw.map(|value| f32::from(value) + 0.5)
     }
     pub fn destination(&self) -> [f32; 2] {
         self.to_raw.map(Self::coordinate)
     }
-    /// Direction conversion from the independent PanzerChasm reconstruction.
+    /// Direction conversion observed in the installed 2022 remaster.
     /// The installed campaign uses 4 as well as the documented 0–3.
     pub fn angle_radians(&self) -> f32 {
-        (-f32::from(self.direction) * std::f32::consts::FRAC_PI_2 - std::f32::consts::FRAC_PI_2)
+        (f32::from(self.direction) * std::f32::consts::FRAC_PI_2 - std::f32::consts::FRAC_PI_2)
             .rem_euclid(std::f32::consts::TAU)
     }
 }
@@ -53,7 +53,8 @@ impl fmt::Display for TeleportParseError {
 impl Error for TeleportParseError {}
 
 /// Parse complete `#teleports` sections. Any invalid row rejects the whole
-/// definition set; six-field rows are retained but are not executable yet.
+/// definition set. The remaster ignores the optional trailing field, which is
+/// retained here for round-tripping and diagnostics.
 pub fn parse(source: &str) -> Result<Vec<Teleport>, TeleportParseError> {
     let mut result = Vec::new();
     let mut inside = false;
@@ -95,7 +96,9 @@ pub fn parse(source: &str) -> Result<Vec<Teleport>, TeleportParseError> {
                 })
             })
             .collect::<Result<_, _>>()?;
-        if values[..4].iter().any(|v| *v >= RAW_LIMIT) {
+        if values[..2].iter().any(|v| *v >= MAP_SIDE)
+            || values[2..4].iter().any(|v| *v >= RAW_LIMIT)
+        {
             return Err(TeleportParseError {
                 line: i + 1,
                 reason: "coordinate outside map",
@@ -141,7 +144,6 @@ pub struct TeleportEvent {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TeleportFailure {
-    UnsupportedExtra { index: usize, value: u16 },
     DestinationBlocked { index: usize },
     InvalidDefinition { index: usize },
 }
@@ -159,7 +161,7 @@ impl TeleportState {
     }
     /// Check one entity after movement, in authored order. The host's clearance
     /// predicate must cover its collision shape and destination occupancy.
-    /// Failed or unsupported attempts do not modify the rearm state.
+    /// Failed attempts do not modify the rearm state.
     pub fn tick(
         &mut self,
         definitions: &[Teleport],
@@ -167,11 +169,8 @@ impl TeleportState {
         is_clear: impl FnOnce([f32; 2]) -> bool,
     ) -> Result<Option<TeleportEvent>, TeleportFailure> {
         if let Some((index, _)) = definitions.iter().enumerate().find(|(_, teleport)| {
-            teleport
-                .from_raw
-                .iter()
-                .chain(teleport.to_raw.iter())
-                .any(|v| *v >= RAW_LIMIT)
+            teleport.from_raw.iter().any(|v| *v >= MAP_SIDE)
+                || teleport.to_raw.iter().any(|v| *v >= RAW_LIMIT)
                 || teleport.direction > 4
         }) {
             return Err(TeleportFailure::InvalidDefinition { index });
@@ -197,9 +196,6 @@ impl TeleportState {
         let Some((index, p)) = found else {
             return Ok(None);
         };
-        if let Some(value) = p.extra {
-            return Err(TeleportFailure::UnsupportedExtra { index, value });
-        }
         let destination = p.destination();
         if !is_clear(destination) {
             return Err(TeleportFailure::DestinationBlocked { index });
@@ -224,13 +220,38 @@ mod tests {
         assert_eq!(p[0].destination(), [5.5, 32.5]);
         assert_eq!(p[1].destination(), [2220.0 / 256.0, 28.0]);
         assert_eq!(p[2].extra, Some(2));
-        assert_eq!(p[0].angle_radians(), 0.0);
+        assert!((p[0].angle_radians() - std::f32::consts::PI).abs() < 1e-5);
         assert!((p[1].angle_radians() - std::f32::consts::FRAC_PI_2 * 3.0).abs() < 1e-5);
     }
+    #[test]
+    fn remaster_directions_match_world_cos_sin_convention() {
+        let expected = [
+            [0.0, -1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+            [0.0, -1.0],
+        ];
+        for (direction, vector) in expected.into_iter().enumerate() {
+            let t = Teleport {
+                from_raw: [1, 1],
+                to_raw: [2, 2],
+                direction: direction as u8,
+                extra: None,
+            };
+            let (sin, cos) = t.angle_radians().sin_cos();
+            assert!(
+                (cos - vector[0]).abs() < 1e-5 && (sin - vector[1]).abs() < 1e-5,
+                "direction {direction}: ({cos},{sin})"
+            );
+        }
+    }
+
     #[test]
     fn malformed_sections_fail_closed() {
         for s in [
             "#teleports\ntcenter 64 x 1 1 0\n#end",
+            "#teleports\ntcenter 64 1 1 1 0\n#end",
             "#teleports\ntcenter 1 1 16384 1 0\n#end",
             "#teleports\ntcenter 1 1 1 1 5\n#end",
             "#teleports\ntcenter 1 1 1 1 0",
@@ -254,8 +275,8 @@ mod tests {
             0
         );
         assert_eq!(
-            state.tick(&p, [3.5, 2.5], |_| true),
-            Err(TeleportFailure::UnsupportedExtra { index: 2, value: 2 })
+            state.tick(&p, [3.5, 2.5], |_| true).unwrap().unwrap().index,
+            2
         );
         assert!(state.tick(&p, [f32::NAN, 0.0], |_| true).unwrap().is_none());
         let mut invalid = p.clone();

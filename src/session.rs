@@ -1742,7 +1742,7 @@ mod tests {
         });
         assert!(events.teleport.is_some());
         assert_eq!(session.world.player.position, [2.5, 0.5]);
-        assert_eq!(session.world.player.angle, 0.0);
+        assert!((session.world.player.angle - std::f32::consts::PI).abs() < 1e-5);
         assert_eq!(session.vertical.feet(), 0.0);
         assert_eq!(session.vertical.velocity(), 0.0);
         assert!(session.vertical.grounded());
@@ -1807,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn teleport_destination_collision_and_unknown_flags_fail_without_moving() {
+    fn teleport_destination_collision_fails_and_extra_field_is_ignored() {
         use crate::teleport::{self, RearmPolicy, TeleportFailure};
         use crate::world::Wall;
         let mut session = mission_session("");
@@ -1843,11 +1843,9 @@ mod tests {
             RearmPolicy::ReferenceContinuous,
         );
         let e = unknown.step(SessionInput::default());
-        assert_eq!(
-            e.teleport_failure,
-            Some(TeleportFailure::UnsupportedExtra { index: 0, value: 2 })
-        );
-        assert_eq!(unknown.world.player.position, [0.5, 0.5]);
+        assert!(e.teleport_failure.is_none());
+        assert!(e.teleport.is_some());
+        assert_eq!(unknown.world.player.position, [2.5, 0.5]);
     }
 
     #[test]

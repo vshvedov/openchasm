@@ -33,6 +33,13 @@ fn campaign_teleports_parse_and_preserve_expansion_flags() {
         if level == 17 {
             assert_eq!(rows.len(), 6);
             assert!(rows.iter().all(|row| row.extra == Some(2)));
+            let mut state = teleport::TeleportState::default();
+            let event = state
+                .tick(&rows, rows[0].source(), |_| true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.destination, [37.5, 16.5]);
+            assert!((event.angle_radians - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
         }
         total += rows.len();
         extra += rows.iter().filter(|row| row.extra.is_some()).count();

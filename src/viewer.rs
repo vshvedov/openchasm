@@ -215,9 +215,6 @@ fn advance_reflection_indicator(ticks: u8, reflection_count: usize) -> u8 {
 fn teleport_failure_message(failure: openchasm::teleport::TeleportFailure) -> String {
     use openchasm::teleport::TeleportFailure;
     match failure {
-        TeleportFailure::UnsupportedExtra { index, value } => {
-            format!("TELEPORT {} UNSUPPORTED FLAG {}", index + 1, value)
-        }
         TeleportFailure::DestinationBlocked { index } => {
             format!("TELEPORT {} DESTINATION BLOCKED", index + 1)
         }
@@ -1479,10 +1476,6 @@ mod tests {
     #[test]
     fn teleport_errors_are_actionable() {
         use openchasm::teleport::TeleportFailure;
-        assert_eq!(
-            teleport_failure_message(TeleportFailure::UnsupportedExtra { index: 0, value: 2 }),
-            "TELEPORT 1 UNSUPPORTED FLAG 2"
-        );
         assert_eq!(
             teleport_failure_message(TeleportFailure::DestinationBlocked { index: 4 }),
             "TELEPORT 5 DESTINATION BLOCKED"

@@ -1,0 +1,5 @@
+# Ambient sound definitions
+
+`AmbientDefinitions::parse` reads the level resource's `#ambients` section. Entries distinguish a missing ID from an explicitly blank slot. A nonblank entry provides its filename under `sound/`, a volume in 0–128 (default 86), and an optional `b:` background sound ID. Invalid names, duplicate entries, out-of-range IDs or volumes, unknown options, and malformed blocks are rejected. The permitted background sound range 0–154 follows the bundled manual's sound-ID ranges. Resource lookup and playback belong to the client.
+
+The bundled 2022 modding manual documents `v:` and `b:` and says the latter selects a random sound played while the player is in a matching ambient cell. Exact random timing and `sound_config.txt` volume adjustments remain unimplemented. PanzerChasm treats ambient cell ID 0 as silence and fades between looped sounds over 0.5 seconds; whether the remaster treats ID 0 the same way is unresolved. Level resource slot 0 can contain a filename and is therefore preserved by this parser.

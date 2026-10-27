@@ -104,6 +104,7 @@ fn make_world(map: &Map) -> Result<World, Box<dyn Error>> {
             let wall = map.wall(x, y).expect("valid grid coordinates");
             if wall.is_wall() && wall.start != wall.end {
                 walls.push(Wall {
+                    cell: Some([x as u8, y as u8]),
                     a: convert(wall.start),
                     b: convert(wall.end),
                     texture: wall.texture_id,
@@ -209,7 +210,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
                 println!(
                     "{id}: {} walls, {} actors",
-                    world.walls.len(),
+                    world
+                        .walls
+                        .iter()
+                        .filter(|wall| wall.cell.is_some())
+                        .count(),
                     map.monsters.len()
                 );
             }

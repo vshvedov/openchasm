@@ -144,6 +144,7 @@ mod tests {
     fn paints_a_textured_wall_at_screen_center() {
         let world = World {
             walls: vec![Wall {
+                cell: None,
                 a: [1.0, -1.0],
                 b: [1.0, 1.0],
                 texture: 1,

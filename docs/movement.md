@@ -1,0 +1,9 @@
+# Player movement research
+
+The current preview simulates a circular player on a two-dimensional plane. A swept circle against each wall segment prevents the player from passing through a wall during a movement step, and a remaining tangential movement slides along the surface. Rounded segment endpoints prevent the player from cutting through the end of a wall. A player initially overlapping geometry is permitted to move away from it. This collision algorithm is an original implementation for the preview and is not yet established as equivalent to Chasm's behavior.
+
+The preview currently uses a radius of 0.18 tiles, speed of 2.5 tiles per second, and turn speed of 2 radians per second. These values are provisional, not measurements of the original. The modding manual included with the 2022 game describes a `WRad` field as collision radius for map geometry; the `heronew.car` record in `chasm.inf` lists 100 for that field. Whether that value governs the player, its units, and how speed interacts with movement state still need verification against the game.
+
+The modding manual also describes texture IDs 1–86 as opaque one-sided walls, 87–119 as transparent two-sided walls, and 120 as invisible two-sided walls. The `g` flag in `#GFX` disables walk collision for transparent walls; `s` disables shot collision. Current preview walls are all treated as solid, so this behavior is incomplete. Moving doors, objects, actors, floors, ceilings, jumping, and vertical collision also remain unimplemented.
+
+The window layer sends input to a fixed-rate movement step, with no window or audio dependency inside the geometry code. Floating-point results and input handling have not been proven deterministic across platforms, so this separation is only groundwork for a future authoritative server.

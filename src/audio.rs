@@ -214,6 +214,16 @@ pub struct Audio {
     enemy_sounds: Vec<[Option<Arc<[u8]>>; 2]>,
     player_sounds: [Option<Arc<[u8]>>; 3],
     music: Option<Player>,
+    one_shots: Vec<Player>,
+}
+const MAX_ONE_SHOTS: usize = 64;
+
+fn track_one_shot(players: &mut Vec<Player>, player: Player) {
+    players.retain(|active| !active.empty());
+    if players.len() >= MAX_ONE_SHOTS {
+        players.remove(0).stop();
+    }
+    players.push(player);
 }
 impl Audio {
     pub fn new(resources: &mut ResourceSet, inf: &[u8]) -> Self {
@@ -284,11 +294,12 @@ impl Audio {
             enemy_sounds,
             player_sounds,
             music: None,
+            one_shots: Vec::new(),
         }
     }
     /// Play one committed player pain/death cue. A missing pain variant falls
     /// back to the other; unavailable audio or missing files are silent.
-    pub fn play_player_sound(&self, kind: PlayerSound) {
+    pub fn play_player_sound(&mut self, kind: PlayerSound) {
         let Some(sink) = &self.sink else {
             return;
         };
@@ -301,7 +312,7 @@ impl Audio {
             });
         if let Some(bytes) = sample {
             if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(bytes))) {
-                player.detach();
+                track_one_shot(&mut self.one_shots, player);
             }
         }
     }
@@ -309,7 +320,7 @@ impl Audio {
     /// Play committed attacks using authored model-name samples. Missing
     /// actors, files, decoders and audio output are silently ignored.
     pub fn play_enemy_attacks(
-        &self,
+        &mut self,
         attacks: &[openchasm::ai::EnemyAttack],
         actors: &openchasm::actors::ActorState,
         listener: [f32; 2],
@@ -327,7 +338,7 @@ impl Audio {
             };
             if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(bytes))) {
                 player.set_volume(volume);
-                player.detach();
+                track_one_shot(&mut self.one_shots, player);
             }
         }
     }
@@ -351,13 +362,20 @@ impl Audio {
         player.append(source.repeat_infinite());
         self.music = Some(player);
     }
-    /// Start a detached one-shot sample if output and the requested asset exist.
-    pub fn play(&self, id: u8) {
+    /// Start a bounded, tracked one-shot sample when the asset is available.
+    pub fn play(&mut self, id: u8) {
         let (Some(sink), Some(bytes)) = (&self.sink, self.sounds.get(&id)) else {
             return;
         };
         if let Ok(player) = rodio::play(sink.mixer(), Cursor::new(Arc::clone(bytes))) {
-            player.detach();
+            track_one_shot(&mut self.one_shots, player);
+        }
+    }
+
+    /// Stop sounds from the discarded timeline, leaving level music playing.
+    pub fn stop_one_shots(&mut self) {
+        for player in self.one_shots.drain(..) {
+            player.stop();
         }
     }
 }
@@ -365,6 +383,43 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_shots_are_bounded_and_reset_does_not_stop_music() {
+        use rodio::buffer::SamplesBuffer;
+
+        fn active_player() -> (Player, rodio::queue::SourcesQueueOutput) {
+            let (player, output) = Player::new();
+            player.append(SamplesBuffer::new(
+                std::num::NonZeroU16::new(1).unwrap(),
+                std::num::NonZeroU32::new(44_100).unwrap(),
+                vec![1.0; 44_100],
+            ));
+            (player, output)
+        }
+
+        let (music, mut music_output) = active_player();
+        let mut audio = Audio {
+            sink: None,
+            sounds: BTreeMap::new(),
+            enemy_sounds: Vec::new(),
+            player_sounds: [None, None, None],
+            music: Some(music),
+            one_shots: Vec::new(),
+        };
+        let mut outputs = Vec::new();
+        for _ in 0..=MAX_ONE_SHOTS {
+            let (player, output) = active_player();
+            track_one_shot(&mut audio.one_shots, player);
+            outputs.push(output);
+        }
+        assert_eq!(audio.one_shots.len(), MAX_ONE_SHOTS);
+        // The oldest source was stopped on eviction.
+        assert_ne!(outputs[0].next(), Some(1.0));
+        audio.stop_one_shots();
+        assert!(audio.one_shots.is_empty());
+        assert_ne!(outputs[1].next(), Some(1.0));
+        assert_eq!(music_output.next(), Some(1.0));
+    }
     #[test]
     fn installed_pickup_wav_decodes_when_game_data_is_available() {
         use rodio::Source;

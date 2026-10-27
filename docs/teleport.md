@@ -33,9 +33,8 @@ are reported as `teleport_failure`. The host presents sound and networking.
 AI and other entities do not teleport yet; wind currently applies before the
 teleport. Session clones retain the teleport state.
 
-Clearance currently assumes represented objects extend upward from the floor.
-That blocks level 17's first portal at (41,53): the landing overlaps the 2D
-radius of roof object `18_cl2.3o`, despite its mesh being above the player.
-The other five level-17 landings were clear in the installed-data fixture. This
-conservative false positive needs model-height-aware collision before that
-portal can be enabled correctly. Tests do not establish whole-map traversal.
+The client loads object mesh heights for destination clearance, allowing level
+17's first landing beneath the elevated `18_cl2.3o` roof. Missing or invalid
+height data falls back to conservative blocking. The installed-data scenario
+tests this landing without actors; it does not establish whole-map traversal
+or clearance with the level's full enemy population.

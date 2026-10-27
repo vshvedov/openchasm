@@ -2,7 +2,7 @@
 //!
 //! F5/F9 provide a same-level in-memory quicksave only. The snapshot includes
 //! simulation and scene instance/animation state; transient explosion sprites
-//! are cleared on load and already-playing audio is not rewound. No data is
+//! and one-shot sounds are cleared on load; music continues. No data is
 //! written to disk; the checkpoint is lost on leaving the viewer/level.
 use crate::audio::{Audio, PlayerSound};
 use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene, ObjectSceneSnapshot};
@@ -528,7 +528,7 @@ pub fn run(
 ) -> Result<Option<openchasm::inventory::Inventory>, Box<dyn Error>> {
     let ClientFeedback {
         mut session,
-        audio,
+        mut audio,
         weapon_overlay,
         projectile_renderer,
         mut explosion_renderer,
@@ -725,6 +725,7 @@ pub fn run(
             accumulator = 0.0;
         }
         if restart_requested {
+            audio.stop_one_shots();
             session = initial_session.clone();
             if let Some(renderer) = &mut explosion_renderer {
                 renderer.clear();
@@ -770,6 +771,7 @@ pub fn run(
                 CheckpointCommand::Load => {
                     if let Some(saved) = &quicksave {
                         if objects.restore(&saved.scene) {
+                            audio.stop_one_shots();
                             session = saved.session.clone();
                             animation_tick = saved.animation_tick;
                             weapon_clock = saved.weapon_clock;

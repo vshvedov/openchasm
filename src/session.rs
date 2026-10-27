@@ -1,6 +1,6 @@
 //! Fixed-tick game session: simulation state independent of presentation and transport.
 use crate::actors::{ActorDefinitions, ActorState};
-use crate::ai::{EnemyAi, Mode};
+use crate::ai::{EnemyAi, EnemyAttack, EnemyAttackKind, Mode};
 use crate::combat::{Combat, FireResult, RocketDefinitions, ShotContext, ShotImpact};
 use crate::game::GameInventory;
 use crate::pickups::{Difficulty, PickupEvent};
@@ -31,6 +31,7 @@ pub struct SessionEvents {
     pub pickups: Vec<PickupEvent>,
     pub shot: Option<FireResult>,
     pub damage: u16,
+    pub enemy_attacks: Vec<EnemyAttack>,
 }
 
 pub struct Session {
@@ -112,10 +113,16 @@ impl Session {
             }
             events.shot = Some(shot);
         }
-        for attack in self
-            .ai
-            .tick(&mut self.actors, &self.actor_definitions, &self.world)
-        {
+        events.enemy_attacks = self.ai.tick_with_rockets(
+            &mut self.actors,
+            &self.actor_definitions,
+            &self.rockets,
+            &self.world,
+        );
+        for attack in &events.enemy_attacks {
+            if matches!(attack.kind, EnemyAttackKind::Ranged { instant: false, .. }) {
+                continue;
+            }
             // Provisional armor: absorbs at most half of each incoming hit.
             let absorbed = (attack.damage / 2).min(self.game.inventory.armor);
             self.game.inventory.armor -= absorbed;
@@ -226,5 +233,12 @@ mod tests {
         ));
         assert_eq!(session.actors.actors[0].health, 20);
         assert_eq!(session.game.inventory.ammo[0], 9);
+        session.actor_definitions.entries[1].rocket = 0;
+        let events = session.step(SessionInput::default());
+        assert!(matches!(
+            events.enemy_attacks.first().map(|attack| attack.kind),
+            Some(EnemyAttackKind::Ranged { instant: true, .. })
+        ));
+        assert_eq!(session.game.inventory.health, 90);
     }
 }

@@ -1,6 +1,6 @@
 //! Software-rendered geometry viewer. Game rules live outside the window layer.
 use crate::audio::Audio;
-use crate::object_render::{ActorAnimationMode, ObjectScene};
+use crate::object_render::{ActorAnimationMode, CameraView, ObjectScene};
 use crate::planes::PlaneRenderer;
 use crate::projectile_render::{ProjectileRenderer, ProjectileVisual};
 use crate::texture::CelImage;
@@ -99,6 +99,7 @@ fn text(frame: &mut [u32], x: usize, y: usize, message: &str) {
 struct RenderWorld<'a> {
     world: &'a World,
     elevations: &'a [f32],
+    eye_height: f32,
 }
 
 fn render(
@@ -111,14 +112,12 @@ fn render(
     label: &str,
 ) {
     let world = scene.world;
+    let camera = CameraView {
+        player: world.player,
+        eye_height: scene.eye_height,
+    };
     if let Some(planes) = planes {
-        planes.render(
-            frame,
-            WIDTH,
-            HEIGHT,
-            world.player.position,
-            world.player.angle,
-        );
+        planes.render(frame, WIDTH, HEIGHT, camera);
     } else {
         for (y, row) in frame.chunks_mut(WIDTH).enumerate() {
             row.fill(if y < HEIGHT / 2 { 0x303847 } else { 0x38312b });
@@ -129,8 +128,8 @@ fn render(
     let mut hits = Vec::new();
     for x in 0..WIDTH {
         // Direction is unnormalized, so hit distance is perpendicular to camera plane.
-        let camera = (2.0 * x as f32 / WIDTH as f32 - 1.0) * 0.66;
-        let direction = [cos - sin * camera, sin + cos * camera];
+        let camera_x = (2.0 * x as f32 / WIDTH as f32 - 1.0) * 0.66;
+        let direction = [cos - sin * camera_x, sin + cos * camera_x];
         world.ray_hits(direction, &mut hits);
         for &(distance, index, along) in &hits {
             let texture = world.walls[index].texture as u32;
@@ -139,7 +138,7 @@ fn render(
             }
             let half = (HEIGHT as f32 * 0.5 / distance).min((HEIGHT * 4) as f32);
             let offset = scene.elevations.get(index).copied().unwrap_or(0.0) / 64.0;
-            let origin = HEIGHT as f32 * 0.5 - half - offset * half;
+            let origin = HEIGHT as f32 * 0.5 - (2.0 + offset - camera.eye_height) * half;
             let top = origin.max(0.0).min(HEIGHT as f32) as usize;
             let bottom = (origin + half * 2.0).max(0.0).min(HEIGHT as f32) as usize;
             let attenuation = (1.0 / (1.0 + distance * 0.08)).clamp(0.25, 1.0);
@@ -170,14 +169,14 @@ fn render(
         }
     }
     if let Some(objects) = objects {
-        objects.render(frame, depth, WIDTH, HEIGHT, world.player);
+        objects.render(frame, depth, WIDTH, HEIGHT, camera);
     }
     text(frame, 8, 8, label);
     text(
         frame,
         8,
         20,
-        "WASD MOVE  MOUSE/ARROWS TURN  E USE  SPACE FIRE  1-8  ESC QUIT",
+        "WASD MOVE  MOUSE TURN/FIRE  SPACE/RMB JUMP  E USE  1-8  ESC",
     );
     text(
         frame,
@@ -252,6 +251,7 @@ pub fn run(
     let mut accumulator = 0.0f32;
     let mut animation_tick = 0_u64;
     let mut pending_interact = false;
+    let mut pending_jump = false;
     let mut pending_weapon = None;
     let mut shoot_ticks = 0usize;
     let mut current_message: Option<(Vec<String>, f32)> = None;
@@ -291,6 +291,7 @@ pub fn run(
                     held.clear();
                     mouse_fire = false;
                     pending_interact = false;
+                    pending_jump = false;
                     pending_weapon = None;
                     accumulator = 0.0;
                 }
@@ -309,6 +310,8 @@ pub fn run(
                             advance_requested = true;
                         } else if code == Scancode::E {
                             pending_interact = true;
+                        } else if code == Scancode::Space {
+                            pending_jump = true;
                         }
                         if let Some(index) = number_keys.iter().position(|&key| key == code) {
                             pending_weapon = Some(index);
@@ -336,6 +339,12 @@ pub fn run(
                             mouse_fire = true;
                         }
                     }
+                }
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } if look.focused => {
+                    pending_jump = true;
                 }
                 Event::MouseButtonUp {
                     mouse_btn: MouseButton::Left,
@@ -376,6 +385,7 @@ pub fn run(
                 objects.set_visible(cell, visible);
             }
             pending_interact = false;
+            pending_jump = false;
             pending_weapon = None;
             shoot_ticks = 0;
             animation_tick = 0;
@@ -387,7 +397,7 @@ pub fn run(
             sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
         }
-        let firing = held.contains(&Scancode::Space) || mouse_fire;
+        let firing = mouse_fire;
         while accumulator >= STEP {
             // Deltas are motion, not velocity: consume exactly once per tick.
             let yaw_delta = look.take_yaw();
@@ -396,10 +406,12 @@ pub fn run(
                 movement,
                 yaw_delta,
                 interact: pending_interact,
+                jump: pending_jump,
                 fire: firing,
                 select_weapon: pending_weapon,
             });
             pending_interact = false;
+            pending_jump = false;
             pending_weapon = None;
             if let Some((_, remaining)) = &mut current_message {
                 *remaining -= STEP;
@@ -483,6 +495,7 @@ pub fn run(
             RenderWorld {
                 world: &session.world,
                 elevations: &session.wall_elevations,
+                eye_height: session.vertical.eye(),
             },
             &textures,
             Some(&planes),
@@ -505,7 +518,10 @@ pub fn run(
             &mut depth,
             WIDTH,
             HEIGHT,
-            session.world.player,
+            CameraView {
+                player: session.world.player,
+                eye_height: session.vertical.eye(),
+            },
             &projectile_visuals,
         );
         let pose = if shoot_ticks > 0 {
@@ -655,6 +671,7 @@ mod tests {
             RenderWorld {
                 world: &world,
                 elevations: &[],
+                eye_height: 1.0,
             },
             &textures,
             None,
@@ -667,6 +684,57 @@ mod tests {
         assert!(visible_in_front & 0x0000ff > 0, "{visible_in_front:06x}");
     }
 
+    #[test]
+    fn raising_the_camera_moves_wall_projection_down() {
+        let world = World {
+            walls: vec![Wall {
+                a: [4.0, -1.0],
+                b: [4.0, 1.0],
+                texture: 1,
+                blocks_movement: true,
+                cell: None,
+            }],
+            player: Player {
+                position: [0.0, 0.0],
+                angle: 0.0,
+            },
+        };
+        let mut frame = vec![0; WIDTH * HEIGHT];
+        let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+        let top = |depth: &[f32]| {
+            (0..HEIGHT)
+                .find(|&y| depth[y * WIDTH + WIDTH / 2].is_finite())
+                .unwrap()
+        };
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[],
+                eye_height: 0.75,
+            },
+            &[],
+            None,
+            None,
+            "",
+        );
+        let lower_camera_top = top(&depth);
+        render(
+            &mut frame,
+            &mut depth,
+            RenderWorld {
+                world: &world,
+                elevations: &[],
+                eye_height: 1.15,
+            },
+            &[],
+            None,
+            None,
+            "",
+        );
+        assert!(top(&depth) > lower_camera_top + 10);
+    }
     #[test]
     fn raised_wall_exposes_space_below_it() {
         let world = World {
@@ -696,6 +764,7 @@ mod tests {
             RenderWorld {
                 world: &world,
                 elevations: &[80.0],
+                eye_height: 1.0,
             },
             &textures,
             None,
@@ -735,6 +804,7 @@ mod tests {
             RenderWorld {
                 world: &world,
                 elevations: &[],
+                eye_height: 1.0,
             },
             &textures,
             None,

@@ -8,6 +8,7 @@ use crate::object_combat::ObjectCombat;
 use crate::pickups::{Difficulty, PickupEvent};
 use crate::process_runtime::{ProcessEffect, ProcessOutcome, ProcessRuntime};
 use crate::projectiles::{Impact, ImpactTarget, Launch, Owner, ProjectileSystem};
+use crate::vertical::{VerticalBounds, VerticalEvents, VerticalState};
 use crate::world::{Input, World};
 
 pub struct LevelSetup {
@@ -28,6 +29,8 @@ pub struct SessionInput {
     /// Horizontal look displacement in radians for this tick, independent of frame rate.
     pub yaw_delta: f32,
     pub interact: bool,
+    /// One-shot jump press edge; a held button is not automatically repeated.
+    pub jump: bool,
     pub fire: bool,
     pub select_weapon: Option<usize>,
 }
@@ -43,11 +46,13 @@ pub struct SessionEvents {
     /// Mission presentation/completion events produced during this step.
     pub mission: Vec<MissionEvent>,
     pub process_effects: Vec<ProcessEffect>,
+    pub vertical: VerticalEvents,
 }
 
 #[derive(Clone)]
 pub struct Session {
     pub world: World,
+    pub vertical: VerticalState,
     pub processes: ProcessRuntime,
     pub actors: ActorState,
     pub actor_definitions: ActorDefinitions,
@@ -86,6 +91,7 @@ impl Session {
             base_wall_blocking,
             elevation_by_cell: vec![0.0; 64 * 64],
             world: setup.world,
+            vertical: VerticalState::new(0.0).expect("default vertical state is valid"),
             processes: setup.processes,
             actors: setup.actors,
             actor_definitions: setup.actor_definitions,
@@ -113,19 +119,55 @@ impl Session {
         wall: &crate::world::Wall,
         shot_blocking: &[bool; 128],
         elevation_by_cell: &[f32],
+        shot_height: f32,
     ) -> bool {
         let elevated = wall.cell.is_some_and(|[x, y]| {
             x < 64
                 && y < 64
                 && elevation_by_cell
                     .get(usize::from(x) * 64 + usize::from(y))
-                    .is_some_and(|offset| *offset >= 64.0)
+                    .is_some_and(|offset| *offset >= shot_height * 64.0)
         });
         !elevated
             && shot_blocking
                 .get(wall.texture as usize)
                 .copied()
                 .unwrap_or(true)
+    }
+    /// Conservative clearance under nearby elevated solid walls. Flat map
+    /// floor/ceiling assumptions remain provisional until plane geometry exists.
+    fn player_bounds(&self) -> VerticalBounds {
+        let p = self.world.player.position;
+        let mut bounds = VerticalBounds::flat_room();
+        for (i, wall) in self.world.walls.iter().enumerate() {
+            if !self.base_wall_blocking.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let offset = self.wall_elevations.get(i).copied().unwrap_or(0.0) / 64.0;
+            if offset <= self.vertical.feet() || offset >= bounds.ceiling.unwrap_or(f32::INFINITY) {
+                continue;
+            }
+            let d = [wall.b[0] - wall.a[0], wall.b[1] - wall.a[1]];
+            let len = d[0] * d[0] + d[1] * d[1];
+            let t = if len <= 1e-12 {
+                0.0
+            } else {
+                (((p[0] - wall.a[0]) * d[0] + (p[1] - wall.a[1]) * d[1]) / len).clamp(0.0, 1.0)
+            };
+            let dx = p[0] - (wall.a[0] + d[0] * t);
+            let dy = p[1] - (wall.a[1] + d[1] * t);
+            if dx * dx + dy * dy < 0.18 * 0.18 {
+                bounds.ceiling = Some(offset);
+            }
+        }
+        bounds
+    }
+    fn sync_wall_blocking(&mut self) {
+        let needed = (self.vertical.head() * 64.0).max(80.0);
+        for (i, wall) in self.world.walls.iter_mut().enumerate() {
+            wall.blocks_movement = self.base_wall_blocking.get(i).copied().unwrap_or(false)
+                && self.wall_elevations.get(i).copied().unwrap_or(0.0) < needed;
+        }
     }
     fn apply_process_effects(&mut self) -> Vec<ProcessEffect> {
         let effects = self.processes.take_effects();
@@ -137,13 +179,13 @@ impl Session {
             {
                 if let Some(wall) = self.world.walls.get_mut(wall_index) {
                     self.wall_elevations[wall_index] = offset_raw;
-                    wall.blocks_movement = self.base_wall_blocking[wall_index] && offset_raw < 80.0;
                     if let Some([x, y]) = wall.cell.filter(|[x, y]| *x < 64 && *y < 64) {
                         self.elevation_by_cell[usize::from(x) * 64 + usize::from(y)] = offset_raw;
                     }
                 }
             }
         }
+        self.sync_wall_blocking();
         effects
     }
     fn apply_player_damage(&mut self, amount: u16) -> u16 {
@@ -181,6 +223,14 @@ impl Session {
             self.world.player.angle =
                 (self.world.player.angle + delta).rem_euclid(std::f32::consts::TAU);
         }
+        let bounds = self.player_bounds();
+        // A closing wall can temporarily leave insufficient clearance; retain
+        // the last valid vertical state until the player can move clear.
+        events.vertical = self
+            .vertical
+            .step(DT, input.jump, bounds)
+            .unwrap_or_default();
+        self.sync_wall_blocking();
         self.world.step(input.movement, DT);
         events.pickups = self.game.collect_near(self.world.player.position);
         self.processes.set_keys(self.game.inventory.keys);
@@ -204,7 +254,14 @@ impl Session {
                     world: &self.world,
                     objects: self.objects.as_mut(),
                 },
-                |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell),
+                |wall| {
+                    Self::blocks_shot(
+                        wall,
+                        &self.shot_blocking,
+                        &self.elevation_by_cell,
+                        self.vertical.eye(),
+                    )
+                },
             );
             match shot {
                 FireResult::Fired(ShotImpact::Object {
@@ -257,7 +314,7 @@ impl Session {
             &self.actor_definitions,
             &self.rockets,
             &self.world,
-            &|wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell),
+            &|wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
         );
         for attack in &events.enemy_attacks {
             if let EnemyAttackKind::Ranged {
@@ -290,7 +347,7 @@ impl Session {
             &self.actors,
             &self.actor_definitions,
             self.objects.as_ref(),
-            |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell),
+            |wall| Self::blocks_shot(wall, &self.shot_blocking, &self.elevation_by_cell, 1.0),
         );
         for impact in &events.projectile_impacts {
             match impact.target {
@@ -633,6 +690,58 @@ mod tests {
         assert!(completed);
     }
     #[test]
+    fn session_jump_and_restart_clone_preserve_vertical_state() {
+        let mut session = mission_session("");
+        let initial = session.clone();
+        let first = session.step(SessionInput {
+            jump: true,
+            ..Default::default()
+        });
+        assert!(first.vertical.jumped);
+        assert!(session.vertical.feet() > 0.0);
+        let airborne = session.step(SessionInput {
+            jump: true,
+            ..Default::default()
+        });
+        assert!(!airborne.vertical.jumped);
+        for _ in 0..120 {
+            session.step(SessionInput::default());
+        }
+        assert!(session.vertical.grounded());
+        assert!((session.vertical.feet() - 0.0).abs() < 1e-6);
+        assert!(initial.vertical.grounded());
+        assert_eq!(initial.vertical.feet(), 0.0);
+    }
+    #[test]
+    fn jumping_under_raised_solid_gate_hits_its_underside() {
+        use crate::world::Wall;
+        let mut session = mission_session("");
+        session.world.player.position = [1.0, 0.5];
+        session.world.walls.push(Wall {
+            a: [1.0, 0.0],
+            b: [1.0, 1.0],
+            texture: 1,
+            blocks_movement: false,
+            cell: Some([1, 0]),
+        });
+        session.base_wall_blocking.push(true);
+        session.wall_elevations.push(80.0);
+        session.elevation_by_cell[64] = 80.0;
+        let first = session.step(SessionInput {
+            jump: true,
+            ..Default::default()
+        });
+        assert!(first.vertical.jumped);
+        let mut hit = false;
+        for _ in 0..100 {
+            let event = session.step(SessionInput::default());
+            hit |= event.vertical.hit_ceiling;
+            assert!(session.vertical.head() <= 1.25 + 1e-5);
+        }
+        assert!(hit);
+        assert!(session.vertical.grounded());
+    }
+    #[test]
     fn raised_wall_becomes_passable_and_remains_visible_as_elevated_geometry() {
         use crate::process_runtime::ProcessCapabilities;
         use crate::world::Wall;
@@ -678,7 +787,14 @@ mod tests {
         assert!(!Session::blocks_shot(
             &session.world.walls[0],
             &session.shot_blocking,
-            &session.elevation_by_cell
+            &session.elevation_by_cell,
+            1.0
+        ));
+        assert!(Session::blocks_shot(
+            &session.world.walls[0],
+            &session.shot_blocking,
+            &session.elevation_by_cell,
+            1.3
         ));
     }
     #[test]

@@ -13,9 +13,15 @@ use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
 const NEAR: f32 = 0.05;
-const CAMERA_HEIGHT: f32 = 1.0;
 const CAMERA_PLANE: f32 = 0.66;
 const ACTOR_ANIMATION_FPS: f64 = 18.0;
+
+/// Shared camera pose for all world-space renderers.
+#[derive(Clone, Copy)]
+pub struct CameraView {
+    pub player: Player,
+    pub eye_height: f32,
+}
 
 /// Provisional mapping from simulation behavior to CAR animation slots.
 #[allow(dead_code)] // Modes are supplied by the viewer once integrated.
@@ -546,9 +552,13 @@ impl ObjectScene {
         depth: &mut [f32],
         width: usize,
         height: usize,
-        player: Player,
+        camera: CameraView,
     ) {
-        if width.checked_mul(height) != Some(frame.len()) || frame.len() != depth.len() {
+        let player = camera.player;
+        if !camera.eye_height.is_finite()
+            || width.checked_mul(height) != Some(frame.len())
+            || frame.len() != depth.len()
+        {
             return;
         }
         let (camera_sin, camera_cos) = player.angle.sin_cos();
@@ -599,7 +609,7 @@ impl ObjectScene {
                     let world_y = dy + x * sin + y * cos;
                     vertices.push(Vertex {
                         side: -world_x * camera_sin + world_y * camera_cos,
-                        up: f32::from(p[2]) * MODEL_SCALE - CAMERA_HEIGHT,
+                        up: f32::from(p[2]) * MODEL_SCALE - camera.eye_height,
                         depth: world_x * camera_cos + world_y * camera_sin,
                         uv: texture_uv(polygon, corner, mesh.car_uv),
                     });
@@ -885,12 +895,37 @@ mod tests {
             &mut depth,
             64,
             64,
-            Player {
-                position: [0.0, 1.0],
-                angle: 0.0,
+            CameraView {
+                player: Player {
+                    position: [0.0, 1.0],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
             },
         );
         assert!(frame.iter().any(|&pixel| pixel != 0));
+        let top = |pixels: &[u32]| {
+            (0..64)
+                .find(|&y| pixels[y * 64..(y + 1) * 64].iter().any(|&p| p != 0))
+                .unwrap()
+        };
+        let low_eye_top = top(&frame);
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        scene.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player: Player {
+                    position: [0.0, 1.0],
+                    angle: 0.0,
+                },
+                eye_height: 1.2,
+            },
+        );
+        assert!(top(&frame) > low_eye_top + 2);
         assert!(scene.set_actor_pose(0, [3.0, 4.0], 1.0, false));
         assert!(!scene.instances[0].visible);
         assert!(scene.instances[1].visible);

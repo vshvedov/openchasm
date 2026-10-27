@@ -3,14 +3,13 @@
 //! This module does not create or advance projectiles, apply damage, or know
 //! who owns them. The simulation provides positions and orientation per frame.
 use crate::content::ResourceSet;
+use crate::object_render::CameraView;
 use crate::texture::Palette;
 use openchasm::combat::RocketDefinitions;
 use openchasm::model::{Model, SKIN_WIDTH};
-use openchasm::world::Player;
 use std::collections::{BTreeSet, HashMap};
 
 const MODEL_SCALE: f32 = 1.0 / 2048.0;
-const CAMERA_HEIGHT: f32 = 1.0;
 const CAMERA_PLANE: f32 = 0.66;
 const NEAR: f32 = 0.05;
 
@@ -97,10 +96,12 @@ impl ProjectileRenderer {
         depth: &mut [f32],
         width: usize,
         height: usize,
-        player: Player,
+        camera: CameraView,
         projectiles: &[ProjectileVisual],
     ) {
-        if width == 0
+        let player = camera.player;
+        if !camera.eye_height.is_finite()
+            || width == 0
             || height == 0
             || width.checked_mul(height) != Some(frame.len())
             || frame.len() != depth.len()
@@ -151,7 +152,7 @@ impl ProjectileRenderer {
                     vertices.push(Vertex {
                         side: -wx * camera_sin + wy * camera_cos,
                         depth: wx * camera_cos + wy * camera_sin,
-                        up: projectile.position[2] + pz - CAMERA_HEIGHT,
+                        up: projectile.position[2] + pz - camera.eye_height,
                         uv: [
                             f32::from(polygon.uv[corner][0]),
                             f32::from(polygon.uv[corner][1]) + f32::from(polygon.sprite_offset),
@@ -298,6 +299,7 @@ impl Raster<'_> {
 mod tests {
     use super::*;
     use openchasm::model::{Polygon, Vertex as ModelVertex};
+    use openchasm::world::Player;
 
     fn renderer() -> ProjectileRenderer {
         let vertex = |y, z| ModelVertex {
@@ -340,18 +342,105 @@ mod tests {
             yaw: std::f32::consts::FRAC_PI_2,
             pitch: 0.0,
         };
-        renderer.render(&mut frame, &mut depth, 64, 64, player, &[shot]);
+        renderer.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player,
+                eye_height: 1.0,
+            },
+            &[shot],
+        );
         assert!(frame.iter().all(|&pixel| pixel == 0));
         depth.fill(f32::INFINITY);
-        renderer.render(&mut frame, &mut depth, 64, 64, player, &[shot]);
+        renderer.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player,
+                eye_height: 1.0,
+            },
+            &[shot],
+        );
         assert!(frame.iter().any(|&pixel| pixel != 0));
         frame.fill(0);
         depth.fill(f32::INFINITY);
         shot.rocket_type = 1;
-        renderer.render(&mut frame, &mut depth, 64, 64, player, &[shot]);
+        renderer.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player,
+                eye_height: 1.0,
+            },
+            &[shot],
+        );
         shot.rocket_type = usize::MAX;
-        renderer.render(&mut frame, &mut depth, 64, 64, player, &[shot]);
+        renderer.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player,
+                eye_height: 1.0,
+            },
+            &[shot],
+        );
         assert!(frame.iter().all(|&pixel| pixel == 0));
+    }
+    #[test]
+    fn rising_camera_moves_projectile_projection_down() {
+        let renderer = renderer();
+        let player = Player {
+            position: [0.0, 0.0],
+            angle: 0.0,
+        };
+        let shot = ProjectileVisual {
+            rocket_type: 0,
+            position: [1.0, 0.0, 1.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+        };
+        let mut frame = vec![0; 64 * 64];
+        let mut depth = vec![f32::INFINITY; 64 * 64];
+        let top = |frame: &[u32]| {
+            (0..64)
+                .find(|&y| frame[y * 64..(y + 1) * 64].iter().any(|&pixel| pixel != 0))
+                .unwrap()
+        };
+        renderer.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player,
+                eye_height: 0.75,
+            },
+            &[shot],
+        );
+        let lower_top = top(&frame);
+        frame.fill(0);
+        depth.fill(f32::INFINITY);
+        renderer.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            CameraView {
+                player,
+                eye_height: 1.15,
+            },
+            &[shot],
+        );
+        assert!(top(&frame) > lower_top + 5);
     }
     #[test]
     fn skips_invalid_coordinates_and_rejects_unsafe_paths() {
@@ -372,9 +461,12 @@ mod tests {
             &mut depth,
             4,
             4,
-            Player {
-                position: [0.0, 0.0],
-                angle: 0.0,
+            CameraView {
+                player: Player {
+                    position: [0.0, 0.0],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
             },
             &[shot],
         );

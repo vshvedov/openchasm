@@ -3,6 +3,7 @@
 //! Geometry here is renderer-only: the camera height and lighting are chosen to
 //! match the current wall preview, not yet validated against the original game.
 use crate::map::{Floors, Map, FLOOR_TEXTURE_COUNT, FLOOR_TEXTURE_SIDE, MAP_SIDE};
+use crate::object_render::CameraView;
 use crate::texture::Palette;
 
 const FLOOR_BACKGROUND: u32 = 0x38312b;
@@ -49,15 +50,14 @@ impl PlaneRenderer {
     /// Paint the floor and ceiling before drawing walls, using the same camera
     /// plane and projected wall height as the geometry preview. Invalid or
     /// off-map intersections retain a plain background.
-    pub fn render(
-        &self,
-        frame: &mut [u32],
-        width: usize,
-        height: usize,
-        position: [f32; 2],
-        angle: f32,
-    ) {
-        if width == 0 || height == 0 || width.checked_mul(height) != Some(frame.len()) {
+    pub fn render(&self, frame: &mut [u32], width: usize, height: usize, camera: CameraView) {
+        let position = camera.player.position;
+        let angle = camera.player.angle;
+        if !camera.eye_height.is_finite()
+            || width == 0
+            || height == 0
+            || width.checked_mul(height) != Some(frame.len())
+        {
             return;
         }
         let (sin, cos) = angle.sin_cos();
@@ -76,7 +76,15 @@ impl PlaneRenderer {
             if delta < f32::EPSILON {
                 continue;
             }
-            let distance = horizon / delta;
+            let plane_height = if ceiling {
+                2.0 - camera.eye_height
+            } else {
+                camera.eye_height
+            };
+            if plane_height <= 0.0 {
+                continue;
+            }
+            let distance = horizon * plane_height / delta;
             let start = [
                 position[0] + distance * (cos - camera_plane[0]),
                 position[1] + distance * (sin - camera_plane[1]),
@@ -150,7 +158,18 @@ mod tests {
         let (map, floors, palette) = fixtures(0, 1);
         let renderer = PlaneRenderer::new(&map, &floors, &palette);
         let mut image = vec![0; 8 * 8];
-        renderer.render(&mut image, 8, 8, [16.5, 16.5], 0.0);
+        renderer.render(
+            &mut image,
+            8,
+            8,
+            CameraView {
+                player: crate::world::Player {
+                    position: [16.5, 16.5],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
+            },
+        );
         assert!(image[4] & 0x00ff00 > 0);
         assert_eq!(image[4] & 0xff00ff, 0);
         assert!(image[7 * 8 + 4] & 0xff0000 > 0);
@@ -158,11 +177,54 @@ mod tests {
     }
 
     #[test]
+    fn plane_distance_changes_with_camera_height() {
+        let (map, floors, palette) = fixtures(0, 1);
+        let renderer = PlaneRenderer::new(&map, &floors, &palette);
+        let mut low = vec![0; 8 * 8];
+        let mut high = vec![0; 8 * 8];
+        let player = crate::world::Player {
+            position: [16.5, 16.5],
+            angle: 0.0,
+        };
+        renderer.render(
+            &mut low,
+            8,
+            8,
+            CameraView {
+                player,
+                eye_height: 0.75,
+            },
+        );
+        renderer.render(
+            &mut high,
+            8,
+            8,
+            CameraView {
+                player,
+                eye_height: 1.25,
+            },
+        );
+        // Higher camera sees a more distant floor and a closer ceiling.
+        assert!((low[7 * 8 + 4] & 0xff0000) > (high[7 * 8 + 4] & 0xff0000));
+        assert!((low[4] & 0x00ff00) < (high[4] & 0x00ff00));
+    }
+    #[test]
     fn empty_and_sky_cells_leave_the_fallback_background() {
         let (map, floors, palette) = fixtures(63, 62);
         let renderer = PlaneRenderer::new(&map, &floors, &palette);
         let mut image = vec![0; 8 * 8];
-        renderer.render(&mut image, 8, 8, [16.5, 16.5], 0.0);
+        renderer.render(
+            &mut image,
+            8,
+            8,
+            CameraView {
+                player: crate::world::Player {
+                    position: [16.5, 16.5],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
+            },
+        );
         assert_eq!(image[4], SKY_BACKGROUND);
         assert_eq!(image[7 * 8 + 4], FLOOR_BACKGROUND);
     }
@@ -172,11 +234,33 @@ mod tests {
         let (map, floors, palette) = fixtures(0, 0);
         let renderer = PlaneRenderer::new(&map, &floors, &palette);
         let mut image = vec![0; 8 * 8];
-        renderer.render(&mut image, 8, 8, [-100.0, -100.0], 0.0);
+        renderer.render(
+            &mut image,
+            8,
+            8,
+            CameraView {
+                player: crate::world::Player {
+                    position: [-100.0, -100.0],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
+            },
+        );
         assert_eq!(image[4], SKY_BACKGROUND);
         assert_eq!(image[7 * 8 + 4], FLOOR_BACKGROUND);
         let mut short = [42; 3];
-        renderer.render(&mut short, 4, 4, [0.0, 0.0], 0.0);
+        renderer.render(
+            &mut short,
+            4,
+            4,
+            CameraView {
+                player: crate::world::Player {
+                    position: [0.0, 0.0],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
+            },
+        );
         assert_eq!(short, [42; 3]);
     }
 }

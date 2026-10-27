@@ -100,6 +100,41 @@ fn cycle_weapon(
     Some(selection)
 }
 
+fn wheel_weapon(
+    look: &RelativeLook,
+    inventory: &openchasm::inventory::Inventory,
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
+    if look.focused {
+        cycle_weapon(inventory, current, delta)
+    } else {
+        None
+    }
+}
+
+fn held_movement(held: &HashSet<Scancode>) -> Input {
+    let key = |code| if held.contains(&code) { 1.0 } else { 0.0 };
+    Input {
+        forward: key(Scancode::W) - key(Scancode::S),
+        strafe: key(Scancode::D) - key(Scancode::A),
+        turn: key(Scancode::Right) - key(Scancode::Left),
+    }
+}
+
+// Clear held action state on restart/load without changing mouse capture.
+fn clear_held_controls(
+    held: &mut HashSet<Scancode>,
+    fire: &mut bool,
+    look: &mut RelativeLook,
+    accumulator: &mut f32,
+) {
+    held.clear();
+    *fire = false;
+    look.pending_dx = 0;
+    *accumulator = 0.0;
+}
+
 fn fire_feedback(result: Option<FireResult>) -> Option<&'static str> {
     match result {
         Some(FireResult::OutOfAmmo) => Some("OUT OF AMMO"),
@@ -667,14 +702,15 @@ pub fn run(
                     mouse_btn: MouseButton::Left,
                     ..
                 } => mouse_fire = false,
-                Event::MouseWheel { y, direction, .. } if look.focused && look.captured => {
+                Event::MouseWheel { y, direction, .. } => {
                     let delta = if direction == MouseWheelDirection::Flipped {
                         y.saturating_neg()
                     } else {
                         y
                     };
                     let current = pending_weapon.unwrap_or(session.selected_weapon);
-                    if let Some(next) = cycle_weapon(&session.game.inventory, current, delta) {
+                    if let Some(next) = wheel_weapon(&look, &session.game.inventory, current, delta)
+                    {
                         pending_weapon = Some(next);
                     }
                 }
@@ -691,12 +727,6 @@ pub fn run(
         } else {
             accumulator = 0.0;
         }
-        let key = |code| if held.contains(&code) { 1.0 } else { 0.0 };
-        let movement = Input {
-            forward: key(Scancode::W) - key(Scancode::S),
-            strafe: key(Scancode::D) - key(Scancode::A),
-            turn: key(Scancode::Right) - key(Scancode::Left),
-        };
         if restart_requested {
             session = initial_session.clone();
             if let Some(renderer) = &mut explosion_renderer {
@@ -705,6 +735,8 @@ pub fn run(
             if !objects.restore(&initial_scene) {
                 return Err("initial scene snapshot no longer matches the level".into());
             }
+            clear_held_controls(&mut held, &mut mouse_fire, &mut look, &mut accumulator);
+            frame_clock.rebase(Instant::now());
             pending_interact = false;
             pending_jump = false;
             pending_weapon = None;
@@ -756,13 +788,15 @@ pub fn run(
                             }
                             // Leave window focus/capture unchanged; discard all
                             // inputs accumulated before the restored state.
-                            held.clear();
-                            mouse_fire = false;
+                            clear_held_controls(
+                                &mut held,
+                                &mut mouse_fire,
+                                &mut look,
+                                &mut accumulator,
+                            );
                             pending_interact = false;
                             pending_jump = false;
                             pending_weapon = None;
-                            look.pending_dx = 0;
-                            accumulator = 0.0;
                             frame_clock.rebase(Instant::now());
                             advance_requested = false;
                             checkpoint_notice = Some(("QUICKLOADED", 2.0));
@@ -779,6 +813,7 @@ pub fn run(
             sdl.mouse().set_relative_mouse_mode(false);
             return Ok(Some(session.game.inventory.clone()));
         }
+        let movement = held_movement(&held);
         let firing = mouse_fire;
         while accumulator >= STEP {
             // Deltas are motion, not velocity: consume exactly once per tick.
@@ -1456,5 +1491,49 @@ mod tests {
             teleport_failure_message(TeleportFailure::InvalidDefinition { index: 1 }),
             "TELEPORT 2 INVALID"
         );
+    }
+    #[test]
+    fn restart_clears_movement_fire_yaw_and_time_without_releasing_capture() {
+        let mut held = HashSet::from([Scancode::W, Scancode::D, Scancode::Right]);
+        let mut fire = true;
+        let mut look = RelativeLook {
+            focused: true,
+            captured: true,
+            pending_dx: 42,
+        };
+        let mut accumulator = 0.1;
+        assert_eq!(held_movement(&held).forward, 1.0);
+        clear_held_controls(&mut held, &mut fire, &mut look, &mut accumulator);
+        let movement = held_movement(&held);
+        assert_eq!(
+            (movement.forward, movement.strafe, movement.turn),
+            (0.0, 0.0, 0.0)
+        );
+        assert!(!fire);
+        assert_eq!(look.take_yaw(), 0.0);
+        assert_eq!(accumulator, 0.0);
+        assert!(look.focused && look.captured);
+    }
+
+    #[test]
+    fn wheel_selection_works_without_capture_but_not_without_focus() {
+        let inventory = openchasm::inventory::Inventory {
+            health: 100,
+            armor: 0,
+            weapons: [true, true, false, false, false, false, false, false],
+            ammo: [1, 1, 0, 0, 0, 0, 0, 0],
+            keys: [false; 3],
+            invisibility_ticks_remaining: 0,
+        };
+        let mut look = RelativeLook {
+            focused: true,
+            captured: false,
+            pending_dx: 0,
+        };
+        assert_eq!(wheel_weapon(&look, &inventory, 0, 1), Some(1));
+        look.captured = true;
+        assert_eq!(wheel_weapon(&look, &inventory, 0, 1), Some(1));
+        look.set_focus(false);
+        assert_eq!(wheel_weapon(&look, &inventory, 0, 1), None);
     }
 }

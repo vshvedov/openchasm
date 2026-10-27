@@ -32,7 +32,8 @@ pub struct AmbientGrid {
     // X-major, matching Map's on-disk and public indexing.
     cells: [u8; MAP_SIDE * MAP_SIDE],
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AmbientSnapshot {
     pub cells: Vec<u8>,
 }

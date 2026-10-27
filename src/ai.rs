@@ -15,7 +15,8 @@ const SIGHT_RANGE: f32 = 8.0;
 const MELEE_RANGE: f32 = 0.8;
 const ATTACK_COOLDOWN_TICKS: u16 = 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Mode {
     Inactive,
     Idle,
@@ -89,14 +90,16 @@ pub struct EnemyAi {
     player_invisible: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttackPhaseSnapshot {
     pub slot: u8,
     pub frame_count: u32,
     pub elapsed_ticks: u32,
     pub fired: bool,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrainSnapshot {
     pub source_index: u32,
     pub mode: Mode,
@@ -105,7 +108,8 @@ pub struct BrainSnapshot {
     pub run_units: u64,
     pub attack_phase: Option<AttackPhaseSnapshot>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnemyAiSnapshot {
     pub brains: Vec<BrainSnapshot>,
     pub player_invisible: bool,

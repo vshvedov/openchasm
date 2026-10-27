@@ -107,7 +107,8 @@ pub struct VerticalState {
 }
 /// Mutable vertical values. Physics configuration is supplied by the freshly
 /// reconstructed level and deliberately is not stored here.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerticalSnapshot {
     pub feet: f32,
     pub velocity: f32,

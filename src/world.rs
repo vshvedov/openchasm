@@ -9,7 +9,8 @@
 
 /// Horizontal wall collision policy. Authored sides follow an independent
 /// reconstruction and have not been verified against the original game.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum WallCollisionMode {
     /// Existing conservative behavior: every blocking wall is two-sided.
     #[default]
@@ -65,7 +66,8 @@ pub struct World {
 }
 
 /// Mutable wall geometry is keyed by stable vector index and authored cell.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WallSnapshot {
     pub index: u32,
     pub cell: Option<[u8; 2]>,
@@ -74,7 +76,8 @@ pub struct WallSnapshot {
     pub b: [f32; 2],
     pub blocks_movement: bool,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorldSnapshot {
     pub player_position: [f32; 2],
     pub player_angle: f32,

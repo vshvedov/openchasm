@@ -38,7 +38,7 @@ impl fmt::Display for SaveError {
 impl std::error::Error for SaveError {}
 
 /// A SHA-256 content identity. The hash is not an entitlement or authenticity proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContentDigest(pub [u8; 32]);
 
 /// Borrowed validated payload; caller must independently validate its schema.

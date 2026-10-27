@@ -26,7 +26,8 @@ pub enum Owner {
 }
 
 /// Portable owner identity; enemy IDs refer to authored actor placements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum OwnerSnapshot {
     Player,
     Enemy { source_index: u32 },
@@ -121,7 +122,8 @@ pub struct ProjectileSystem {
     projectiles: Vec<Projectile>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectileSnapshot {
     pub id: u64,
     pub owner: OwnerSnapshot,
@@ -133,7 +135,8 @@ pub struct ProjectileSnapshot {
     pub damage: i32,
     pub remaining: f32,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectileSystemSnapshot {
     pub next_id: u64,
     pub projectiles: Vec<ProjectileSnapshot>,

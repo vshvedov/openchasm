@@ -47,7 +47,8 @@ impl Default for QuakeField {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuakeSnapshot {
     pub cells: Vec<u32>,
 }

@@ -250,7 +250,8 @@ pub struct MissionState {
     end_remaining: Option<f32>,
     completed: bool,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MissionSnapshot {
     pub first_messages_shown: Vec<u16>,
     pub end_remaining: Option<f32>,

@@ -163,7 +163,8 @@ pub struct MineSystem {
     mines: Vec<Mine>,
     next_id: u64,
 }
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MineSnapshot {
     pub id: u64,
     pub owner: OwnerSnapshot,
@@ -171,7 +172,8 @@ pub struct MineSnapshot {
     pub age_ticks: u32,
     pub armed: bool,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MineSystemSnapshot {
     pub next_id: u64,
     pub mines: Vec<MineSnapshot>,

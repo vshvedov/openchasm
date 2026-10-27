@@ -291,7 +291,8 @@ pub struct ShotContext<'a> {
 pub struct Combat {
     cooldown: f32,
 }
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CombatSnapshot {
     pub cooldown: f32,
 }

@@ -77,7 +77,8 @@ pub struct ObjectCombat {
     targets: Vec<Target>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectCombatEntrySnapshot {
     pub cell: [usize; 2],
     pub raw_type: u8,
@@ -86,7 +87,8 @@ pub struct ObjectCombatEntrySnapshot {
     pub enabled: bool,
     pub destroyed: bool,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectCombatSnapshot {
     pub entries: Vec<ObjectCombatEntrySnapshot>,
 }

@@ -12,7 +12,8 @@ const SIDE: usize = 64;
 /// Both this factor and interpolation need validation against the original game.
 const DISPLACEMENT_SCALE: f32 = 0.5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindZone {
     /// Inclusive map grid coordinates.
     pub min_cell: [u8; 2],
@@ -61,7 +62,8 @@ impl Default for WindField {
         Self::new()
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindSnapshot {
     pub cells: Vec<[i16; 2]>,
     pub actor_cells: Vec<[i16; 2]>,

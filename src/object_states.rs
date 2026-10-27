@@ -82,7 +82,8 @@ pub struct ObjectStates {
     states: BTreeMap<[usize; 2], ObjectState>,
 }
 /// Durable mutable state keyed by the authored map cell.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectStateSnapshot {
     pub cell: [usize; 2],
     pub raw_type: u8,
@@ -90,7 +91,8 @@ pub struct ObjectStateSnapshot {
     pub position: [f32; 2],
     pub angle_radians: f32,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectStatesSnapshot {
     pub entries: Vec<ObjectStateSnapshot>,
 }

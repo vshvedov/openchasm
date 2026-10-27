@@ -188,7 +188,8 @@ pub struct Inventory {
 
 /// Version-independent mutable inventory values; weapon definitions stay in
 /// the loaded content and are checked during restore.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InventorySnapshot {
     pub health: u16,
     pub armor: u16,
@@ -205,7 +206,8 @@ pub enum InventorySnapshotError {
     Ammo { weapon: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtectivePowerupsSnapshot {
     pub enabled: bool,
     pub reflector_ticks_remaining: u32,

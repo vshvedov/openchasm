@@ -58,14 +58,16 @@ pub struct Pickups {
 
 /// Only mutable pickup state; action codes, radii and difficulty come from
 /// freshly loaded level content, keyed by the original map cell.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PickupSnapshot {
     pub cell: [u8; 2],
     pub position: [f32; 2],
     pub script_enabled: bool,
     pub collected: bool,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PickupsSnapshot {
     pub entries: Vec<PickupSnapshot>,
 }

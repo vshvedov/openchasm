@@ -318,7 +318,8 @@ fn object_blocks_height(
 }
 
 /// Bounded committed process effects used to validate history-dependent grids.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum GridJournalEntry {
     Immediate { process_id: u16 },
     WindActivate { process_id: u16 },
@@ -370,7 +371,8 @@ pub struct Session {
 
 /// Explicit mutable-state aggregate. The content digest is supplied and
 /// verified by the host; the DTO contains no resource bytes or paths.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSnapshot {
     pub content: crate::save_format::ContentDigest,
     pub capabilities: SessionSnapshotCapabilities,
@@ -399,7 +401,8 @@ pub struct SessionSnapshot {
     pub wall_elevations: Vec<f32>,
     pub elevation_by_cell: Vec<f32>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSnapshotCapabilities {
     pub wall_collision_mode: WallCollisionMode,
     pub wall_materials: bool,
@@ -3105,6 +3108,75 @@ mod tests {
     }
 
     #[test]
+    fn session_codec_roundtrip_and_rejects_untrusted_data() {
+        use crate::{save_format, session_codec};
+        let baseline = mission_session("");
+        let digest = save_format::ContentDigest([55; 32]);
+        let snapshot = baseline.snapshot(digest).unwrap();
+        let encoded = session_codec::encode(&snapshot).unwrap();
+        let decoded = session_codec::decode(&encoded, digest).unwrap();
+        assert_eq!(decoded, snapshot);
+        let restored = baseline.restore_from_baseline(&decoded, digest).unwrap();
+        assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
+        assert!(session_codec::decode(&encoded, save_format::ContentDigest([56; 32])).is_err());
+        let mut corrupted = encoded.clone();
+        corrupted[60] ^= 1;
+        assert!(session_codec::decode(&corrupted, digest).is_err());
+        assert!(session_codec::decode(&encoded[..encoded.len() - 1], digest).is_err());
+        let envelope = save_format::decode(&encoded).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(envelope.payload).unwrap();
+        let mut future = original.clone();
+        future["version"] = 2.into();
+        let envelope = save_format::encode(digest, &serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(matches!(
+            session_codec::decode(&envelope, digest),
+            Err(session_codec::SessionCodecError::UnsupportedVersion(2))
+        ));
+        let mut unknown = original.clone();
+        unknown["snapshot"]["world"]["future"] = true.into();
+        let envelope = save_format::encode(digest, &serde_json::to_vec(&unknown).unwrap()).unwrap();
+        assert!(session_codec::decode(&envelope, digest).is_err());
+        let mut bad_content = original.clone();
+        bad_content["snapshot"]["content"][0] = 0.into();
+        let envelope =
+            save_format::encode(digest, &serde_json::to_vec(&bad_content).unwrap()).unwrap();
+        assert!(session_codec::decode(&envelope, digest).is_err());
+        let giant = vec![b' '; session_codec::MAX_SESSION_PAYLOAD + 1];
+        let giant = save_format::encode(digest, &giant).unwrap();
+        assert!(matches!(
+            session_codec::decode(&giant, digest),
+            Err(session_codec::SessionCodecError::PayloadTooLarge)
+        ));
+        let mut oversized_json = original.clone();
+        oversized_json["snapshot"]["grid_journal"] = serde_json::Value::Array(vec![
+            serde_json::json!({"Immediate": {"process_id": 1}});
+            4097
+        ]);
+        let envelope =
+            save_format::encode(digest, &serde_json::to_vec(&oversized_json).unwrap()).unwrap();
+        assert!(matches!(
+            session_codec::decode(&envelope, digest),
+            Err(session_codec::SessionCodecError::InvalidCardinality)
+        ));
+        let mut oversized = snapshot.clone();
+        oversized
+            .grid_journal
+            .resize(4097, GridJournalEntry::Immediate { process_id: 1 });
+        assert!(matches!(
+            session_codec::encode(&oversized),
+            Err(session_codec::SessionCodecError::InvalidCardinality)
+        ));
+        let mut not_finite = snapshot.clone();
+        not_finite.world.player_position[0] = f32::NAN;
+        assert!(session_codec::encode(&not_finite).is_err());
+        let mut illegal = snapshot.clone();
+        illegal.inventory.health = 201;
+        let encoded = session_codec::encode(&illegal).unwrap();
+        let decoded = session_codec::decode(&encoded, digest).unwrap();
+        assert!(baseline.restore_from_baseline(&decoded, digest).is_err());
+    }
+
+    #[test]
     fn aggregate_snapshot_restores_from_fresh_baseline_atomically() {
         let mut baseline = mission_session("");
         baseline.rockets = RocketDefinitions(vec![RocketDefinition {
@@ -3424,6 +3496,8 @@ mod tests {
         source.apply_process_effects();
         let digest = crate::save_format::ContentDigest([12; 32]);
         let snapshot = source.snapshot(digest).unwrap();
+        let encoded = crate::session_codec::encode(&snapshot).unwrap();
+        let snapshot = crate::session_codec::decode(&encoded, digest).unwrap();
         let restored = baseline.restore_from_baseline(&snapshot, digest).unwrap();
         assert_eq!(restored.snapshot(digest).unwrap(), snapshot);
         let mut forged = snapshot.clone();

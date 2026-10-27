@@ -158,7 +158,8 @@ fn obstructed(motions: &[Motion], world: &World, elapsed: f32, direction: f32) -
 /// Initial authoritative pose and conservative collision radius of one source
 /// map object. Position and radius use map tiles; elevation uses raw script
 /// units and orientation uses radians. Cell is a stable map-grid identifier.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessObject {
     pub cell: [u8; 2],
     pub position: [f32; 2],
@@ -336,7 +337,8 @@ pub enum ProcessEffect {
 }
 /// A death field's authored values. Vertical bounds use 1/64 tile; negative
 /// lower bounds designate fields that do not damage the player in the manual.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeathZone {
     pub min_cell: [u8; 2],
     pub max_cell: [u8; 2],
@@ -1416,7 +1418,8 @@ pub struct ProcessRuntime {
 }
 
 /// Durable process phase; delay is measured in seconds.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ProcessPhaseSnapshot {
     Closed,
     Delay(f32),
@@ -1424,7 +1427,8 @@ pub enum ProcessPhaseSnapshot {
     Open,
     Closing,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessEntrySnapshot {
     pub id: u16,
     pub phase: ProcessPhaseSnapshot,
@@ -1437,7 +1441,8 @@ pub struct ProcessEntrySnapshot {
     pub object_progress: Vec<f32>,
     pub previous_cell_types: Vec<Option<u8>>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessRuntimeSnapshot {
     pub processes: Vec<ProcessEntrySnapshot>,
     pub previous_floor: Option<[u8; 2]>,

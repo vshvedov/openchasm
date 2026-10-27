@@ -38,13 +38,15 @@ fn contains(zone: &DeathZone, position: [f32; 2], feet: f32, head: f32) -> bool 
         && head > zone.z_bottom_raw as f32 / 64.0
         && feet < zone.z_top_raw as f32 / 64.0
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HazardEntrySnapshot {
     pub process_id: u16,
     pub zones: Vec<DeathZone>,
     pub ticks: u8,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HazardsSnapshot {
     pub active: Vec<HazardEntrySnapshot>,
 }

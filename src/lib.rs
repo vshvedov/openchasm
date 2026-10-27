@@ -31,6 +31,7 @@ pub mod projectiles;
 pub mod quake;
 pub mod save_format;
 pub mod session;
+pub mod session_codec;
 pub mod sound_definitions;
 pub mod teleport;
 pub mod vertical;

@@ -127,7 +127,8 @@ pub fn parse(source: &str) -> Result<Vec<Teleport>, TeleportParseError> {
 }
 
 /// Explicit trigger policy; original cooldown rules are unknown.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RearmPolicy {
     /// PanzerChasm tests every entity every tick and has no teleport cooldown.
     #[default]
@@ -152,7 +153,8 @@ pub struct TeleportState {
     policy: RearmPolicy,
     waiting_for_exit: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeleportSnapshot {
     pub policy: RearmPolicy,
     pub waiting_for_exit: bool,

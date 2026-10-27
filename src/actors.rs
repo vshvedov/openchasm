@@ -197,7 +197,8 @@ pub struct ActorState {
 }
 /// Mutable actor values keyed by authored placement identity. Definition and
 /// map placement data remain sourced from the content on restore.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActorSnapshot {
     pub source_index: u32,
     pub authored_id: u16,
@@ -206,7 +207,8 @@ pub struct ActorSnapshot {
     pub angle_radians: f32,
     pub health: i32,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActorStateSnapshot {
     pub actors: Vec<ActorSnapshot>,
 }

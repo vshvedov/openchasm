@@ -98,7 +98,10 @@ pub fn gameplay_sound_ids(events: &openchasm::session::SessionEvents, rocket_typ
     if matches!(
         events.shot,
         Some(FireResult::Fired(
-            ShotImpact::Actor { .. } | ShotImpact::Wall { .. } | ShotImpact::Object { .. }
+            ShotImpact::Actor { .. }
+                | ShotImpact::Wall { .. }
+                | ShotImpact::Object { .. }
+                | ShotImpact::Plane { .. }
         ))
     ) {
         if let Some(id) = usize::try_from(rocket_type).ok().and_then(sound_for) {
@@ -983,6 +986,11 @@ mod tests {
         assert!(gameplay_sound_ids(&events, 1).is_empty());
         events.shot = Some(FireResult::Fired(ShotImpact::Miss));
         assert!(gameplay_sound_ids(&events, 1).is_empty());
+        events.shot = Some(FireResult::Fired(ShotImpact::Plane {
+            plane: openchasm::combat::ShotPlane::Floor,
+            distance: 1.0,
+        }));
+        assert_eq!(gameplay_sound_ids(&events, 1), vec![31]);
         events.shot = Some(FireResult::Fired(ShotImpact::Wall {
             wall_index: 0,
             distance: 1.0,

@@ -122,6 +122,10 @@ impl ExplosionRenderer {
     pub(crate) fn effect_count(&self) -> usize {
         self.effects.len()
     }
+    #[cfg(test)]
+    pub(crate) fn effect_positions(&self) -> Vec<[f32; 3]> {
+        self.effects.iter().map(|effect| effect.position).collect()
+    }
     /// Load an indexed world-effect sprite with the shared palette and depth
     /// renderer. Other effect kinds provide their own event selection.
     pub fn load_sprite(

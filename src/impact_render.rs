@@ -154,9 +154,9 @@ impl ImpactRenderer {
         if let Some(FireResult::Fired(shot)) = events.shot {
             let (actor, distance) = match shot {
                 ShotImpact::Actor { distance, .. } => (true, distance),
-                ShotImpact::Wall { distance, .. } | ShotImpact::Object { distance, .. } => {
-                    (false, distance)
-                }
+                ShotImpact::Wall { distance, .. }
+                | ShotImpact::Object { distance, .. }
+                | ShotImpact::Plane { distance, .. } => (false, distance),
                 _ => (false, f32::NAN),
             };
             if distance.is_finite() && distance >= 0.0 && camera.player.angle.is_finite() {
@@ -297,5 +297,51 @@ mod tests {
         );
         renderer.spawn(Kind::Bullet, [f32::NAN, 0.0, 0.0]);
         assert_eq!(count(&renderer.bullet), 0);
+    }
+    #[test]
+    fn floor_and_ceiling_hits_emit_sprites_at_aimed_contact() {
+        use openchasm::combat::{RocketDefinition, ShotPlane};
+        let explicit = std::env::var_os("OPENCHASM_TEST_CONTENT");
+        let path = explicit
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "assets/csm.bin".into());
+        if !path.exists() && explicit.is_none() {
+            return;
+        }
+        let mut resources = ResourceSet::open(&path).unwrap();
+        let palette = Palette::parse(&resources.read("chasm2.pal").unwrap()).unwrap();
+        let rockets = RocketDefinitions(vec![RocketDefinition {
+            model_name: String::new(),
+            power: 1,
+            raw_fields: vec![1],
+        }]);
+        let mut renderer = ImpactRenderer::load(&mut resources, &palette, &rockets);
+        for (plane, pitch) in [
+            (ShotPlane::Floor, -std::f32::consts::FRAC_PI_4),
+            (ShotPlane::Ceiling, std::f32::consts::FRAC_PI_4),
+        ] {
+            let events = SessionEvents {
+                shot: Some(FireResult::Fired(ShotImpact::Plane {
+                    plane,
+                    distance: 1.0,
+                })),
+                ..Default::default()
+            };
+            let camera = CameraView {
+                player: crate::world::Player {
+                    position: [1.0, 2.0],
+                    angle: 0.0,
+                },
+                eye_height: 1.0,
+                pitch,
+            };
+            renderer.consume(&events, camera, 0);
+        }
+        let positions = renderer.bullet.as_ref().unwrap().effect_positions();
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0], [2.0, 2.0, 0.0]);
+        assert_eq!(positions[1], [2.0, 2.0, 2.0]);
+        assert_eq!(renderer.smoke.as_ref().unwrap().effect_count(), 6);
     }
 }

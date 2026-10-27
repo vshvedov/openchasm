@@ -1,8 +1,7 @@
 //! Window- and network-independent provisional instant-shot combat.
 //!
-//! Rocket definitions are data driven. Instant shots are currently a single
-//! horizontal ray, with all pellets aggregated, and combat timing/radii are
-//! provisional. Physical projectiles, vertical aim and effects are unsupported.
+//! Rocket definitions are data driven. Instant shots use one aimed ray with
+//! aggregated pellets; combat timing and hit shapes remain provisional.
 use crate::actors::{ActorDefinitions, ActorState};
 use crate::inventory::{Inventory, WeaponDefinitions};
 use crate::map::UNITS_PER_TILE;
@@ -240,6 +239,12 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShotPlane {
+    Floor,
+    Ceiling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShotImpact {
     Actor {
         source_index: usize,
@@ -255,6 +260,12 @@ pub enum ShotImpact {
         cell: [usize; 2],
         damage: i32,
         destroyed: bool,
+        distance: f32,
+    },
+    /// Contact with the host-supplied provisional room plane. Distance is the
+    /// horizontal ray distance, as for wall, object, and actor hits.
+    Plane {
+        plane: ShotPlane,
         distance: f32,
     },
     Miss,
@@ -552,6 +563,18 @@ impl Combat {
             })
             .map(|(distance, index, _)| (distance, index))
             .min_by(|a, b| a.0.total_cmp(&b.0));
+        let plane_hit = aim.and_then(|a| {
+            let slope = a.pitch.tan();
+            let (plane, distance) = if slope > 1e-7 {
+                (ShotPlane::Ceiling, (a.ceiling - a.eye) / slope)
+            } else if slope < -1e-7 {
+                (ShotPlane::Floor, (a.floor - a.eye) / slope)
+            } else {
+                return None;
+            };
+            (distance.is_finite() && (0.0..=MAX_RANGE).contains(&distance))
+                .then_some((plane, distance))
+        });
         let room_limit = aim.map_or(MAX_RANGE, |a| {
             let slope = a.pitch.tan();
             if slope > 1e-7 {
@@ -646,6 +669,10 @@ impl Combat {
                 wall_index: index,
                 distance,
             })
+        } else if let Some((plane, distance)) =
+            plane_hit.filter(|(_, distance)| *distance <= nearest)
+        {
+            FireResult::Fired(ShotImpact::Plane { plane, distance })
         } else {
             FireResult::Fired(ShotImpact::Miss)
         }
@@ -746,6 +773,81 @@ mod tests {
             blocks_movement: true,
             cell: None,
         }
+    }
+    #[test]
+    fn aimed_shots_report_room_planes_only_when_nearest_and_in_range() {
+        let (mut inventory, weapons, rockets, definitions, mut actors, mut world) = setup();
+        actors.actors.clear();
+        let mut shoot = |pitch: f32, world: &World| {
+            Combat::new().fire_with_aim(
+                0,
+                ShotContext {
+                    inventory: &mut inventory,
+                    weapons: &weapons,
+                    rockets: &rockets,
+                    actors: &mut actors,
+                    definitions: &definitions,
+                    world,
+                    objects: None,
+                },
+                false,
+                ShotAim {
+                    eye: 1.0,
+                    pitch,
+                    floor: 0.0,
+                    ceiling: 2.0,
+                },
+                |_, _| true,
+                |_, _| None,
+            )
+        };
+        for (pitch, expected) in [
+            (-std::f32::consts::FRAC_PI_4, ShotPlane::Floor),
+            (std::f32::consts::FRAC_PI_4, ShotPlane::Ceiling),
+        ] {
+            assert!(
+                matches!(shoot(pitch, &world), FireResult::Fired(ShotImpact::Plane { plane, distance }) if plane == expected && (distance - 1.0).abs() < 1e-5)
+            );
+        }
+        assert_eq!(shoot(0.0, &world), FireResult::Fired(ShotImpact::Miss));
+        assert_eq!(shoot(0.001, &world), FireResult::Fired(ShotImpact::Miss));
+        world.walls.push(wall(0.5));
+        assert!(
+            matches!(shoot(-std::f32::consts::FRAC_PI_4, &world), FireResult::Fired(ShotImpact::Wall { distance, .. }) if (distance - 0.5).abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn nearer_actor_wins_over_floor_plane() {
+        let (mut inventory, weapons, rockets, definitions, mut actors, world) = setup();
+        let result = Combat::new().fire_with_aim(
+            0,
+            ShotContext {
+                inventory: &mut inventory,
+                weapons: &weapons,
+                rockets: &rockets,
+                actors: &mut actors,
+                definitions: &definitions,
+                world: &world,
+                objects: None,
+            },
+            false,
+            ShotAim {
+                eye: 1.0,
+                pitch: -(1.0_f32 / 3.0).atan(),
+                floor: 0.0,
+                ceiling: 2.0,
+            },
+            |_, _| true,
+            |_, _| None,
+        );
+        assert!(matches!(
+            result,
+            FireResult::Fired(ShotImpact::Actor {
+                source_index: 0,
+                ..
+            })
+        ));
     }
     #[test]
     fn instant_shot_hits_nearest_actor_consumes_ammo_and_obeys_cooldown() {

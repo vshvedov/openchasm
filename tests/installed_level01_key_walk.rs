@@ -1,6 +1,6 @@
-//! Walk from the real Power Station spawn to its green key.
-//! Optional owned data, no enemies, and conservative solid wall approximations;
-//! this checks one interaction route, not full level completion.
+//! Walk from the real Power Station spawn to the green key and turbine switch.
+//! Optional owned data, no enemies; actual authored wall material flags and
+//! actual model heights are used; this does not prove full level completion.
 #[allow(dead_code)]
 #[path = "../src/archive.rs"]
 mod archive;
@@ -45,8 +45,41 @@ fn run_walk(mode: WallCollisionMode) {
     let mut archive = archive::Archive::open(&path).unwrap();
     let map = Map::parse(&archive.read("map/map.01").unwrap()).unwrap();
     let inf = archive.read("chasm.inf").unwrap();
-    let definitions =
-        ObjectDefinitions::parse(&inf, &archive.read("map/resource.01").unwrap()).unwrap();
+    let resource = archive.read("map/resource.01").unwrap();
+    let definitions = ObjectDefinitions::parse(&inf, &resource).unwrap();
+    let mut blocks_movement = [true; 128];
+    let mut blocks_shots = [true; 128];
+    let mut in_gfx = false;
+    for line in String::from_utf8_lossy(&resource).lines().map(str::trim) {
+        if line.eq_ignore_ascii_case("#gfx") {
+            in_gfx = true;
+            continue;
+        }
+        if in_gfx && line.to_ascii_lowercase().starts_with("#end") {
+            break;
+        }
+        if !in_gfx {
+            continue;
+        }
+        let Some((id, values)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(id) = id.trim().parse::<usize>() else {
+            continue;
+        };
+        if !(87..=119).contains(&id) {
+            continue;
+        }
+        let mut parts = values.split_whitespace();
+        if parts.next().is_none() {
+            continue;
+        }
+        if let Some(flags) = parts.next() {
+            let flags = flags.to_ascii_lowercase();
+            blocks_movement[id] = !flags.starts_with('g');
+            blocks_shots[id] = flags.as_bytes().get(1) != Some(&b's');
+        }
+    }
     let script = Script::parse(&String::from_utf8_lossy(
         &archive.read("map/process.01").unwrap(),
     ));
@@ -66,7 +99,7 @@ fn run_walk(mode: WallCollisionMode) {
                     a: point(w.start),
                     b: point(w.end),
                     texture: w.texture_id,
-                    blocks_movement: true,
+                    blocks_movement: blocks_movement[usize::from(w.texture_id)],
                     cell: Some([x as u8, y as u8]),
                 });
             }
@@ -129,7 +162,7 @@ fn run_walk(mode: WallCollisionMode) {
         actor_definitions: ActorDefinitions::parse(&inf).unwrap(),
         game,
         rockets: RocketDefinitions::parse(&inf).unwrap(),
-        shot_blocking: [true; 128],
+        shot_blocking: blocks_shots,
         difficulty: Difficulty::Normal,
     });
     assert!(
@@ -154,6 +187,25 @@ fn run_walk(mode: WallCollisionMode) {
         &script,
         true,
     ));
+    let mut heights = openchasm::object_heights::ObjectHeightCatalog::new();
+    for (index, definition) in session
+        .scripted_objects
+        .as_ref()
+        .unwrap()
+        .definitions
+        .level_objects
+        .iter()
+        .enumerate()
+    {
+        if let Ok(bytes) = archive.read(&format!("model/{}", definition.model_name)) {
+            if let Ok(model) = openchasm::model::Model::parse(&bytes) {
+                if let Some(bounds) = openchasm::object_heights::HeightBounds::from_3o(&model) {
+                    heights.set(163 + index as u8, bounds);
+                }
+            }
+        }
+    }
+    assert!(session.set_object_heights(heights, cells));
     let gate = session
         .world
         .walls
@@ -181,7 +233,7 @@ fn run_walk(mode: WallCollisionMode) {
         checkpoints.push([25.875, 53.625 - 0.25 * y as f32]);
     }
     for target in checkpoints {
-        for _ in 0..12 {
+        for _ in 0..120 {
             let p = session.world.player.position;
             let d = [target[0] - p[0], target[1] - p[1]];
             let distance = d[0].hypot(d[1]);
@@ -353,6 +405,8 @@ fn run_walk(mode: WallCollisionMode) {
         - std::f32::consts::PI;
     session.step(SessionInput {
         yaw_delta: yaw,
+        // The real window starts at z=1.72; look up before shooting it.
+        pitch_delta: (1.9 - session.vertical.eye()).atan2((51.5 - p[1]).hypot(23.5 - p[0])),
         ..Default::default()
     });
     let mut destroyed = false;
@@ -371,11 +425,118 @@ fn run_walk(mode: WallCollisionMode) {
         session.processes.object_pose([23, 51]).is_none(),
         "destroyed window must stop blocking movement"
     );
+    // The navigable route returns through the key door, loops west and
+    // reaches the authored turbine switch. Keep every step in Session.
+    let corners: [[f32; 2]; 15] = [
+        [23.5, 52.5],
+        [21.5, 52.5],
+        [21.5, 56.75],
+        [21.25, 56.75],
+        [21.25, 57.25],
+        [20.25, 57.25],
+        [20.25, 57.5],
+        [20.0, 57.5],
+        [20.0, 57.75],
+        [17.75, 57.75],
+        [17.75, 48.75],
+        [24.75, 48.75],
+        [24.75, 45.75],
+        [25.5, 45.75],
+        [25.5, 44.5],
+    ];
+    let mut route = vec![corners[0]];
+    for pair in corners.windows(2) {
+        let delta = [pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]];
+        let steps = ((delta[0].abs() + delta[1].abs()) * 4.0).round() as usize;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            route.push([pair[0][0] + delta[0] * t, pair[0][1] + delta[1] * t]);
+        }
+    }
+    walk(&mut session, &route);
+    session.step(SessionInput {
+        interact: true,
+        ..Default::default()
+    });
+    let snapshot = session.processes.snapshot(&session.world).unwrap();
+    let switch = snapshot.processes.iter().find(|p| p.id == 10).unwrap();
+    assert!(
+        switch.progress > 0.0,
+        "turbine switch must start process 10"
+    );
+    for _ in 0..200 {
+        session.step(SessionInput::default());
+    }
+    walk_corners(
+        &mut session,
+        &[
+            [25.5, 44.5],
+            [12.25, 44.5],
+            [12.25, 40.75],
+            [11.75, 40.75],
+            [11.75, 40.5],
+            [11.25, 40.5],
+            [11.25, 40.75],
+        ],
+    );
+    session.step(SessionInput {
+        interact: true,
+        ..Default::default()
+    });
+    let snapshot = session.processes.snapshot(&session.world).unwrap();
+    assert!(
+        !snapshot
+            .processes
+            .iter()
+            .find(|p| p.id == 2)
+            .unwrap()
+            .locked,
+        "switch14 unlocks blue lab door"
+    );
+    walk_corners(
+        &mut session,
+        &[
+            [11.25, 40.75],
+            [11.25, 40.5],
+            [14.25, 40.5],
+            [14.25, 43.5],
+            [14.5, 43.5],
+            [14.5, 43.75],
+            [23.5, 43.75],
+            [23.5, 43.0],
+            [23.5, 42.75],
+            [23.5, 42.5],
+        ],
+    );
+    let snapshot = session.processes.snapshot(&session.world).unwrap();
+    assert!(
+        snapshot
+            .processes
+            .iter()
+            .find(|p| p.id == 2)
+            .unwrap()
+            .progress
+            > 0.0,
+        "blue lab door opens"
+    );
+}
+
+fn walk_corners(session: &mut Session, corners: &[[f32; 2]]) {
+    let mut route = vec![corners[0]];
+    for pair in corners.windows(2) {
+        let delta = [pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]];
+        let steps = ((delta[0].abs() + delta[1].abs()) * 4.0).round() as usize;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            route.push([pair[0][0] + delta[0] * t, pair[0][1] + delta[1] * t]);
+        }
+    }
+    walk(session, &route);
 }
 
 fn walk(session: &mut Session, checkpoints: &[[f32; 2]]) {
     for &target in checkpoints {
-        for _ in 0..12 {
+        for _ in 0..120 {
             let p = session.world.player.position;
             let d = [target[0] - p[0], target[1] - p[1]];
             let distance = d[0].hypot(d[1]);

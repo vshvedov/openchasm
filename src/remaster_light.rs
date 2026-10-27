@@ -240,6 +240,19 @@ impl RemasterLightMap {
         ambient + surface_response(directional, normal)
     }
 
+    /// Exact specialization of `sample(position, [0, 0, +/-1])` for horizontal
+    /// floors and ceilings. No constant normal validation or normalization is
+    /// needed; the field vector length is still taken after interpolation.
+    #[inline]
+    pub fn sample_horizontal(&self, position: [f32; 2]) -> f32 {
+        if !position.iter().all(|v| v.is_finite()) {
+            return 0.0;
+        }
+        let directional = self.directional(position);
+        let ambient = ambient_index(position).map_or(0.0, |i| self.ambient[i]);
+        ambient + directional.iter().map(|v| v * v).sum::<f32>().sqrt()
+    }
+
     /// Uses the rendered authored face normal, including the reverse face for
     /// two-sided wall materials. Do not automatically face normals to camera.
     pub fn sample_wall(&self, position: [f32; 2], normal: [f32; 2]) -> f32 {
@@ -257,6 +270,7 @@ impl RemasterLightMap {
         )
     }
 
+    #[inline]
     fn directional(&self, position: [f32; 2]) -> [f32; 4] {
         let (x0, x1, blend_x) = sample_axis(position[0]);
         let (y0, y1, blend_y) = sample_axis(position[1]);
@@ -677,6 +691,64 @@ mod tests {
             if value.is_finite() {
                 check(value);
             }
+        }
+    }
+
+    #[test]
+    fn horizontal_sampling_matches_general_normal_bits() {
+        let field = RemasterLightMap {
+            // Mixed opposing contributions and varying neighbors exercise
+            // length after interpolation, not a sum of source intensities.
+            field: (0..FIELD_SIDE * FIELD_SIDE)
+                .map(|i| {
+                    [
+                        (i % 17) as f32 * 0.25,
+                        (i % 13) as f32 * 0.125,
+                        -((i % 7) as f32) * 0.5,
+                        -((i % 11) as f32) * 0.0625,
+                    ]
+                })
+                .collect(),
+            ambient: (0..MAP_SIDE * MAP_SIDE)
+                .map(|i| (i % 16) as f32 / 255.0)
+                .collect(),
+            skipped_sources: 0,
+        };
+        let check = |position| {
+            let specialized = field.sample_horizontal(position).to_bits();
+            for z in [-1.0, 1.0] {
+                assert_eq!(
+                    specialized,
+                    field.sample(position, [0.0, 0.0, z]).to_bits(),
+                    "{position:?}"
+                );
+            }
+        };
+        for x in [
+            f32::NEG_INFINITY,
+            -f32::MAX,
+            -64.0,
+            -0.096875,
+            -f32::from_bits(1),
+            -0.0,
+            0.0,
+            0.03125,
+            63.999996,
+            64.0,
+            64.0 + 1.55 / 16.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            check([x, 0.0]);
+            check([0.03125, x]);
+            check([x, x]);
+        }
+        for i in 0..4096 {
+            check([
+                i as f32 / 64.0,
+                ((i * 1777) % 4096) as f32 / 64.0 + 0.0078125,
+            ]);
         }
     }
 

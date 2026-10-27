@@ -238,10 +238,8 @@ impl PlaneRenderer {
                     let dx = world_x - position[0];
                     let dy = world_y - position[1];
                     let distance = (dx * dx + dy * dy + plane_height * plane_height).sqrt();
-                    map.sample(
-                        [world_x, world_y],
-                        [0.0, 0.0, if ceiling { -1.0 } else { 1.0 }],
-                    ) * crate::remaster_light::distance_multiplier(distance, fade)
+                    map.sample_horizontal([world_x, world_y])
+                        * crate::remaster_light::distance_multiplier(distance, fade)
                 } else {
                     self.static_light.sample([world_x, world_y]).unwrap_or(1.0)
                 };

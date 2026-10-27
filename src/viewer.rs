@@ -495,6 +495,38 @@ fn quake_camera(
     )
 }
 
+#[derive(Default, Clone, Copy)]
+struct RenderTimings {
+    plane: Duration,
+    wall: Duration,
+    model: Duration,
+    effects: Duration,
+    weapon: Duration,
+}
+impl RenderTimings {
+    fn accumulate(&mut self, other: Self) {
+        self.plane += other.plane;
+        self.wall += other.wall;
+        self.model += other.model;
+        self.effects += other.effects;
+        self.weapon += other.weapon;
+    }
+    fn ms_per_frame(value: Duration, frames: u32) -> f64 {
+        if frames == 0 {
+            0.0
+        } else {
+            value.as_secs_f64() * 1000.0 / f64::from(frames)
+        }
+    }
+}
+fn profile_start(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+fn profile_elapsed(start: Option<Instant>) -> Duration {
+    start.map_or(Duration::ZERO, |time| time.elapsed())
+}
+
+#[cfg(test)]
 fn render(
     frame: &mut [u32],
     depth: &mut [f32],
@@ -503,6 +535,20 @@ fn render(
     planes: Option<&PlaneRenderer>,
     objects: Option<&ObjectScene>,
 ) {
+    let _ = render_profiled(frame, depth, scene, textures, planes, objects, false);
+}
+
+fn render_profiled(
+    frame: &mut [u32],
+    depth: &mut [f32],
+    scene: RenderWorld<'_>,
+    textures: &[Option<ViewerTexture>],
+    planes: Option<&PlaneRenderer>,
+    objects: Option<&ObjectScene>,
+    profile: bool,
+) -> RenderTimings {
+    let mut timings = RenderTimings::default();
+    let started = profile_start(profile);
     let world = scene.world;
     let mut camera_player = world.player;
     camera_player.angle += scene.yaw_offset;
@@ -523,6 +569,8 @@ fn render(
             });
         }
     }
+    timings.plane = profile_elapsed(started);
+    let started = profile_start(profile);
     let [cos, sin] = camera.player.forward();
     let [right_x, right_y] = camera.player.right();
     let mut hits = Vec::new();
@@ -585,6 +633,8 @@ fn render(
             }
         }
     }
+    timings.wall = profile_elapsed(started);
+    let started = profile_start(profile);
     if let Some(objects) = objects {
         objects.render_with_static_light(
             frame,
@@ -597,6 +647,8 @@ fn render(
             planes.map(PlaneRenderer::static_light),
         );
     }
+    timings.model = profile_elapsed(started);
+    timings
 }
 
 fn draw_header(frame: &mut [u32], label: &str) {
@@ -856,6 +908,8 @@ pub fn run(
     let mut frame_stats = crate::frame_stats::FrameStats::new(Instant::now());
     let profile = std::env::var("OPENCHASM_PROFILE").as_deref() == Ok("1");
     let mut profile_samples = 0_u32;
+    let mut stage_totals = RenderTimings::default();
+    let mut stage_frames = 0_u32;
     let mut suppress_toggle_text = false;
     let mut minimap = minimap::Minimap::new(&session.world);
     let number_keys = [
@@ -1556,7 +1610,7 @@ pub fn run(
         let dynamic_lights = session.light_sources.as_ref().map(|sources| {
             openchasm::dynamic_light::DynamicLightSampler::from_snapshot(&sources.snapshot())
         });
-        render(
+        let mut stage_timings = render_profiled(
             &mut frame,
             &mut depth,
             RenderWorld {
@@ -1571,7 +1625,9 @@ pub fn run(
             &textures,
             Some(&planes),
             Some(&objects),
+            profile,
         );
+        let stage_started = profile_start(profile);
         let projectile_visuals: Vec<_> = session
             .projectiles
             .active()
@@ -1606,6 +1662,8 @@ pub fn run(
         if let Some(renderer) = &projectile_trails {
             renderer.render(&mut frame, &depth, WIDTH, HEIGHT, camera);
         }
+        stage_timings.effects = profile_elapsed(stage_started);
+        let stage_started = profile_start(profile);
         let (pose, frame_index) = weapon_clock
             .pose(weapon_overlay.frame_count(session.selected_weapon, WeaponPose::Idle));
         weapon_overlay.render_with_light(
@@ -1620,6 +1678,11 @@ pub fn run(
                 .sample(camera.player.position)
                 .unwrap_or(1.0),
         );
+        stage_timings.weapon = profile_elapsed(stage_started);
+        if profile {
+            stage_totals.accumulate(stage_timings);
+            stage_frames = stage_frames.saturating_add(1);
+        }
         apply_damage_tint(&mut frame, damage_feedback.flash);
         minimap.draw(&mut frame, WIDTH, HEIGHT, &session.world);
         draw_header(&mut frame, label);
@@ -1726,8 +1789,11 @@ pub fn run(
         ) {
             profile_samples = profile_samples.wrapping_add(1);
             if profile && profile_samples.is_multiple_of(4) {
-                eprintln!("frame profile: {:.1} fps, {:.2} ms/frame; sim {:.2}, render {:.2}, present {:.2}, max {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms);
+                let ms = |value| RenderTimings::ms_per_frame(value, stage_frames);
+                eprintln!("frame profile: {:.1} fps, {:.2} ms/frame; sim {:.2}, render {:.2}, present {:.2}, max {:.2} ms; plane {:.2}, wall {:.2}, model {:.2}, effects {:.2}, weapon {:.2} ms", metrics.fps, metrics.frame_ms, metrics.simulation_ms, metrics.render_ms, metrics.present_ms, metrics.max_frame_ms, ms(stage_totals.plane), ms(stage_totals.wall), ms(stage_totals.model), ms(stage_totals.effects), ms(stage_totals.weapon));
             }
+            stage_totals = RenderTimings::default();
+            stage_frames = 0;
         }
         frame_pacer.presented(render_started);
         let delay = frame_pacer.wait_hint(Instant::now());
@@ -1743,6 +1809,25 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn render_timing_averages_and_disabled_clock() {
+        let mut total = RenderTimings::default();
+        total.accumulate(RenderTimings {
+            plane: Duration::from_millis(3),
+            wall: Duration::from_millis(8),
+            ..RenderTimings::default()
+        });
+        total.accumulate(RenderTimings {
+            plane: Duration::from_millis(5),
+            wall: Duration::from_millis(10),
+            ..RenderTimings::default()
+        });
+        assert_eq!(RenderTimings::ms_per_frame(total.plane, 2), 4.0);
+        assert_eq!(RenderTimings::ms_per_frame(total.wall, 2), 9.0);
+        assert_eq!(RenderTimings::ms_per_frame(total.wall, 0), 0.0);
+        assert!(profile_start(false).is_none());
+        assert_eq!(profile_elapsed(None), Duration::ZERO);
+    }
     #[test]
     fn same_batch_checkpoint_keys_preserve_save_then_load_order() {
         let commands: Vec<_> = [Scancode::F5, Scancode::F9]

@@ -27,6 +27,12 @@ fn resource_paths(resources: &ResourceSet) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+fn next_campaign_level(id: &str) -> Option<String> {
+    let level = id.parse::<u8>().ok()?;
+    (1..19)
+        .contains(&level)
+        .then(|| format!("{:02}", level + 1))
+}
 fn level_id(path: &str) -> &str {
     path.strip_prefix("map/resource.").unwrap_or(path)
 }
@@ -256,69 +262,88 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("Checked {} maps.", paths.len());
         }
         "view" => {
-            let id = args.next().unwrap_or_else(|| "01".to_owned());
+            let mut id = args.next().unwrap_or_else(|| "01".to_owned());
             if args.next().is_some() || id.len() != 2 || !id.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("view expects a two-digit level ID, for example 01".into());
             }
-            let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
-            let resource = resources.read(&format!("map/resource.{id}"))?;
-            let name = level_name(&resource);
-            let graphics = parse_wall_graphics(&resource);
-            let textures = load_wall_textures(&mut resources, &graphics);
-            let world = make_world(&map, &graphics)?;
-            let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
-            let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
-            let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
-            let script_data = resources.read(&format!("map/process.{id}"))?;
-            let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
-            let processes = process_runtime::ProcessRuntime::new(&script, &world);
-            let definitions =
-                objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
-            let mut object_scene =
-                object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
-            let actor_definitions = actors::ActorDefinitions::parse(&resources.read("chasm.inf")?)?;
-            let actor_state =
-                actors::ActorState::from_placements(&map.monsters, &actor_definitions);
-            object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
-            let info = resources.read("chasm.inf")?;
-            let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
-            let mut audio = audio::Audio::new(&mut resources, &info);
-            audio.play_level_music(&mut resources, &resource);
-            let weapon_overlay =
-                weapon_render::WeaponRenderer::load(&mut resources, &info, &palette)?;
-            let game = openchasm::game::GameInventory::new(
-                weapons,
-                &objects::instances(&map),
-                &definitions,
-                openchasm::pickups::Difficulty::Normal,
-            );
-            let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
-            let projectile_renderer =
-                projectile_render::ProjectileRenderer::load(&mut resources, &rockets, &palette);
-            let shot_blocking =
-                std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
-            let session = openchasm::session::Session::new(openchasm::session::LevelSetup {
-                world,
-                processes,
-                actors: actor_state,
-                actor_definitions,
-                game,
-                rockets,
-                shot_blocking,
-                difficulty: openchasm::pickups::Difficulty::Normal,
-            });
-            viewer::run(
-                textures,
-                planes,
-                object_scene,
-                viewer::ClientFeedback {
-                    session,
-                    audio,
-                    weapon_overlay,
-                    projectile_renderer,
-                },
-                &format!("{id}: {name}"),
-            )?;
+            let mut carry: Option<openchasm::inventory::Inventory> = None;
+            loop {
+                let map = Map::parse(&resources.read(&format!("map/map.{id}"))?)?;
+                let resource = resources.read(&format!("map/resource.{id}"))?;
+                let name = level_name(&resource);
+                let graphics = parse_wall_graphics(&resource);
+                let textures = load_wall_textures(&mut resources, &graphics);
+                let world = make_world(&map, &graphics)?;
+                let floors = map::Floors::parse(&resources.read(&format!("map/floors.{id}"))?)?;
+                let palette = texture::Palette::parse(&resources.read("chasm2.pal")?)?;
+                let planes = planes::PlaneRenderer::new(&map, &floors, &palette);
+                let script_data = resources.read(&format!("map/process.{id}"))?;
+                let script = process::Script::parse(&String::from_utf8_lossy(&script_data));
+                let processes = process_runtime::ProcessRuntime::new(&script, &world);
+                let definitions =
+                    objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
+                let mut object_scene =
+                    object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
+                let actor_definitions =
+                    actors::ActorDefinitions::parse(&resources.read("chasm.inf")?)?;
+                let actor_state =
+                    actors::ActorState::from_placements(&map.monsters, &actor_definitions);
+                object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
+                let info = resources.read("chasm.inf")?;
+                let weapons = openchasm::inventory::WeaponDefinitions::parse(&info)?;
+                let mut audio = audio::Audio::new(&mut resources, &info);
+                audio.play_level_music(&mut resources, &resource);
+                let weapon_overlay =
+                    weapon_render::WeaponRenderer::load(&mut resources, &info, &palette)?;
+                let mut game = openchasm::game::GameInventory::new(
+                    weapons,
+                    &objects::instances(&map),
+                    &definitions,
+                    openchasm::pickups::Difficulty::Normal,
+                );
+                if let Some(mut inventory) = carry.take() {
+                    inventory.keys = [false; 3];
+                    game.inventory = inventory;
+                }
+                let rockets = openchasm::combat::RocketDefinitions::parse(&info)?;
+                let projectile_renderer =
+                    projectile_render::ProjectileRenderer::load(&mut resources, &rockets, &palette);
+                let shot_blocking =
+                    std::array::from_fn(|index| !graphics[index].disable_shoot_collision);
+                let mut session =
+                    openchasm::session::Session::new(openchasm::session::LevelSetup {
+                        world,
+                        processes,
+                        actors: actor_state,
+                        actor_definitions,
+                        game,
+                        rockets,
+                        shot_blocking,
+                        difficulty: openchasm::pickups::Difficulty::Normal,
+                    });
+                session.set_mission(openchasm::mission::MissionPlan::parse(
+                    &script,
+                    &String::from_utf8_lossy(&script_data),
+                ));
+                let next_level = viewer::run(
+                    textures,
+                    planes,
+                    object_scene,
+                    viewer::ClientFeedback {
+                        session,
+                        audio,
+                        weapon_overlay,
+                        projectile_renderer,
+                    },
+                    &format!("{id}: {name}"),
+                )?;
+                if let (Some(inventory), Some(next)) = (next_level, next_campaign_level(&id)) {
+                    carry = Some(inventory);
+                    id = next;
+                } else {
+                    break;
+                }
+            }
         }
         "objects" => {
             let id = args.next().unwrap_or_else(|| "01".to_owned());
@@ -388,6 +413,14 @@ fn main() {
 #[cfg(test)]
 mod wall_graphics_tests {
     use super::*;
+    #[test]
+    fn campaign_sequence_stops_after_last_map() {
+        assert_eq!(next_campaign_level("01").as_deref(), Some("02"));
+        assert_eq!(next_campaign_level("18").as_deref(), Some("19"));
+        assert_eq!(next_campaign_level("19"), None);
+        assert_eq!(next_campaign_level("99"), None);
+        assert_eq!(next_campaign_level("invalid"), None);
+    }
     #[test]
     fn reads_transparent_wall_flags_without_affecting_invisible_or_opaque_walls() {
         let graphics = parse_wall_graphics(b"#GFX\n001: wall.cel gso\n087: grate.cel gs.\n088: fence.cel .s.\n120: hidden.cel gso\n#end.\n089: after.cel gso\n");

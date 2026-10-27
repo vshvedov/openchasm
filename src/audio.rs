@@ -64,7 +64,7 @@ impl Audio {
     pub fn new(resources: &mut ResourceSet, inf: &[u8]) -> Self {
         let mut sounds = BTreeMap::new();
         for (id, path) in sound_names(inf) {
-            if matches!(id, 21..=28 | 51..=58 | 60 | 62 | 63) {
+            if matches!(id, 21..=28 | 51..=58 | 60 | 61 | 62 | 63) {
                 if let Ok(bytes) = resources.read(&path) {
                     sounds.insert(id, Arc::from(bytes));
                 }

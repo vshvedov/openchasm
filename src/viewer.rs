@@ -10,6 +10,7 @@ use font8x8::{UnicodeFonts, BASIC_FONTS};
 use minifb::{Key, KeyRepeat, MouseButton, ScaleMode, Window, WindowOptions};
 use openchasm::ai::Mode;
 use openchasm::combat::FireResult;
+use openchasm::mission::MissionEvent;
 use openchasm::session::{Session, SessionInput};
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -156,7 +157,7 @@ pub fn run(
     mut objects: ObjectScene,
     feedback: ClientFeedback,
     label: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<openchasm::inventory::Inventory>, Box<dyn Error>> {
     let ClientFeedback {
         mut session,
         audio,
@@ -190,6 +191,8 @@ pub fn run(
     let mut pending_interact = false;
     let mut pending_weapon = None;
     let mut shoot_ticks = 0usize;
+    let mut current_message: Option<(Vec<String>, f32)> = None;
+    let mut completed = false;
     let number_keys = [
         Key::Key1,
         Key::Key2,
@@ -221,6 +224,11 @@ pub fn run(
             pending_interact = false;
             pending_weapon = None;
             shoot_ticks = 0;
+            current_message = None;
+            completed = false;
+        }
+        if completed && window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+            return Ok(Some(session.game.inventory.clone()));
         }
         pending_interact |= window.is_key_pressed(Key::E, KeyRepeat::No);
         for (index, key) in number_keys.iter().enumerate() {
@@ -238,6 +246,33 @@ pub fn run(
             });
             pending_interact = false;
             pending_weapon = None;
+            if let Some((_, remaining)) = &mut current_message {
+                *remaining -= STEP;
+            }
+            if current_message
+                .as_ref()
+                .is_some_and(|(_, remaining)| *remaining <= 0.0)
+            {
+                current_message = None;
+            }
+            for event in events.mission {
+                match event {
+                    MissionEvent::ShowMessage(id) => {
+                        if let Some(message) = session
+                            .mission
+                            .as_ref()
+                            .and_then(|mission| mission.plan.messages.get(&id))
+                        {
+                            current_message = Some((
+                                message.lines.iter().map(|line| line.text.clone()).collect(),
+                                message.duration_seconds.max(0.1),
+                            ));
+                            audio.play(61);
+                        }
+                    }
+                    MissionEvent::LevelComplete => completed = true,
+                }
+            }
             for event in events.pickups {
                 objects.set_visible(event.cell, false);
                 let sound = match event.pickup {
@@ -345,6 +380,19 @@ pub fn run(
                 if inventory.keys[2] { "B" } else { "-" }
             ),
         );
+        if let Some((lines, _)) = &current_message {
+            for (row, line) in lines.iter().enumerate().take(6) {
+                text(&mut frame, 8, 52 + row * 10, line);
+            }
+        }
+        if completed {
+            text(
+                &mut frame,
+                WIDTH / 2 - 112,
+                HEIGHT / 2 + 35,
+                "LEVEL COMPLETE - ENTER TO CONTINUE",
+            );
+        }
         if inventory.health == 0 {
             text(
                 &mut frame,
@@ -355,7 +403,7 @@ pub fn run(
         }
         window.update_with_buffer(&frame, WIDTH, HEIGHT)?;
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]

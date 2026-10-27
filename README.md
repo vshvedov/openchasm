@@ -1,6 +1,6 @@
 # OpenChasm
 
-An experimental Rust reimplementation of **Chasm: The Rift**, with Linux, Windows and macOS as target platforms. The current build is an **early gameplay preview**; the full campaign is not yet playable. It loads the original map wall segments, CEL textures, floor and ceiling textures, static 3O objects, and static monster models, starts at the player spawn, and allows basic movement. Movement and collision are provisional. A limited subset of map processes can move walls, supported items can be collected, and enemies can chase and melee; Enemy behavior and most weapon mechanics are provisional; some audio, grenade and mine behavior, level completion and multiplayer have not been implemented.
+An experimental Rust reimplementation of **Chasm: The Rift**, with Linux, Windows and macOS as target platforms. The current build is an **early gameplay preview**; the full campaign is not yet playable. It loads the original map wall segments, CEL textures, floor and ceiling textures, static 3O objects, and static monster models, starts at the player spawn, and allows basic movement. Movement and collision are provisional. A limited subset of map processes can move walls, supported items can be collected, and enemies can chase and melee; Enemy behavior and most weapon mechanics are provisional; some audio, grenade and mine behavior, many level scripts and multiplayer remain incomplete.
 
 The name OpenChasm is already used by another independent project; this repository is a separate Rust implementation. See [research notes](docs/research.md) and [map format notes](docs/map-format.md) for references.
 
@@ -13,7 +13,7 @@ cargo run --release -- sources
 cargo run --release -- --source full view 01
 ```
 
-Use **WASD** to move, **left/right arrows** to turn, **E** to use nearby linked objects, **Space** or the left mouse button to fire, **1–8** to select owned weapons, and **R** to restart the level, and **Escape** to quit. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
+Use **WASD** to move, **left/right arrows** to turn, **E** to use nearby linked objects, **Space** or the left mouse button to fire, **1–8** to select owned weapons, and **R** to restart the level, and **Escape** to quit. After a supported level exit, press **Enter** to continue. Change `01` to another two-digit map ID shown by `cargo run --release -- levels`. Select `demo`, `full`, or `local` with `--source`, or supply a path to a compatible archive or directory of loose resources. Without an option the program chooses the copied local archive first, then the full Steam installation, then the demo. `--archive PATH` remains an alias for `--source PATH`.
 
 Examples:
 

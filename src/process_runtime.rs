@@ -480,6 +480,17 @@ impl ProcessRuntime {
             outcome,
         }
     }
+    /// Activate all ordinary links bound to a cell in script order. Used by
+    /// both interaction and collecting a key or other linked object.
+    pub fn activate_links_at(&mut self, cell: [u8; 2]) -> Vec<ProcessEvent> {
+        let ids: Vec<u16> = self
+            .links
+            .iter()
+            .filter(|link| link.kind == "link" && [link.x, link.y] == cell)
+            .map(|link| link.process)
+            .collect();
+        ids.into_iter().map(|id| self.trigger(id)).collect()
+    }
     /// Call after movement once per simulation step. `interact_pressed` must be
     /// true on the press edge only, not every frame while the key is held.
     pub fn tick(
@@ -528,12 +539,12 @@ impl ProcessRuntime {
                 .map(|link| {
                     let dx = f32::from(link.x) + 0.5 - p[0];
                     let dy = f32::from(link.y) + 0.5 - p[1];
-                    (link.process, dx * dx + dy * dy)
+                    ([link.x, link.y], dx * dx + dy * dy)
                 })
                 .filter(|(_, distance)| *distance <= USE_RANGE * USE_RANGE)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((id, _)) = nearest {
-                events.push(self.trigger(id));
+            if let Some((cell, _)) = nearest {
+                events.extend(self.activate_links_at(cell));
             }
         }
         for process in self.processes.values_mut() {
@@ -659,6 +670,24 @@ mod tests {
         runtime.tick(&mut world, 1.0 / 60.0, true);
         tick_for(&mut runtime, &mut world, 1.0);
         assert!((world.walls[0].a[0] - 2.0).abs() < 0.001);
+    }
+    #[test]
+    fn use_activates_all_processes_bound_to_nearest_cell() {
+        let script = Script::parse("#proc1\n#action\nunlock 3\n#end\n#proc2\n#action\nlock 3\n#end\n#proc3\nLock\n#action\nmove 1 0 256 0\n#end\n#links\nlink 1 0 1\nlink 1 0 2\n#end\n");
+        let mut world = world();
+        let mut runtime = ProcessRuntime::new(&script, &world);
+        let events = runtime.tick(&mut world, 1.0 / 60.0, true);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.process_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.outcome == ProcessOutcome::Accepted));
+        assert!(runtime.processes[&3].locked);
     }
     #[test]
     fn use_chooses_nearest_link() {

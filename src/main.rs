@@ -1,6 +1,7 @@
 mod archive;
 mod audio;
 mod content;
+mod gltf_model;
 mod object_render;
 mod planes;
 mod projectile_render;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use world::{Player, Wall, World};
 
 fn usage() {
-    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|objects [LEVEL]|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
+    eprintln!("Usage: openchasm [--source full|demo|local|PATH] <sources|info|list [PREFIX]|levels|check|objects [LEVEL]|gltf-info RESOURCE|model-info MODEL [ANI]|view [LEVEL]|cat RESOURCE>\n\nUse 'sources' to see available content. Default: local archive, then Steam full, then demo.");
 }
 fn resource_paths(resources: &ResourceSet) -> Vec<String> {
     resources
@@ -381,6 +382,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 println!("{:?} #{} cell {:?} pos {:?} angle {:.3} flags {:02x} difficulty {} extra {} size {}; model {} alternate {} animation {:?}; metadata {:?}", instance.kind, instance.definition_index, instance.grid_cell, instance.position, instance.angle_radians, instance.flags, instance.difficulty_flags, instance.extra, instance.size, def.model_3o_path().unwrap_or_else(|| "(none)".into()), def.model_gltf_path(), def.animation_path(), [def.collision_radius, def.shadow, def.bmp_object, def.bmp_z, def.action_code, def.blow_up, def.break_limit, def.ambient_sound, def.break_sound]);
             }
             println!("{} objects in level {id}.", instances.len());
+        }
+        "gltf-info" => {
+            let path = args
+                .next()
+                .ok_or("gltf-info requires a glTF resource path")?;
+            if args.next().is_some() {
+                return Err("gltf-info accepts one resource path".into());
+            }
+            let model = gltf_model::GltfModel::load(&mut resources, &path)?;
+            let vertices: usize = model
+                .primitives
+                .iter()
+                .filter_map(|primitive| primitive.frame_positions(0))
+                .map(|frame| frame.len())
+                .sum();
+            println!(
+                "{path}: {} primitives, {vertices} vertices, {} images, {} frames",
+                model.primitives.len(),
+                model.images.len(),
+                model.frame_count
+            );
         }
         "model-info" => {
             let name = args

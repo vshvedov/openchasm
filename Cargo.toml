@@ -7,7 +7,7 @@ description = "An experimental open-source Chasm: The Rift engine reimplementati
 
 [features]
 default = ["client"]
-client = ["dep:font8x8", "dep:rodio", "dep:sdl2"]
+client = ["dep:font8x8", "dep:rodio", "dep:sdl2", "dep:gltf", "dep:base64", "dep:png"]
 
 [[bin]]
 name = "openchasm"
@@ -15,6 +15,9 @@ path = "src/main.rs"
 required-features = ["client"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 font8x8 = { version = "0.3", optional = true }
+gltf = { version = "1.4.1", default-features = false, features = ["utils", "names"], optional = true }
+png = { version = "0.18", optional = true }
 rodio = { version = "0.23", optional = true, default-features = false, features = ["flac", "playback", "wav"] }
 sdl2 = { version = "0.38", optional = true, features = ["bundled", "static-link"] }

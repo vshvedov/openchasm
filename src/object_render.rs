@@ -3,6 +3,7 @@
 //! The viewer's camera is intentionally shared with its wall projection. Meshes
 //! and instances are immutable here; gameplay movement and animation are not
 //! simulated by this module.
+use crate::actors::{ActorDefinitions, ActorState};
 use crate::content::ResourceSet;
 use crate::model::{Model, SKIN_WIDTH};
 use crate::objects::{self, ObjectDefinitions};
@@ -18,13 +19,16 @@ const CAMERA_PLANE: f32 = 0.66;
 struct Mesh {
     model: Model,
     radius: f32,
+    /// CAR texture coordinates use 8 fractional bits unlike 3O.
+    car_uv: bool,
 }
 
 struct Instance {
     mesh: usize,
     position: [f32; 2],
     angle: f32,
-    cell: [usize; 2],
+    cell: Option<[usize; 2]>,
+    actor_source_index: Option<usize>,
     visible: bool,
 }
 
@@ -33,6 +37,19 @@ pub struct ObjectScene {
     meshes: Vec<Mesh>,
     instances: Vec<Instance>,
     palette: [u32; 256],
+}
+
+fn texture_uv(polygon: &crate::model::Polygon, corner: usize, car_uv: bool) -> [f32; 2] {
+    let u = f32::from(polygon.uv[corner][0]);
+    let v = f32::from(polygon.uv[corner][1]);
+    if car_uv {
+        [
+            u / 256.0,
+            (v + 4.0 * f32::from(polygon.sprite_offset)) / 256.0,
+        ]
+    } else {
+        [u, v + f32::from(polygon.sprite_offset)]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -198,7 +215,11 @@ impl ObjectScene {
                             })
                             .fold(0.0_f32, f32::max);
                         let index = meshes.len();
-                        meshes.push(Mesh { model, radius });
+                        meshes.push(Mesh {
+                            model,
+                            radius,
+                            car_uv: false,
+                        });
                         Some(index)
                     }
                     Err(error) => {
@@ -212,7 +233,8 @@ impl ObjectScene {
                     mesh,
                     position: instance.position,
                     angle: instance.angle_radians,
-                    cell: instance.grid_cell,
+                    cell: Some(instance.grid_cell),
+                    actor_source_index: None,
                     visible: true,
                 });
             }
@@ -231,11 +253,108 @@ impl ObjectScene {
         }
     }
 
+    /// Add the initial pose of each definition-backed actor, caching CAR meshes.
+    /// Actor state remains separate; these are only render-side instances.
+    pub fn add_actors(
+        &mut self,
+        resources: &mut ResourceSet,
+        actors: &ActorState,
+        definitions: &ActorDefinitions,
+    ) {
+        let mut cache: HashMap<String, Option<usize>> = HashMap::new();
+        let mut warnings = BTreeSet::new();
+        for actor in &actors.actors {
+            let Some(definition) = definitions.entries.get(actor.definition_index) else {
+                continue;
+            };
+            let Some(path) = definition.car_path() else {
+                warnings.insert(format!("unsupported actor model {}", definition.model_name));
+                continue;
+            };
+            let mesh_index = *cache.entry(path.clone()).or_insert_with(|| {
+                match resources
+                    .read(&path)
+                    .and_then(|data| crate::monster::Monster::parse(&data))
+                {
+                    Ok(car) => {
+                        let mut model = car.model;
+                        // Use the first available animation frame as a static preview.
+                        if let Some(animation) = car.animations.iter().flatten().next() {
+                            if animation.matches_model(&model) {
+                                model.vertices.clone_from(&animation.frames[0]);
+                            }
+                        }
+                        let radius = model
+                            .vertices
+                            .iter()
+                            .map(|vertex| {
+                                let x = f32::from(vertex.position[0]) * MODEL_SCALE;
+                                let y = f32::from(vertex.position[1]) * MODEL_SCALE;
+                                (x * x + y * y).sqrt()
+                            })
+                            .fold(0.0_f32, f32::max);
+                        let index = self.meshes.len();
+                        self.meshes.push(Mesh {
+                            model,
+                            radius,
+                            car_uv: true,
+                        });
+                        Some(index)
+                    }
+                    Err(error) => {
+                        warnings.insert(format!("{path}: {error}"));
+                        None
+                    }
+                }
+            });
+            if let Some(mesh) = mesh_index {
+                self.instances.push(Instance {
+                    mesh,
+                    position: actor.position,
+                    angle: actor.angle_radians,
+                    cell: None,
+                    actor_source_index: Some(actor.source_index),
+                    visible: true,
+                });
+            }
+        }
+        for warning in warnings {
+            eprintln!("actor preview: {warning}");
+        }
+    }
+
+    /// Update one render-side actor pose by its stable source placement index.
+    #[allow(dead_code)] // Used once simulation state drives actor transforms.
+    pub fn set_actor_pose(
+        &mut self,
+        source_index: usize,
+        position: [f32; 2],
+        angle: f32,
+        visible: bool,
+    ) -> bool {
+        if let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.actor_source_index == Some(source_index))
+        {
+            instance.position = position;
+            instance.angle = angle;
+            instance.visible = visible;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Hide or restore an individual placement without changing shared meshes.
     /// Grid cells are stable identifiers from the source map.
     #[allow(dead_code)] // Used when pickup/game state integration is enabled.
     pub fn set_visible(&mut self, cell: [usize; 2], visible: bool) -> bool {
-        if let Some(instance) = self.instances.iter_mut().find(|item| item.cell == cell) {
+        if let Some(instance) = self
+            .instances
+            .iter_mut()
+            .find(|item| item.cell == Some(cell))
+        {
             instance.visible = visible;
             true
         } else {
@@ -279,6 +398,11 @@ impl ObjectScene {
             }
             let (sin, cos) = instance.angle.sin_cos();
             for polygon in &mesh.model.polygons {
+                // The default pose shows intact body/head/hands, excluding
+                // detached parts and attack-only effects.
+                if mesh.car_uv && polygon.group != 0 && polygon.group & (1 | 4 | 16) == 0 {
+                    continue;
+                }
                 let count = polygon.vertex_count();
                 let mut vertices = Vec::with_capacity(count);
                 for corner in 0..count {
@@ -291,10 +415,7 @@ impl ObjectScene {
                         side: -world_x * camera_sin + world_y * camera_cos,
                         up: f32::from(p[2]) * MODEL_SCALE - CAMERA_HEIGHT,
                         depth: world_x * camera_cos + world_y * camera_sin,
-                        uv: [
-                            f32::from(polygon.uv[corner][0]),
-                            f32::from(polygon.uv[corner][1]) + f32::from(polygon.sprite_offset),
-                        ],
+                        uv: texture_uv(polygon, corner, mesh.car_uv),
                     });
                 }
                 let clipped = clip_near(&vertices);
@@ -330,14 +451,16 @@ mod tests {
                     mesh: 0,
                     position: [0.0, 0.0],
                     angle: 0.0,
-                    cell: [1, 2],
+                    cell: Some([1, 2]),
+                    actor_source_index: None,
                     visible: true,
                 },
                 Instance {
                     mesh: 0,
                     position: [1.0, 1.0],
                     angle: 0.0,
-                    cell: [3, 4],
+                    cell: Some([3, 4]),
+                    actor_source_index: None,
                     visible: true,
                 },
             ],
@@ -349,6 +472,93 @@ mod tests {
         assert!(!scene.set_visible([9, 9], false));
         assert!(scene.set_visible([1, 2], true));
         assert!(scene.instances[0].visible);
+    }
+
+    #[test]
+    fn car_uv_uses_fixed_point_coordinates_and_distinct_offset() {
+        let polygon = crate::model::Polygon {
+            vertices: [0, 1, 2, 255],
+            uv: [[256, 512]; 4],
+            next: 0,
+            distant: 0,
+            group: 0,
+            flags: 0,
+            sprite_offset: 64,
+        };
+        assert_eq!(texture_uv(&polygon, 0, true), [1.0, 3.0]);
+        assert_eq!(texture_uv(&polygon, 0, false), [256.0, 576.0]);
+    }
+
+    #[test]
+    fn loads_shared_car_mesh_using_first_pose_and_updates_one_actor() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "openchasm-actor-render-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("monster")).unwrap();
+        let mut car = vec![0_u8; 0x66];
+        car[..2].copy_from_slice(&18_u16.to_le_bytes());
+        let mut body = vec![0_u8; 0x4806 + 64];
+        body[0x4800..0x4802].copy_from_slice(&3_u16.to_le_bytes());
+        body[0x4802..0x4804].copy_from_slice(&1_u16.to_le_bytes());
+        body[0x4804..0x4806].copy_from_slice(&64_u16.to_le_bytes());
+        for (i, index) in [0_u16, 1, 2, 255].iter().enumerate() {
+            body[i * 2..i * 2 + 2].copy_from_slice(&index.to_le_bytes());
+        }
+        body[0x4806..].fill(1);
+        car.extend(body);
+        let mut animation = [0_u8; 18];
+        animation[2..4].copy_from_slice(&(-512_i16).to_le_bytes());
+        animation[8..10].copy_from_slice(&512_i16.to_le_bytes());
+        animation[16..18].copy_from_slice(&2048_i16.to_le_bytes());
+        car.extend(animation);
+        std::fs::write(dir.join("monster/joker.car"), car).unwrap();
+        let mut resources = ResourceSet::open(&dir).unwrap();
+        let definitions = ActorDefinitions::parse(
+            b"[MONSTERS]\n2\nhero.car 1 1 1 1 100 0 0 0\njoker.car 1 1 1 1 100 0 0 0\n",
+        )
+        .unwrap();
+        let map_actor = |x| crate::map::Monster {
+            position: [x, 256],
+            id: 101,
+            angle: 0,
+            flags: 0,
+        };
+        let actors = ActorState::from_placements(&[map_actor(256), map_actor(512)], &definitions);
+        let mut scene = ObjectScene {
+            meshes: vec![],
+            instances: vec![],
+            palette: [0; 256],
+        };
+        scene.add_actors(&mut resources, &actors, &definitions);
+        assert_eq!(scene.meshes.len(), 1);
+        assert_eq!(scene.instances.len(), 2);
+        assert!(scene.meshes[0].car_uv);
+        assert_eq!(scene.meshes[0].model.vertices[0].position[1], -512);
+        scene.palette[1] = 0xffffff;
+        let mut frame = vec![0; 64 * 64];
+        let mut depth = vec![f32::INFINITY; 64 * 64];
+        scene.render(
+            &mut frame,
+            &mut depth,
+            64,
+            64,
+            Player {
+                position: [0.0, 1.0],
+                angle: 0.0,
+            },
+        );
+        assert!(frame.iter().any(|&pixel| pixel != 0));
+        assert!(scene.set_actor_pose(0, [3.0, 4.0], 1.0, false));
+        assert!(!scene.instances[0].visible);
+        assert!(scene.instances[1].visible);
+        assert_eq!(scene.instances[0].position, [3.0, 4.0]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

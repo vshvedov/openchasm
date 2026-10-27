@@ -1,7 +1,9 @@
+mod actors;
 mod archive;
 mod content;
 mod map;
 mod model;
+mod monster;
 mod object_render;
 mod objects;
 mod planes;
@@ -273,8 +275,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let processes = process_runtime::ProcessRuntime::new(&script, &world);
             let definitions =
                 objects::ObjectDefinitions::parse(&resources.read("chasm.inf")?, &resource)?;
-            let object_scene =
+            let mut object_scene =
                 object_render::ObjectScene::load(&mut resources, &map, &definitions, &palette);
+            let actor_definitions = actors::ActorDefinitions::parse(&resources.read("chasm.inf")?)?;
+            let actor_state =
+                actors::ActorState::from_placements(&map.monsters, &actor_definitions);
+            object_scene.add_actors(&mut resources, &actor_state, &actor_definitions);
             viewer::run(
                 world,
                 textures,
